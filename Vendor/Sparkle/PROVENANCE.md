@@ -17,3 +17,8 @@ Vendored contents:
 - `LICENSE`
 
 The vendored binaries are copied without source modification from the upstream release asset.
+
+[`INSTALLED_MANIFEST.tsv`](INSTALLED_MANIFEST.tsv) records the complete installed
+framework and trusted command-line tool tree, including entry types, symlink
+targets, and SHA-256 checksums for regular files. Release preflight verifies that
+closed-world manifest before building.

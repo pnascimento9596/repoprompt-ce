@@ -7,26 +7,134 @@ on:
         description: Existing release tag to publish
         required: true
         type: string
-      draft:
-        description: Create a draft GitHub release
-        required: true
-        default: true
-        type: boolean
+
+concurrency:
+  group: release-draft-creation
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate-ref:
+    name: Validate Approved Release Ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    outputs:
+      commit: ${{ steps.release-ref.outputs.commit }}
+      tooling-commit: ${{ steps.release-ref.outputs.tooling-commit }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a tag reachable from protected main
+        id: release-ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          echo "commit=$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
+          echo "tooling-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  stage:
+    name: Build Approved Source Without Secrets
+    needs: validate-ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out approved tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.commit }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build and stage approved source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+        run: ./trusted-control-plane/Scripts/release.sh stage-publish
+
+      - name: Upload staged release source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-staged-release
+          path: |
+            release-source/dist/*-stage.zip
+            release-source/dist/*-stage.zip.sha256
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
-    name: Notarize and Publish
+    name: Sign, Notarize, and Create Draft
+    needs:
+      - validate-ref
+      - stage
+    if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: macos-26
+    permissions:
+      contents: write
     steps:
-      - name: Check out tagged source
-        uses: actions/checkout@v6
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download staged release source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: RepoPrompt-CE-staged-release
+          path: staged-release
+
+      - name: Check out approved source as data
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.commit }}
+          path: approved-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify and expand staged release source
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd staged-release
+          shopt -s nullglob
+          archives=(./*-stage.zip)
+          checksum_files=(./*-stage.zip.sha256)
+          [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one staged ZIP" >&2; exit 1; }
+          [[ "${#checksum_files[@]}" == "1" ]] || { echo "Expected exactly one staged ZIP checksum" >&2; exit 1; }
+          archive="${archives[0]}"
+          [[ "${checksum_files[0]}" == "$archive.sha256" ]] || { echo "Staged ZIP checksum name mismatch" >&2; exit 1; }
+          shasum -a 256 -c "${checksum_files[0]}"
+          ../trusted-control-plane/Scripts/extract_staged_release.py "$archive" ../release-source RepoPrompt
+          REPOPROMPT_RELEASE_SOURCE_ROOT=../release-source \
+            REPOPROMPT_APPROVED_SOURCE_ROOT=../approved-source \
+            ../trusted-control-plane/Scripts/validate_staged_release.sh
 
       - name: Import Developer ID certificate
         env:
@@ -63,15 +171,21 @@ jobs:
           echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
           echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
 
-      - name: Package, notarize, and publish release
+      - name: Sign, notarize, and create draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_DRAFT: ${{ inputs.draft }}
+          SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_GIT_ROOT: ${{ github.workspace }}/trusted-control-plane
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
+          REPOPROMPT_REQUIRE_HEAD_MATCH: 0
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
-        run: ./Scripts/release.sh publish
+        run: ./trusted-control-plane/Scripts/release.sh publish-staged
 
       - name: Remove ephemeral keychain
         if: always()

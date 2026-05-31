@@ -1,6 +1,6 @@
 # Open-Source and Release Readiness Notes
 
-Current as of 2026-05-31. This is a contributor/maintainer inventory for RepoPrompt CE's public-readiness work. It documents the current state and follow-ups; it is not legal advice, a substitute for legal review, or a complete third-party dependency audit.
+Current as of 2026-05-31. This is a contributor/maintainer inventory for RepoPrompt CE's public-readiness work. It documents the current state and follow-ups; it is not legal advice or a substitute for legal review.
 
 ## Release metadata and signing
 
@@ -23,7 +23,7 @@ or carry their own release metadata patch.
 
 `./Scripts/package_app.sh release` produces a signed release `.app` bundle. A signed release requires `SIGN_IDENTITY` and a `REPOPROMPT_PROVISIONING_PROFILE` for `648A27MST5.com.pvncher.repoprompt.ce`, renders the CE entitlements template, uses timestamped hardened-runtime signing, verifies the signed bundle identifier/team, uses Keychain-backed secure storage, copies the root `LICENSE` and `THIRD_PARTY_NOTICES.md` files into `Contents/Resources/Legal`, and recursively copies root [`ThirdPartyLicenses/`](../ThirdPartyLicenses/) into `Contents/Resources/Legal/ThirdPartyLicenses/` in the packaged app.
 
-[`Scripts/release.sh`](../Scripts/release.sh) adds a secret-free ad-hoc release-candidate lane plus the maintainer publishing lane: Developer ID signing, notarization, stapling, ZIP and DMG generation, Sparkle EdDSA-signed update archive metadata, checksums, and GitHub Release draft creation. The contributor and maintainer process, protected GitHub workflow, required environment secrets, and public Sparkle follow-ups are documented in [`docs/releasing.md`](releasing.md).
+[`Scripts/release.sh`](../Scripts/release.sh) adds a secret-free ad-hoc release-candidate lane plus the maintainer publishing lane: resolved-lockfile drift checks, a secret-free approved-source staging job, a fresh protected signing runner, trusted-control-plane Developer ID signing and Sparkle metadata generation, notarization, stapling, ZIP and DMG generation, checksums, packaged legal-tree verification, remote-tag SHA attestation, and draft-only GitHub Release creation. [`Scripts/promote_release.sh`](../Scripts/promote_release.sh) verifies the reviewed draft, rechecks the immutable remote tag SHA and draft attestation, confirms that the modern Sparkle private-key seed matches the app bundle public key and independently verifies the appcast ZIP signature, rejects asset, reviewed-checksum, or stable-build drift, compares the mounted DMG app with the verified ZIP app, mirrors the public update assets, publishes both releases without rebuilding, resumes matching partial states, fails closed on stable-channel API errors other than an explicit first-release `404`, and runs anonymous post-publish checks. The contributor and maintainer process, GitHub workflows, required environment controls, and secrets are documented in [`docs/releasing.md`](releasing.md).
 
 ## Sparkle metadata
 
@@ -64,15 +64,22 @@ Contributor-visible license expectations before public distribution:
 
 | Component | Location | Current notice source | Follow-up |
 | --- | --- | --- | --- |
-| Sparkle | `Vendor/Sparkle/Sparkle.xcframework` | Sparkle 2.9.2 license, release asset provenance, and SHA-256 are copied under `Vendor/Sparkle`; the license is also copied under `ThirdPartyLicenses/sparkle`. | Included in packaged legal files. |
+| Sparkle | `Vendor/Sparkle/Sparkle.xcframework` | Sparkle 2.9.2 license, release asset provenance, downloaded-archive SHA-256, and a closed-world typed manifest for the installed framework and trusted tools are copied under `Vendor/Sparkle`; the license is also copied under `ThirdPartyLicenses/sparkle`. | Included in packaged legal files. |
 | UniversalCharsetDetection / uchardet | `Vendor/UniversalCharsetDetection` | License and author notices are copied under `ThirdPartyLicenses/universal-charset-detection`. | Included in packaged legal files. |
 | PCRE2 | `Sources/CSwiftPCRE2/src` | License header is copied to `ThirdPartyLicenses/pcre2/LICENSE.txt`. | Included in packaged legal files. |
 | SLJIT | `Sources/CSwiftPCRE2/deps/sljit` | License is copied to `ThirdPartyLicenses/sljit/LICENSE`. | Included in packaged legal files. |
 | wildmatch / OpenBSD-derived fnmatch material | `Sources/RepoPromptC/src/wildmatch/wildmatch.c`, `Sources/RepoPromptC/include/wildmatch.h` | Both checked-in files contain BSD-style notice blocks; `wildmatch.h` includes its existing advertising acknowledgement condition. | Source headers remain preserved. Their full checked-in notice text is reproduced in root `THIRD_PARTY_NOTICES.md` and bundled under `Contents/Resources/Legal` during app packaging. |
 | Tree-sitter grammar packages, `SwiftTreeSitter`, embedded runtime, and runtime ICU subset | `Package.swift`, `Package.resolved`, [`ThirdPartyLicenses/tree-sitter/`](../ThirdPartyLicenses/tree-sitter/) | The curated Tree-sitter README maps exact package/runtime pins to full copied license files, including the embedded ICU subset notice. | Included under `Contents/Resources/Legal/ThirdPartyLicenses/tree-sitter/` during app packaging. |
-| Other SwiftPM dependencies | `Package.swift`, `Package.resolved` | Upstream packages provide their own license files in their repositories. | Generate or curate a comprehensive third-party notice inventory for remaining release dependencies. |
+| Resolved SwiftPM dependency graph | `Package.resolved`, [`ThirdPartyLicenses/swiftpm/`](../ThirdPartyLicenses/swiftpm/) | The machine-checkable inventory maps every remote resolved package to copied upstream license and notice files or to the separately curated Tree-sitter bundle. Checksums protect every copied file. | Included under `Contents/Resources/Legal/ThirdPartyLicenses/swiftpm/` during app packaging. |
 
-The root [`LICENSE`](../LICENSE) provides the Apache License, Version 2.0 for original RepoPrompt CE code. The root [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) is intentionally labeled as a partial inventory: it records the directly bundled attribution material and points to copied legal files, while notice curation for other SwiftPM dependencies remains outstanding before a public distribution.
+The root [`LICENSE`](../LICENSE) provides the Apache License, Version 2.0 for
+original RepoPrompt CE code. The root
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) records bundled
+attribution material and points to copied legal files. The
+[`Scripts/swiftpm_notice_guardrails.sh`](../Scripts/swiftpm_notice_guardrails.sh)
+guardrail keeps the resolved SwiftPM inventory aligned with `Package.resolved`
+and verifies the copied notice checksums, including the complete curated
+Tree-sitter bundle.
 
 ## Remaining public-release blockers
 
@@ -83,6 +90,8 @@ Completed setup on 2026-05-31:
 - Enabled App Store Connect API access, created a least-privilege `Developer` team key for notarization, and verified its credentials with a read-only `notarytool history` request.
 - Created the GitHub `release` environment, stored its Developer ID PKCS#12, export password, ephemeral CI keychain password, CE provisioning profile, CE Sparkle private key, and `NOTARYTOOL_*` secrets, and set the `SIGN_IDENTITY` environment variable.
 - Kept the opted-in contributor cohort in the tracked `.github/APPROVED_CONTRIBUTORS` file so changes remain public and reviewable. The issue and pull-request gates read that default-branch file directly.
+- Curated copied license and notice files for every remote dependency in the resolved root SwiftPM graph and added machine guardrails for inventory drift and copied-file checksums.
+- Added the environment-scoped **Promote Release** workflow. It uses trusted tooling pinned to a validated `main` SHA, requires the requested tag to be reachable from protected `main`, verifies reviewed source-draft assets and ZIP/DMG contents, validates packaged legal files and the protected CE Sparkle private key, mirrors update assets into `repoprompt-ce-updates`, enforces monotonically increasing stable builds, resumes matching partial states, publishes without rebuilding, explicitly selects the latest release, and runs anonymous post-publish checks.
 
 Pre-public validation limitation:
 
@@ -97,10 +106,21 @@ Pre-public validation limitation:
 
 Remaining blockers:
 
-- Enable a GitHub configuration that exposes required-reviewer protection for the `release` environment, or document and enforce an equivalent maintainer approval gate before treating the publishing workflow as protected. The current private-repository settings do not expose a required-reviewer control.
-- Finish the comprehensive notice inventory for SwiftPM dependencies.
-- Harden the public Sparkle promotion path before treating automatic updates as production-ready: validate that the CI private key matches the committed public key, publish an existing reviewed draft without rebuilding it, explicitly mark the intended stable tag as GitHub's latest release, and run anonymous post-publish feed, archive-signature, and checksum smoke checks.
-- Automate mirroring reviewed release assets into the public `repoprompt-ce-updates` repository. The maintainer-only [`Scripts/publish_public_update_test.sh`](../Scripts/publish_public_update_test.sh) helper provides the explicit private-repository smoke path in the meantime.
+- Enable a GitHub configuration that exposes required-reviewer protection for
+  the `release` environment and restrict its deployment branches to protected
+  `main`. The current private-repository settings do not expose a
+  required-reviewer control.
+- Add an immutable `v*` release-tag ruleset that allows new tag creation but
+  prevents updates and deletion after creation.
+- Enable GitHub Release immutability for both the source repository and
+  `repoprompt-ce-updates` before the first stable publish.
+- Add the `PUBLIC_UPDATE_REPOSITORY_TOKEN` secret to the protected `release`
+  environment before production promotion. Use a fine-grained GitHub token
+  scoped only to `repoprompt/repoprompt-ce-updates` with repository contents
+  read/write permission.
+- After switching the source repository public, rerun CI, create and test the
+  first **Publish Release** draft, dispatch **Promote Release**, and confirm an
+  installed app updates through the public channel.
 
 ## Contributor validation touchpoints
 

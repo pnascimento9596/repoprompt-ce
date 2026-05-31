@@ -2,7 +2,9 @@
 set -euo pipefail
 
 CONF="${1:-debug}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scripts}"
+RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
 cd "$ROOT_DIR"
 
 [[ "${VERBOSE:-0}" == "1" || "${VERBOSE:-0}" == "true" ]] && set -x
@@ -42,7 +44,8 @@ finish(){
 trap finish EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
-set -a; source "$ROOT_DIR/version.env"; set +a
+source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
+load_release_metadata "$ROOT_DIR"
 APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
 
 IS_RELEASE=0
@@ -54,7 +57,7 @@ else
 fi
 
 phase "Checking build environment"
-run ./Scripts/doctor.sh --quiet
+run "$CONTROL_PLANE_SCRIPTS_DIR/doctor.sh" --quiet
 SIGN_IDENTITY_WAS_EXPLICIT=0
 if [[ -n "${SIGN_IDENTITY:-}" ]]; then
     SIGN_IDENTITY_WAS_EXPLICIT=1
@@ -153,14 +156,14 @@ if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
 fi
 
 phase "Building $APP_NAME ($CONF)"
-run swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
+run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
 phase "Building repoprompt-mcp ($CONF)"
-run swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
+run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
 
 phase "Resolving build artifact paths"
-echo_cmd swift build -c "$CONF" --show-bin-path
-BUILD_DIR="$(swift build -c "$CONF" --show-bin-path)"
+echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
+BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
 if (( IS_RELEASE )); then
     APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 else
@@ -238,8 +241,10 @@ fi
 
 phase "Copying dynamic frameworks"
 printf 'Framework destination: %s\n' "$APP_BUNDLE/Contents/Frameworks"
-echo_cmd find "$ROOT_DIR/.build" -path '*/Sparkle.framework' -type d -prune -print -exec cp -R {} "$APP_BUNDLE/Contents/Frameworks/" ';'
-find "$ROOT_DIR/.build" -path '*/Sparkle.framework' -type d -prune -print -exec cp -R {} "$APP_BUNDLE/Contents/Frameworks/" \; 2>/dev/null || true
+SPARKLE_FRAMEWORK="$BUILD_DIR/Sparkle.framework"
+REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+    "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" "$SPARKLE_FRAMEWORK"
+run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 
 phase "Signing app bundle"

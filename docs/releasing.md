@@ -30,17 +30,13 @@ The intended process is:
 3. Contributors and maintainers test the ad-hoc release-candidate artifact.
 4. A maintainer merges the PR and creates a new immutable tag for that exact
    commit.
-5. A maintainer dispatches **Publish Release** in draft mode. CI imports the
+5. A maintainer dispatches **Publish Release**. CI imports the
    protected secrets, signs, notarizes, staples, and uploads the draft assets.
 6. Maintainers test the draft ZIP and DMG without rebuilding them.
-7. A maintainer promotes the existing draft, explicitly marks that tag as
-   GitHub's latest stable release, and runs the anonymous post-publish checks
-   below.
-
-The current workflow implements draft creation. A separate protected
-promotion workflow that publishes an existing reviewed draft, mirrors its
-public update assets, and runs the post-publish checks remains a public-launch
-hardening item.
+7. A maintainer dispatches **Promote Release** for the reviewed tag. CI verifies
+   the existing draft, mirrors the public update assets, publishes both
+   releases without rebuilding, explicitly marks that tag as GitHub's latest
+   stable release, and runs anonymous post-publish checks.
 
 ## Contributor release candidate
 
@@ -102,10 +98,19 @@ provisioning profile, hardened runtime entitlements, notarization, and stapling.
 ## Maintainer setup
 
 Create a protected GitHub Actions environment named `release`. Require
-maintainer approval before jobs can access its secrets. If the repository's
-current GitHub plan or visibility does not expose required reviewers for
-environments, resolve that limitation or enforce an equivalent maintainer
-approval gate before treating the publishing workflow as protected.
+maintainer approval before jobs can access its secrets, and restrict deployment
+branches to protected `main`. Do not run production publication until both
+controls are enabled.
+
+Add an immutable release-tag ruleset for `v*` tags. Allow maintainers to create
+new release tags, but prevent updates and deletion after creation. The release
+scripts re-resolve the remote tag before draft upload and again before
+promotion; the ruleset makes that repository policy explicit.
+
+Enable GitHub **Release immutability** for both `repoprompt/repoprompt-ce` and
+`repoprompt/repoprompt-ce-updates` before the first stable publish. The tag
+ruleset protects tag creation history; release immutability additionally locks
+published release assets and their associated tag.
 
 Add these environment secrets:
 
@@ -118,7 +123,8 @@ Add these environment secrets:
 | `NOTARYTOOL_PRIVATE_KEY_BASE64` | Base64-encoded App Store Connect API `.p8` key accepted by `notarytool`. |
 | `NOTARYTOOL_KEY_ID` | App Store Connect API key ID. |
 | `NOTARYTOOL_ISSUER_ID` | App Store Connect API issuer ID. |
-| `SPARKLE_PRIVATE_KEY` | Sparkle EdDSA private key for the CE update channel. |
+| `SPARKLE_PRIVATE_KEY` | Modern Sparkle EdDSA private-key seed for the CE update channel. It must decode from base64 to exactly 32 bytes. |
+| `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
 
 The optional `SIGN_IDENTITY` environment variable defaults to:
 
@@ -134,6 +140,12 @@ The provisioning profile must authorize:
 
 The release script validates that identifier before signing.
 
+`PUBLIC_UPDATE_REPOSITORY_TOKEN` is intentionally separate from the workflow's
+source-repository `github.token`. Keep its repository scope narrow: the
+promotion workflow needs to create and publish GitHub Releases in the public
+artifact-only update repository, but it does not need broader organization
+permissions.
+
 App Store Connect organization API access must be enabled before generating the
 notarization `.p8` key. If **Users and Access → Integrations → App Store Connect
 API** shows **Request Access**, complete that approval step before creating the
@@ -145,15 +157,31 @@ secrets, remove the one-time `.p8` download from the local machine.
 
 1. Update `version.env` and commit the release state.
 2. Create and push a tag pointing at that commit.
-3. Run the **Publish Release** workflow with the existing tag and leave
-   `draft` enabled.
+3. Dispatch **Publish Release** from protected `main` with the existing tag.
 4. Review and test the draft GitHub Release assets before promotion.
 
-The workflow imports the Developer ID certificate into an ephemeral keychain,
-embeds the CE provisioning profile, signs with hardened runtime entitlements,
-notarizes and staples the app and DMG, creates a Sparkle appcast containing an
-EdDSA signature for the update ZIP, and uploads ZIP, DMG, appcast, and checksum
-assets to GitHub Releases.
+The workflow's no-secret validation job first requires the requested tag to be
+reachable from protected `main`. A separate unprotected staging job uses
+release tooling pinned to the exact validated `main` SHA and checks out the
+approved tag commit as release source with read-only permissions and without
+persisted checkout credentials. After remote-tag attestation it scrubs GitHub
+tokens before invoking SwiftPM-controlled commands. It resolves dependencies without lockfile
+drift, builds the approved source, verifies the trusted Sparkle payload, stages
+an ad-hoc app bundle, and uploads that bundle as a short-lived workflow
+artifact. The environment-scoped signing job starts on a fresh runner,
+downloads and verifies the staged artifact, then imports the Developer ID
+certificate and notarization key. Before secrets are imported, trusted tooling
+extracts the untrusted staging archive with path-confinement checks and verifies
+its path shape, metadata, and packaged legal files against a data-only checkout
+of the approved commit. Trusted tooling rechecks the immutable remote tag SHA,
+replaces the staged Sparkle framework with the closed-world verified
+trusted-control-plane copy, renders hardened runtime entitlements from trusted
+policy, signs the staged bundle, notarizes and staples the app and DMG, creates a Sparkle appcast with the trusted
+`generate_appcast` binary, and uploads ZIP, DMG, appcast, and checksum assets to
+a draft GitHub Release. The draft notes embed the approved release-commit SHA.
+Draft-only creation is intentional: **Promote Release** is the sole stable
+publication path. The appcast enclosure already points at the immutable,
+tag-specific public updater ZIP URL that promotion will populate.
 
 The current app enables Sparkle's required update-archive verification through
 `SUPublicEDKey`. It does not currently opt into the stronger optional
@@ -208,13 +236,44 @@ generated appcast, and checksums as a public updater-smoke release in
 `repoprompt-ce-updates`.
 
 The helper reads the CE Sparkle private key from the local Sparkle Keychain
-account `repoprompt-ce`. It refuses to overwrite an existing public test tag.
+account `repoprompt-ce`. It refuses to overwrite an existing public test tag
+and publishes that tag with `--latest=false`, so a private-source smoke run
+cannot replace the stable feed selected by `latest/download/appcast.xml`.
 
 ## Promote and verify
 
-Promotion must publish the existing reviewed draft without rebuilding its
-artifacts. Explicitly mark the intended stable tag as GitHub's latest release.
-Immediately verify anonymously:
+After reviewing the source draft ZIP and DMG, compute the SHA-256 digest of the
+reviewed source-draft `SHA256SUMS` file:
+
+```bash
+shasum -a 256 SHA256SUMS
+```
+
+Dispatch the environment-scoped **Promote Release** workflow from protected
+`main` with the same tag and that reviewed digest. It runs:
+
+```bash
+./Scripts/promote_release.sh promote
+```
+
+The script refuses a prerelease, extra or missing assets, checksum drift,
+invalid Developer ID signing or notarization, ZIP/DMG content mismatch,
+packaged legal-tree drift, bundle metadata drift, multi-item appcasts, an
+appcast that does not target the immutable public updater URL, a protected
+private key that does not match the committed app public key, a signature
+mismatch against the committed public key, a non-canonical or metadata-mismatched
+release tag, a moved remote tag, a missing release-commit attestation, a private
+source repository, a reviewed-checksum digest mismatch, or a build number that
+does not advance the current stable channel. Rollback protection treats an
+explicit GitHub `404` as the empty first-release state and fails closed on other
+API or network errors.
+
+After verification, it creates or resumes an updater draft with the reviewed
+ZIP, appcast, and checksums, publishes the updater release, publishes the source
+release, explicitly marks both as latest, and immediately verifies every source
+and updater asset anonymously. The workflow serializes stable-channel
+promotion so two CI promotions cannot race. Rerunning the same tag safely
+resumes expected partial states only when the existing assets match exactly.
 
 ```text
 https://github.com/repoprompt/repoprompt-ce-updates/releases/latest
@@ -223,7 +282,7 @@ https://github.com/repoprompt/repoprompt-ce-updates/releases/download/<tag>/<zip
 https://github.com/repoprompt/repoprompt-ce/releases/download/<tag>/<dmg>
 ```
 
-The promotion gate should confirm:
+The promotion gate confirms:
 
 - `/releases/latest` resolves to the intended tag.
 - `appcast.xml` returns HTTP `200` after redirects.
@@ -233,20 +292,22 @@ The promotion gate should confirm:
 - The ZIP EdDSA signature verifies against the public key embedded in the
   packaged app.
 - ZIP and DMG SHA-256 values match `SHA256SUMS`.
-
-Before public launch, add CI verification that the protected
-`SPARKLE_PRIVATE_KEY` matches the committed `SUPublicEDKey`.
+- The mounted DMG app matches the verified ZIP app, including packaged legal
+  resources.
 
 ## Recovery
 
 Never overwrite assets on a published release, reuse a public tag, or move an
 existing release tag.
 
-For an incomplete draft, inspect its assets and either delete the incomplete
-draft before rerunning the protected build or resume only after checksum
-comparison. For a public regression, withdraw the bad release if policy allows
-it and publish a new hotfix tag with a higher `BUILD_NUMBER`; explicitly
-promote the hotfix as latest.
+For an incomplete source draft, inspect its assets and either delete the
+incomplete draft before rerunning the protected build or resume only after
+checksum comparison. If promotion stops after creating or publishing an
+updater release, rerun **Promote Release** with the same tag. It resumes only
+when the existing updater assets match the reviewed source assets exactly. For
+a public regression, withdraw the bad release if policy allows it and publish a
+new hotfix tag with a higher `BUILD_NUMBER`; explicitly promote the hotfix as
+latest.
 
 ## References
 
@@ -254,3 +315,4 @@ promote the hotfix as latest.
 - [Sparkle customization keys](https://sparkle-project.org/documentation/customization/)
 - [GitHub: Linking to releases](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)
 - [GitHub REST API: Get the latest release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
+- [GitHub: Immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)

@@ -11,7 +11,7 @@ set +a
 PUBLIC_UPDATE_REPOSITORY="${PUBLIC_UPDATE_REPOSITORY:-repoprompt/repoprompt-ce-updates}"
 PUBLIC_UPDATE_TAG="${PUBLIC_UPDATE_TAG:-v${MARKETING_VERSION}-private-smoke.${BUILD_NUMBER}}"
 PUBLIC_UPDATE_BASE_URL="https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$PUBLIC_UPDATE_TAG"
-PUBLIC_FEED_URL="https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/latest/download/appcast.xml"
+PUBLIC_FEED_URL="$PUBLIC_UPDATE_BASE_URL/appcast.xml"
 SPARKLE_KEY_ACCOUNT="${SPARKLE_KEY_ACCOUNT:-repoprompt-ce}"
 UPDATE_ZIP="${1:-$ROOT_DIR/dist/${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}.zip}"
 GENERATE_APPCAST="$ROOT_DIR/Vendor/Sparkle/bin/generate_appcast"
@@ -80,7 +80,7 @@ build_number="$(plutil -extract CFBundleVersion raw "$APP_BUNDLE/Contents/Info.p
 cp "$UPDATE_ZIP" "$APPCAST_DIR/"
 "$GENERATE_APPCAST" \
     --account "$SPARKLE_KEY_ACCOUNT" \
-    --download-url-prefix "$PUBLIC_UPDATE_BASE_URL" \
+    --download-url-prefix "$PUBLIC_UPDATE_BASE_URL/" \
     -o "$APPCAST" \
     "$APPCAST_DIR"
 
@@ -97,7 +97,7 @@ gh release create "$PUBLIC_UPDATE_TAG" \
     "$CHECKSUMS" \
     --repo "$PUBLIC_UPDATE_REPOSITORY" \
     --target main \
-    --latest \
+    --latest=false \
     --title "RepoPrompt CE $MARKETING_VERSION private-repo updater smoke" \
     --notes "Public updater smoke artifact for RepoPrompt CE $MARKETING_VERSION ($BUILD_NUMBER). Source remains private during release validation."
 
@@ -108,4 +108,4 @@ grep -q "$PUBLIC_UPDATE_BASE_URL/" "$TMP_DIR/published-appcast.xml" ||
     fail "Published appcast does not point at the expected public update URL."
 
 printf 'Published public RepoPrompt CE updater smoke release: %s\n' "$PUBLIC_UPDATE_TAG"
-printf 'Feed URL: %s\n' "$PUBLIC_FEED_URL"
+printf 'Isolated smoke feed URL: %s\n' "$PUBLIC_FEED_URL"

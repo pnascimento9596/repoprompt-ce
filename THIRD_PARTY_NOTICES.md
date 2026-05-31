@@ -1,8 +1,10 @@
-# Third-Party Notices (Partial Inventory)
+# Third-Party Notices
 
 Original RepoPrompt CE code is released under the Apache License, Version 2.0, as provided in [`LICENSE`](LICENSE). Third-party components remain subject to their own copyright notices and license terms.
 
-This file currently records notice material identified during focused attribution remediation. It is **not** a complete dependency inventory or audit. Additional third-party notice curation remains pending as described in [`docs/open-source-readiness.md`](docs/open-source-readiness.md).
+This file records attribution material for bundled source and the resolved root
+SwiftPM dependency graph. It is not legal advice or a substitute for legal
+review.
 
 ## Sparkle
 
@@ -29,6 +31,15 @@ and [`ThirdPartyLicenses/sljit/LICENSE`](ThirdPartyLicenses/sljit/LICENSE).
 RepoPrompt CE links Tree-sitter grammar package products through fixed, source-preserving SwiftPM revision pins. Those package dependencies still require attribution when distributed.
 
 The curated [`ThirdPartyLicenses/tree-sitter/`](ThirdPartyLicenses/tree-sitter/) bundle maps the directly linked grammar products to their exact upstream repositories and revisions, and includes full license copies for the grammar packages, `SwiftTreeSitter`, its embedded Tree-sitter runtime, and the ICU subset notice shipped with that runtime.
+
+## Resolved SwiftPM dependencies
+
+[`ThirdPartyLicenses/swiftpm/`](ThirdPartyLicenses/swiftpm/) preserves upstream
+license and notice files for every remote dependency resolved by the root Swift
+package graph. Its machine-checkable
+[`inventory.tsv`](ThirdPartyLicenses/swiftpm/inventory.tsv) maps each exact
+resolved version or revision to its upstream repository and copied notice
+bundle. Tree-sitter packages refer to the separately curated bundle above.
 
 ## Markdownosaur
 

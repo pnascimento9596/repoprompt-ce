@@ -26,6 +26,9 @@ jobs:
       - name: Run conductor tests
         run: make conductor-selftest
 
+      - name: Run release workflow tests
+        run: make release-selftest
+
   build-and-test:
     name: Build and Test
     runs-on: macos-26

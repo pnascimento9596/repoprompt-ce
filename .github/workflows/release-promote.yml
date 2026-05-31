@@ -1,0 +1,83 @@
+name: Promote Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing reviewed source draft tag to promote
+        required: true
+        type: string
+      reviewed_checksums_sha256:
+        description: SHA-256 digest of the reviewed source-draft SHA256SUMS file
+        required: true
+        type: string
+
+concurrency:
+  group: stable-release-channel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-ref:
+    name: Validate Approved Release Ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    outputs:
+      commit: ${{ steps.release-ref.outputs.commit }}
+      tooling-commit: ${{ steps.release-ref.outputs.tooling-commit }}
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a tag reachable from protected main
+        id: release-ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          echo "commit=$(./Scripts/verify_release_ref.sh "$RELEASE_TAG")" >> "$GITHUB_OUTPUT"
+          echo "tooling-commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  promote:
+    name: Mirror and Promote Reviewed Draft
+    needs: validate-ref
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out approved tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.commit }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify, mirror, and promote reviewed assets
+        env:
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          SOURCE_GH_TOKEN: ${{ github.token }}
+          PUBLIC_UPDATE_GH_TOKEN: ${{ secrets.PUBLIC_UPDATE_REPOSITORY_TOKEN }}
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REVIEWED_CHECKSUMS_SHA256: ${{ inputs.reviewed_checksums_sha256 }}
+          SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: ./trusted-control-plane/Scripts/promote_release.sh promote
