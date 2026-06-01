@@ -10378,29 +10378,30 @@ final class AgentModeViewModel: ObservableObject {
         workspaceEntries.reserveCapacity(min(taggedPaths.count, maxFiles))
         var seenFileIDs = Set<UUID>()
         var seenExternalPaths = Set<String>()
+        let rootsByID = await Dictionary(uniqueKeysWithValues: store.rootRefs(scope: .allLoaded).map { ($0.id, $0) })
 
         for taggedPath in taggedPaths {
             guard orderedFiles.count < maxFiles else { break }
-            if let result = await store.lookupPath(taggedPath, profile: .mcpRead, rootScope: .allLoaded),
-               let file = result.file,
-               seenFileIDs.insert(file.id).inserted,
-               let content = try? await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
-            {
+            guard let readable = await readableService.resolveReadableFile(taggedPath, profile: .mcpRead, rootScope: .allLoaded) else { continue }
+            switch readable {
+            case let .workspace(file):
+                guard seenFileIDs.insert(file.id).inserted,
+                      let content = try? await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath),
+                      let root = rootsByID[file.rootID]
+                else { continue }
                 let entry = ResolvedPromptFileEntry(
                     file: file,
                     isCodemap: false,
                     mode: .fullFile,
                     loadedContent: content,
-                    rootFolderPath: result.location.rootPath
+                    rootFolderPath: root.standardizedFullPath
                 )
                 workspaceEntries.append(entry)
                 orderedFiles.append(.workspace(entry))
-                continue
+            case let .external(externalFile):
+                guard seenExternalPaths.insert(externalFile.absolutePath).inserted else { continue }
+                orderedFiles.append(.external(externalFile))
             }
-
-            guard let externalFile = readableService.resolveAlwaysReadableExternalFile(atAbsolutePath: taggedPath),
-                  seenExternalPaths.insert(externalFile.absolutePath).inserted else { continue }
-            orderedFiles.append(.external(externalFile))
         }
 
         guard !orderedFiles.isEmpty else { return nil }

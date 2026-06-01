@@ -3353,12 +3353,15 @@ final class MCPServerViewModel: ObservableObject {
         if let issue = await store.exactPathResolutionIssue(for: trimmed, kind: .either, rootScope: lookupRootScope) {
             throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
         }
+        let mutationService = WorkspaceFileMutationService(store: store)
+        if let file = await mutationService.exactExistingFile(trimmed, rootScope: lookupRootScope) {
+            try await store.moveItemToTrash(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+            return
+        }
         guard let lookup = await store.lookupPath(WorkspacePathLookupRequest(userPath: trimmed, profile: .moveSourceExact, rootScope: lookupRootScope)) else {
             throw MCPError.invalidParams("Unknown or unloaded path: \(path).")
         }
-        if let file = lookup.file {
-            try await store.moveItemToTrash(rootID: file.rootID, relativePath: file.standardizedRelativePath)
-        } else if let folder = lookup.folder {
+        if let folder = lookup.folder {
             try await store.moveItemToTrash(rootID: folder.rootID, relativePath: folder.standardizedRelativePath)
         } else {
             throw MCPError.invalidParams("Unknown or unloaded path: \(path).")

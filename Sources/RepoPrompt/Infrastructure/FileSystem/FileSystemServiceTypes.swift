@@ -128,5 +128,16 @@ enum FileSystemError: Error {
     case fileTooLarge
     case isDirectory
     case failedToCreateDirectory(Error)
-    case invalidRelativePath // ← NEW
+    case invalidRelativePath
+}
+
+extension FileSystemError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .invalidRelativePath:
+            "Unsafe workspace mutation path: target escapes the loaded root, contains traversal, or uses a symbolic-link component."
+        default:
+            nil
+        }
+    }
 }

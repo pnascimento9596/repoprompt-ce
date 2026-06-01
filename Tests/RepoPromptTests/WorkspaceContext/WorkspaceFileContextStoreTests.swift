@@ -694,9 +694,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertEqual(lookupFiles["Created.swift"]?.id, recordFromStore.id)
     }
 
-    func testPolicyIneligibleCreateSucceedsOnDiskWithoutCatalogMaterialization() async throws {
+    func testIgnoredCreateRemainsExactlyManageableWithoutDiscoveryExposure() async throws {
         let root = try makeTemporaryRoot(name: "IgnoredCreatePostcondition")
-        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        try write("*.ignored\nignored/\n", to: root.appendingPathComponent(".gitignore"))
 
         let store = WorkspaceFileContextStore()
         let record = try await store.loadRoot(path: root.path)
@@ -707,25 +707,465 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             selectCreatedFiles: false
         )
 
-        try await host.writeText(path: "secret.ignored", content: "ignored", overwrite: false)
+        try await host.writeText(path: "secret.ignored", content: "ignored token", overwrite: false)
+        try await host.writeText(path: "ignored/report.md", content: "nested ignored", overwrite: false)
 
-        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("secret.ignored").path))
-        let ignoredFile = await store.file(rootID: record.id, relativePath: "secret.ignored")
-        XCTAssertNil(ignoredFile)
-        let ignoredLookup = await store.lookupPath("secret.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)?.file
-        XCTAssertNil(ignoredLookup)
+        let ignoredURL = root.appendingPathComponent("secret.ignored")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ignoredURL.path))
+        let storedIgnoredFile = await store.file(rootID: record.id, relativePath: "secret.ignored")
+        let ignoredFile = try XCTUnwrap(storedIgnoredFile)
+        XCTAssertEqual(ignoredFile.standardizedFullPath, ignoredURL.path)
 
-        let mutationService = WorkspaceFileMutationService(store: store)
-        let result = try await mutationService.createFileWithPostcondition(
-            userPath: "second.ignored",
-            content: "ignored",
-            rootScope: .visibleWorkspace,
-            pathResolutionPolicy: .canonicalAliasFirst
+        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile(ignoredURL.path, profile: .mcpRead, rootScope: .visibleWorkspace)
+        guard case let .workspace(readableFile) = readable else {
+            return XCTFail("Ignored exact path should resolve as a workspace file")
+        }
+        XCTAssertEqual(readableFile.id, ignoredFile.id)
+
+        let editService = ApplyEditsService(engine: .default, host: host)
+        _ = try await editService.run(ApplyEditsRequest(
+            path: "secret.ignored",
+            mode: .single(search: "token", replace: "edited", replaceAll: false),
+            verbose: false
+        ))
+        let editedContent = try await store.readContent(rootID: record.id, relativePath: "secret.ignored")
+        XCTAssertEqual(editedContent, "ignored edited")
+
+        let ignoredFuzzyLookup = await store.lookupPath("secret.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)?.file
+        let discoverableFiles = await store.files(inRoot: record.id)
+        let searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let rootChildren = await store.directFolderChildren(rootID: record.id)
+        XCTAssertNil(ignoredFuzzyLookup)
+        XCTAssertFalse(discoverableFiles.contains { $0.standardizedRelativePath == "secret.ignored" })
+        XCTAssertFalse(searchSnapshot.files.contains { $0.standardizedRelativePath == "secret.ignored" })
+        XCTAssertFalse(rootChildren?.childFiles.contains { $0.standardizedRelativePath == "secret.ignored" } ?? true)
+        let ignoredFolderChildrenBeforeReplay = await store.directFolderChildren(rootID: record.id, relativePath: "ignored")
+        XCTAssertNil(ignoredFolderChildrenBeforeReplay)
+        let ignoredFolderExpansion = await store.expandFolderInputToFiles("ignored", rootScope: .visibleWorkspace)
+        XCTAssertFalse(ignoredFolderExpansion.handled)
+        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.folderAdded("ignored")])
+        let ignoredFolderChildrenAfterReplay = await store.directFolderChildren(rootID: record.id, relativePath: "ignored")
+        XCTAssertNil(ignoredFolderChildrenAfterReplay)
+
+        let treeSnapshot = await store.makeFileTreeSelectionSnapshot(
+            selection: StoredSelection(),
+            request: WorkspaceFileTreeSnapshotRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                showCodeMapMarkers: false,
+                rootScope: .visibleWorkspace
+            ),
+            profile: .mcpRead
         )
-        XCTAssertEqual(result.catalogIneligibility, .ignored)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("second.ignored").path))
-        let secondIgnoredFile = await store.file(rootID: record.id, relativePath: "second.ignored")
-        XCTAssertNil(secondIgnoredFile)
+        let tree = CodeMapExtractor.generateFileTree(using: treeSnapshot)
+        XCTAssertFalse(tree.contains("secret.ignored"), tree)
+        XCTAssertFalse(tree.contains("ignored"), tree)
+        XCTAssertFalse(tree.contains("report.md"), tree)
+
+        let selectedTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+            selection: StoredSelection(selectedPaths: [ignoredURL.path]),
+            request: WorkspaceFileTreeSnapshotRequest(
+                mode: .selected,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                showCodeMapMarkers: false,
+                rootScope: .visibleWorkspace
+            ),
+            profile: .mcpRead
+        )
+        let selectedTree = CodeMapExtractor.generateFileTree(using: selectedTreeSnapshot)
+        XCTAssertTrue(selectedTree.contains("secret.ignored"), selectedTree)
+        XCTAssertFalse(selectedTree.contains("report.md"), selectedTree)
+
+        let ignoredSubtree = await store.makeFileTreeSelectionSnapshot(
+            selection: StoredSelection(),
+            request: WorkspaceFileTreeSnapshotRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                showCodeMapMarkers: false,
+                rootScope: .visibleWorkspace,
+                startPath: "ignored"
+            ),
+            profile: .mcpRead
+        )
+        XCTAssertTrue(ignoredSubtree.roots.isEmpty)
+    }
+
+    func testVisibleSiblingPromotesManagedOnlyParentWithoutExposingIgnoredSibling() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredParentPromotion")
+        try write("private/*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
+
+        try await host.writeText(path: "private/secret.ignored", content: "hidden", overwrite: false)
+        let hiddenParentChildren = await store.directFolderChildren(rootID: record.id, relativePath: "private")
+        XCTAssertNil(hiddenParentChildren)
+        try await host.writeText(path: "private/public.md", content: "visible", overwrite: false)
+
+        let children = await store.directFolderChildren(rootID: record.id, relativePath: "private")
+        XCTAssertEqual(children?.childFiles.map(\.standardizedRelativePath), ["private/public.md"])
+        let searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertTrue(searchSnapshot.files.contains { $0.standardizedRelativePath == "private/public.md" })
+        XCTAssertFalse(searchSnapshot.files.contains { $0.standardizedRelativePath == "private/secret.ignored" })
+    }
+
+    func testExistingIgnoredFileMaterializesOnlyForExactReadAndEdit() async throws {
+        let root = try makeTemporaryRoot(name: "ExistingIgnoredExact")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let ignoredURL = root.appendingPathComponent("existing.ignored")
+        try write("old", to: ignoredURL)
+
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        let ignoredBeforeExactRead = await store.file(rootID: record.id, relativePath: "existing.ignored")
+        XCTAssertNil(ignoredBeforeExactRead)
+
+        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile(ignoredURL.path, profile: .mcpRead, rootScope: .visibleWorkspace)
+        guard case let .workspace(file) = readable else {
+            return XCTFail("Existing ignored exact path should materialize for read_file semantics")
+        }
+        XCTAssertEqual(file.standardizedFullPath, ignoredURL.path)
+
+        let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
+        try await host.writeText(path: ignoredURL.path, content: "new", overwrite: true)
+        let editedContent = try await store.readContent(rootID: record.id, relativePath: "existing.ignored")
+        let fuzzyLookup = await store.lookupPath("existing.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)?.file
+        let searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(editedContent, "new")
+        XCTAssertNil(fuzzyLookup)
+        XCTAssertFalse(searchSnapshot.files.contains { $0.standardizedRelativePath == "existing.ignored" })
+    }
+
+    func testIgnoredManagedFileDeleteRemovesCatalogWithoutRediscovery() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredDelete")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
+        let ignoredURL = root.appendingPathComponent("delete.ignored")
+        try await host.writeText(path: ignoredURL.path, content: "delete me", overwrite: false)
+
+        try await store.deleteFile(rootID: record.id, relativePath: "delete.ignored")
+        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileRemoved("delete.ignored"), .fileAdded("delete.ignored")])
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ignoredURL.path))
+        let deletedFile = await store.file(rootID: record.id, relativePath: "delete.ignored")
+        XCTAssertNil(deletedFile)
+    }
+
+    func testMoveTransitionsBetweenDiscoverableAndManagedOnlyIgnoredFiles() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredMove")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        try write("visible", to: root.appendingPathComponent("Visible.md"))
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+
+        try await store.moveFile(rootID: record.id, from: "Visible.md", to: "Hidden.ignored")
+        let hiddenFile = await store.file(rootID: record.id, relativePath: "Hidden.ignored")
+        let hiddenLookup = await store.lookupPath("Hidden.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)?.file
+        XCTAssertNotNil(hiddenFile)
+        XCTAssertNil(hiddenLookup)
+        var searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertFalse(searchSnapshot.files.contains { $0.standardizedRelativePath == "Hidden.ignored" })
+
+        try await store.moveFile(rootID: record.id, from: "Hidden.ignored", to: "VisibleAgain.md")
+        let visibleAgainLookup = await store.lookupPath("VisibleAgain.md", profile: .mcpRead, rootScope: .visibleWorkspace)?.file
+        XCTAssertNotNil(visibleAgainLookup)
+        searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertTrue(searchSnapshot.files.contains { $0.standardizedRelativePath == "VisibleAgain.md" })
+    }
+
+    func testExplicitCatalogLookupFastPathsSingleInterpretation() async throws {
+        let root = try makeTemporaryRoot(name: "CatalogFastPath")
+        let fileURL = root.appendingPathComponent("Sources/Visible.swift")
+        try write("visible", to: fileURL)
+
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+
+        let relativeLookup = await store.lookupCatalogFileForExplicitRequest("Sources/Visible.swift", rootScope: .visibleWorkspace)
+        guard case let .matched(relativeFile) = relativeLookup else {
+            return XCTFail("Expected a single-root relative catalog hit")
+        }
+        XCTAssertEqual(relativeFile.rootID, record.id)
+        XCTAssertEqual(relativeFile.standardizedFullPath, fileURL.path)
+
+        let absoluteLookup = await store.lookupCatalogFileForExplicitRequest(fileURL.path, rootScope: .visibleWorkspace)
+        guard case let .matched(absoluteFile) = absoluteLookup else {
+            return XCTFail("Expected an absolute catalog hit")
+        }
+        XCTAssertEqual(absoluteFile.id, relativeFile.id)
+    }
+
+    func testExplicitCatalogLookupDoesNotProbeIgnoredShadowForRelativeMultiRootPath() async throws {
+        let rootA = try makeTemporaryRoot(name: "CatalogFastPathVisible")
+        let rootB = try makeTemporaryRoot(name: "CatalogFastPathIgnored")
+        let visibleURL = rootA.appendingPathComponent("same.md")
+        let ignoredURL = rootB.appendingPathComponent("same.md")
+        try write("visible", to: visibleURL)
+        try write("same.md\n", to: rootB.appendingPathComponent(".gitignore"))
+        try write("ignored", to: ignoredURL)
+
+        let store = WorkspaceFileContextStore()
+        let visibleRoot = try await store.loadRoot(path: rootA.path)
+        let ignoredRoot = try await store.loadRoot(path: rootB.path)
+
+        let catalogLookup = await store.lookupCatalogFileForExplicitRequest("same.md", rootScope: .visibleWorkspace)
+        guard case let .matched(catalogFile) = catalogLookup else {
+            return XCTFail("Expected relative catalog hit without probing ignored disk siblings")
+        }
+        XCTAssertEqual(catalogFile.rootID, visibleRoot.id)
+
+        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile("same.md", profile: .mcpRead, rootScope: .visibleWorkspace)
+        guard case let .workspace(readableFile) = readable else {
+            return XCTFail("Expected visible cataloged file to resolve")
+        }
+        XCTAssertEqual(readableFile.rootID, visibleRoot.id)
+        let ignoredRecord = await store.file(rootID: ignoredRoot.id, relativePath: "same.md")
+        XCTAssertNil(ignoredRecord)
+    }
+
+    func testAmbiguousRelativeIgnoredFileDoesNotMaterializeEitherRoot() async throws {
+        let rootA = try makeTemporaryRoot(name: "IgnoredAmbiguousA")
+        let rootB = try makeTemporaryRoot(name: "IgnoredAmbiguousB")
+        for root in [rootA, rootB] {
+            try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+            try write("ignored", to: root.appendingPathComponent("same.ignored"))
+        }
+
+        let store = WorkspaceFileContextStore()
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let recordB = try await store.loadRoot(path: rootB.path)
+        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile("same.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)
+
+        let storedA = await store.file(rootID: recordA.id, relativePath: "same.ignored")
+        let storedB = await store.file(rootID: recordB.id, relativePath: "same.ignored")
+        XCTAssertNil(readable)
+        XCTAssertNil(storedA)
+        XCTAssertNil(storedB)
+
+        do {
+            _ = try await WorkspaceFileMutationService(store: store).resolveExactExistingFileForMutation("same.ignored", rootScope: .visibleWorkspace)
+            XCTFail("Expected ambiguous ignored mutation target to fail")
+        } catch let error as FileManagerError {
+            guard case let .fileSystemServiceNotFoundWithContext(message) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(message.contains("Unknown or unloaded path"), message)
+        }
+    }
+
+    func testAmbiguousAliasIsTerminalForExplicitReadAndSelectionLookup() async throws {
+        let parentA = try makeTemporaryRoot(name: "AmbiguousAliasParentA")
+        let parentB = try makeTemporaryRoot(name: "AmbiguousAliasParentB")
+        let rootA = parentA.appendingPathComponent("App", isDirectory: true)
+        let rootB = parentB.appendingPathComponent("App", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+        try write("*.ignored\n", to: rootA.appendingPathComponent(".gitignore"))
+        try write("hidden", to: rootA.appendingPathComponent("secret.ignored"))
+        try write("visible fallback", to: rootB.appendingPathComponent("App/secret.ignored"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: rootA.path)
+        _ = try await store.loadRoot(path: rootB.path)
+
+        let catalogLookup = await store.lookupCatalogFileForExplicitRequest("App/secret.ignored", rootScope: .visibleWorkspace)
+        XCTAssertEqual(catalogLookup, .ambiguous)
+        let explicit = try await store.materializeExplicitlyRequestedFile("App/secret.ignored", rootScope: .visibleWorkspace)
+        XCTAssertEqual(explicit, .noCandidate)
+        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile("App/secret.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)
+        XCTAssertNil(readable)
+
+        let snapshot = await store.makeFileTreeSelectionSnapshot(
+            selection: StoredSelection(selectedPaths: ["App/secret.ignored"]),
+            request: WorkspaceFileTreeSnapshotRequest(
+                mode: .selected,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                showCodeMapMarkers: false,
+                rootScope: .visibleWorkspace
+            ),
+            profile: .mcpRead
+        )
+        XCTAssertTrue(snapshot.selectedFileIDs.isEmpty)
+    }
+
+    func testMissingManagedIgnoredRecordIsPrunedByAbsoluteMutationRecovery() async throws {
+        let rootA = try makeTemporaryRoot(name: "StaleIgnoredA")
+        let rootB = try makeTemporaryRoot(name: "StaleIgnoredB")
+        try write("*.ignored\n", to: rootA.appendingPathComponent(".gitignore"))
+        let staleURL = rootA.appendingPathComponent("same.ignored")
+        let visibleURL = rootB.appendingPathComponent("same.ignored")
+        try write("stale", to: staleURL)
+        try write("visible", to: visibleURL)
+
+        let store = WorkspaceFileContextStore()
+        let recordA = try await store.loadRoot(path: rootA.path)
+        let recordB = try await store.loadRoot(path: rootB.path)
+        let initiallyReadable = await WorkspaceReadableFileService(store: store).resolveReadableFile(staleURL.path, profile: .mcpRead, rootScope: .visibleWorkspace)
+        guard case .workspace = initiallyReadable else {
+            return XCTFail("Expected ignored file to materialize before stale-record pruning")
+        }
+        try FileManager.default.removeItem(at: staleURL)
+
+        do {
+            _ = try await WorkspaceFileMutationService(store: store).resolveExactExistingFileForMutation(staleURL.path, rootScope: .visibleWorkspace)
+            XCTFail("Expected removed absolute mutation target to fail")
+        } catch {}
+        let resolved = await WorkspaceReadableFileService(store: store).resolveReadableFile("same.ignored", profile: .mcpRead, rootScope: .visibleWorkspace)
+        guard case let .workspace(file) = resolved else {
+            return XCTFail("Expected remaining visible file to resolve after stale ignored record pruning")
+        }
+        XCTAssertEqual(file.rootID, recordB.id)
+        XCTAssertEqual(file.standardizedFullPath, visibleURL.path)
+        let staleRecord = await store.file(rootID: recordA.id, relativePath: "same.ignored")
+        XCTAssertNil(staleRecord)
+    }
+
+    func testIgnoredFolderReplayStaysHiddenWhenHierarchicalIgnoresAreDisabled() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredFolderReplaySimple")
+        try write("ignored/\n", to: root.appendingPathComponent(".gitignore"))
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path, enableHierarchicalIgnores: false)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("ignored"), withIntermediateDirectories: true)
+
+        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.folderAdded("ignored")])
+
+        let ignoredFolder = await store.folder(rootID: record.id, relativePath: "ignored")
+        XCTAssertNil(ignoredFolder)
+    }
+
+    func testEnsureIndexedFilesDoesNotExposeIgnoredDiskFile() async throws {
+        let root = try makeTemporaryRoot(name: "EnsureIndexedIgnored")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let ignoredURL = root.appendingPathComponent("late.ignored")
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        try write("hidden", to: ignoredURL)
+
+        let indexed = await store.ensureIndexedFiles(paths: [ignoredURL.path])
+
+        XCTAssertTrue(indexed.isEmpty)
+        let indexedIgnoredFile = await store.file(rootID: record.id, relativePath: "late.ignored")
+        XCTAssertNil(indexedIgnoredFile)
+        let searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertFalse(searchSnapshot.files.contains { $0.standardizedFullPath == ignoredURL.path })
+    }
+
+    func testIgnoredCreateRejectsSymlinkedParentWithoutWritingOutsideRoot() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredCreateSymlink")
+        let outside = try makeTemporaryRoot(name: "IgnoredCreateSymlinkOutside")
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("ignored"), withDestinationURL: outside)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
+
+        do {
+            try await host.writeText(path: "ignored/report.md", content: "must not escape", overwrite: false)
+            XCTFail("Expected symlinked parent create to fail")
+        } catch {}
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("report.md").path))
+    }
+
+    func testIgnoredCreateRejectsDanglingLeafSymlinkWithoutWritingOutsideRoot() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredCreateDanglingSymlink")
+        let outside = try makeTemporaryRoot(name: "IgnoredCreateDanglingSymlinkOutside")
+        let outsideTarget = outside.appendingPathComponent("missing-report.md")
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("report.ignored"), withDestinationURL: outsideTarget)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
+
+        do {
+            try await host.writeText(path: "report.ignored", content: "must not escape", overwrite: false)
+            XCTFail("Expected dangling symlink create to fail")
+        } catch {}
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsideTarget.path))
+    }
+
+    func testFileOnlyDeleteAndMoveRejectDirectoryReplacement() async throws {
+        let root = try makeTemporaryRoot(name: "MutationDirectoryReplacement")
+        let replacedURL = root.appendingPathComponent("Replace.swift")
+        try write("file", to: replacedURL)
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        try FileManager.default.removeItem(at: replacedURL)
+        try FileManager.default.createDirectory(at: replacedURL, withIntermediateDirectories: true)
+        try write("keep", to: replacedURL.appendingPathComponent("Nested.txt"))
+
+        do {
+            try await store.deleteFile(rootID: record.id, relativePath: "Replace.swift")
+            XCTFail("Expected file-only delete to reject a replacement directory")
+        } catch {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: replacedURL.appendingPathComponent("Nested.txt").path))
+
+        do {
+            try await store.moveFile(rootID: record.id, from: "Replace.swift", to: "Moved.swift")
+            XCTFail("Expected file-only move to reject a replacement directory")
+        } catch {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: replacedURL.appendingPathComponent("Nested.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Moved.swift").path))
+    }
+
+    func testTrashRejectsSymlinkedParentWithoutMovingOutsideRootFile() async throws {
+        let root = try makeTemporaryRoot(name: "TrashSymlink")
+        let outside = try makeTemporaryRoot(name: "TrashSymlinkOutside")
+        let outsideFile = outside.appendingPathComponent("report.md")
+        try write("keep", to: outsideFile)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("linked"), withDestinationURL: outside)
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+
+        do {
+            try await store.moveItemToTrash(rootID: record.id, relativePath: "linked/report.md")
+            XCTFail("Expected symlinked parent trash to fail")
+        } catch {}
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outsideFile.path))
+    }
+
+    func testUnknownSymlinkedFolderReplayDoesNotIndexFolder() async throws {
+        let root = try makeTemporaryRoot(name: "ReplaySymlinkFolder")
+        let outside = try makeTemporaryRoot(name: "ReplaySymlinkFolderOutside")
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("linked"), withDestinationURL: outside)
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+
+        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.folderAdded("linked")])
+
+        let replayedFolder = await store.folder(rootID: record.id, relativePath: "linked")
+        XCTAssertNil(replayedFolder)
+    }
+
+    func testPolicyIneligibleReplayDoesNotPublishRawDiscoveryDelta() async throws {
+        let root = try makeTemporaryRoot(name: "IgnoredRawReplay")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        try write("hidden", to: root.appendingPathComponent("late.ignored"))
+        let hiddenDelta = expectation(description: "Ignored replay must stay out of discovery-facing raw deltas")
+        hiddenDelta.isInverted = true
+        let stream = await store.fileSystemDeltaEvents()
+        let observation = Task {
+            for await event in stream where FileSystemDeltaPreparation.standardizedRelativePath(for: event.delta) == "late.ignored" {
+                hiddenDelta.fulfill()
+                break
+            }
+        }
+
+        await store.replayObservedFileSystemDeltas(rootID: record.id, deltas: [.fileAdded("late.ignored")])
+        await fulfillment(of: [hiddenDelta], timeout: 0.1)
+        observation.cancel()
     }
 
     func testPolicyIneligibleReplayDoesNotMaterializeIgnoredFile() async throws {
