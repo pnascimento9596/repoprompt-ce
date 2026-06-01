@@ -29,8 +29,7 @@ final class CodexCLIProvider: AIProvider {
     private let testRequestTimeout: TimeInterval
     private let maxRetries: Int
     private let appServerReadyHook: (() async throws -> Void)?
-    private let startNewCodexThreadsEphemerally: Bool
-    private let sessionControllerFactory: ((Set<String>, TimeInterval, Bool) -> CodexSessionControlling)?
+    private let sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)?
     private let authRecovery: any CodexManagedAuthRecovering
     private let initialBackoff: TimeInterval = 1.0
     private let maxBackoff: TimeInterval = 8.0
@@ -51,9 +50,8 @@ final class CodexCLIProvider: AIProvider {
         maxRetries: Int? = nil,
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
-        startNewCodexThreadsEphemerally: Bool = false,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
-        sessionControllerFactory: ((Set<String>, TimeInterval, Bool) -> CodexSessionControlling)? = nil
+        sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
         self.workingDirectory = workingDirectory
         self.enableDebugLogging = enableDebugLogging
@@ -61,7 +59,6 @@ final class CodexCLIProvider: AIProvider {
         self.testRequestTimeout = testRequestTimeout ?? 30
         self.maxRetries = maxRetries ?? 2
         self.appServerReadyHook = appServerReadyHook
-        self.startNewCodexThreadsEphemerally = startNewCodexThreadsEphemerally
         self.authRecovery = authRecovery
         self.sessionControllerFactory = sessionControllerFactory
         _ = logCollector
@@ -678,7 +675,7 @@ final class CodexCLIProvider: AIProvider {
         requestTimeout: TimeInterval
     ) -> CodexSessionControlling {
         if let sessionControllerFactory {
-            return sessionControllerFactory(excludeServers, requestTimeout, startNewCodexThreadsEphemerally)
+            return sessionControllerFactory(excludeServers, requestTimeout)
         }
         guard let appServerClient else {
             preconditionFailure("CodexCLIProvider requires an app-server client when no custom session controller factory is provided.")
@@ -693,8 +690,7 @@ final class CodexCLIProvider: AIProvider {
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
             approvalReviewerProvider: { .user },
-            authTokensRefreshHandler: nil,
-            startNewThreadsEphemerally: startNewCodexThreadsEphemerally
+            authTokensRefreshHandler: nil
         )
 
         return CodexNativeSessionController(

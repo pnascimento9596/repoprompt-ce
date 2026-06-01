@@ -2517,7 +2517,6 @@ class OracleViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
         overrideAIMessage: AIMessage? = nil,
-        queryOrigin: AIQueryOrigin = .standardChat,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async {
         guard !newUserMessage.isEmpty else { return }
@@ -2660,8 +2659,7 @@ class OracleViewModel: ObservableObject {
                 }
                 let (streamID, stream) = try await aiQueriesService.sendPrompt(
                     aiMessage,
-                    model: model,
-                    queryOrigin: queryOrigin
+                    model: model
                 )
 
                 guard await shouldContinueStreaming() else {

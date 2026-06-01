@@ -3,11 +3,6 @@ import Foundation
 /// Per-stream identifier for cancellation.
 public typealias ChatStreamID = UUID
 
-enum AIQueryOrigin: Equatable {
-    case standardChat
-    case oracle
-}
-
 /// Groups all token-usage info so we can extend it later.
 public struct ChatTokenInfo: Codable, Equatable {
     public let promptTokens: Int?
@@ -266,10 +261,6 @@ public class AIQueriesService {
         }
     }
 
-    static func shouldStartNewCodexThreadsEphemerally(for model: AIModel, queryOrigin: AIQueryOrigin) -> Bool {
-        queryOrigin == .oracle && model.providerType == .codex
-    }
-
     static func shouldEagerlyFlushReasoningSummaries(for model: AIModel) -> Bool {
         switch model {
         case let .openAIServiceTierVariant(base, _):
@@ -297,11 +288,9 @@ public class AIQueriesService {
 
     func sendPrompt(
         _ aiMessage: AIMessage,
-        model: AIModel,
-        queryOrigin: AIQueryOrigin = .standardChat
+        model: AIModel
     ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>) {
         let taskId = UUID()
-        let startNewCodexThreadsEphemerally = Self.shouldStartNewCodexThreadsEphemerally(for: model, queryOrigin: queryOrigin)
         await taskManager.createPartialBuffer(for: taskId)
 
         let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
@@ -318,10 +307,7 @@ public class AIQueriesService {
 
                 do {
                     // Build a provider
-                    let provider = try await self.providerPool.createProvider(
-                        for: model,
-                        startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally
-                    )
+                    let provider = try await self.providerPool.createProvider(for: model)
 
                     // Ensure provider is always disposed, regardless of how we exit
                     defer {

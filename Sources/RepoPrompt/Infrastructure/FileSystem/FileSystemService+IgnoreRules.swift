@@ -92,23 +92,24 @@ extension FileSystemService {
     }
 
     /// We walk each parent sub-path, caching the result.
-    func isIgnoredPrefixCheck(relativePath: String) -> Bool {
+    func isIgnoredPrefixCheck(relativePath: String, isDirectory: Bool = false) -> Bool {
         let comps = pathCompsCache.components(for: relativePath)
         return ignoreCacheStore.isIgnoredPrefixCheck(
             components: comps,
+            isDirectory: isDirectory,
             ignoreRules: ignoreRules
         )
     }
 
     /// Check if a path is ignored using hierarchical rules (for delta events)
     func isIgnoredHierarchical(relativePath: String, isDirectory overrideValue: Bool? = nil) async -> Bool {
-        // If hierarchical ignores are disabled, use the simple check
-        if !enableHierarchicalIgnores {
-            return isIgnoredPrefixCheck(relativePath: relativePath)
-        }
-
         // Get the file type
         let isDir = overrideValue ?? (visitedItems[relativePath] ?? fileOrFolderIsDir(relativePath))
+
+        // If hierarchical ignores are disabled, use the simple check
+        if !enableHierarchicalIgnores {
+            return isIgnoredPrefixCheck(relativePath: relativePath, isDirectory: isDir)
+        }
 
         // Create a rules provider that uses our cache and can compute rules on demand
         let provider = FileSystemRulesProvider(service: self)
@@ -118,7 +119,7 @@ extension FileSystemService {
             return try await evaluator.isIgnored(relativePath: relativePath, isDirectory: isDir)
         } catch {
             // Fall back to simple check if hierarchical evaluation fails
-            return isIgnoredPrefixCheck(relativePath: relativePath)
+            return isIgnoredPrefixCheck(relativePath: relativePath, isDirectory: isDir)
         }
     }
 
@@ -128,7 +129,7 @@ extension FileSystemService {
             return false
         }
         if !enableHierarchicalIgnores {
-            return isIgnoredPrefixCheck(relativePath: relativePath)
+            return isIgnoredPrefixCheck(relativePath: relativePath, isDirectory: true)
         }
 
         return await isIgnoredHierarchical(relativePath: relativePath, isDirectory: true)

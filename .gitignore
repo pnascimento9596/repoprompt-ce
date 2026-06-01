@@ -27,6 +27,7 @@ dist/
 *.log
 *.trace
 *.xcresult/
+*.profraw
 
 # Agent-authored working documents
 docs/analysis/

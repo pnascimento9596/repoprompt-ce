@@ -80,7 +80,7 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "Generated exports must not direct-write outside loaded read_file roots")
     }
 
-    func testGeneratedExportWriterRejectsIgnoredExportPathAsUnreadable() async throws {
+    func testGeneratedExportWriterAllowsIgnoredAppManagedExportWithoutDiscoveryExposure() async throws {
         let root = try makeTemporaryRoot(name: "OracleExportIgnored")
         try write("prompt-exports/\n", to: root.appendingPathComponent(".gitignore"))
         let store = WorkspaceFileContextStore()
@@ -93,23 +93,38 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         )
         let exportPath = root.appendingPathComponent("prompt-exports/oracle-plan-ignored.md").path
 
-        do {
-            _ = try await GeneratedOracleExportFileWriter(store: store).write(
-                path: exportPath,
-                content: "ignored",
-                destination: destination
-            )
-            XCTFail("Expected ignored generated export path to fail")
-        } catch {
-            let message = String(describing: error)
-            XCTAssertTrue(message.contains("not readable by read_file"), message)
-            XCTAssertTrue(message.contains("ignored") || message.contains("workspace policy"), message)
-        }
+        let resolvedPath = try await GeneratedOracleExportFileWriter(store: store).write(
+            path: exportPath,
+            content: "ignored",
+            destination: destination
+        )
 
+        XCTAssertEqual(resolvedPath, exportPath)
         let readableService = WorkspaceReadableFileService(store: store)
         let ignoredReadableFile = await readableService.resolveReadableFile(exportPath, profile: .mcpRead, rootScope: .visibleWorkspace)
-        XCTAssertNil(ignoredReadableFile, "Ignored generated export should remain unreadable through read_file semantics")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "Rejected generated exports should clean up unreadable disk artifacts")
+        guard case let .workspace(file) = ignoredReadableFile else {
+            return XCTFail("Ignored generated export should remain exactly readable through read_file semantics")
+        }
+        let content = try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+        XCTAssertEqual(content, "ignored")
+        let searchSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertFalse(searchSnapshot.files.contains { $0.standardizedFullPath == exportPath })
+
+        let treeSnapshot = await store.makeFileTreeSelectionSnapshot(
+            selection: StoredSelection(),
+            request: WorkspaceFileTreeSnapshotRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                showCodeMapMarkers: false,
+                rootScope: .visibleWorkspace
+            ),
+            profile: .mcpRead
+        )
+        let tree = CodeMapExtractor.generateFileTree(using: treeSnapshot)
+        XCTAssertFalse(tree.contains("prompt-exports"), tree)
+        XCTAssertFalse(tree.contains("oracle-plan-ignored.md"), tree)
     }
 
     func testGeneratedExportWriterCleansUpSymlinkedExportPathFailure() async throws {

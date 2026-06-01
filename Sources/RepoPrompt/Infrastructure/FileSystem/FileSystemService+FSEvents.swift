@@ -63,6 +63,27 @@ extension FileSystemService {
         await catalogRegularFileEligibility(relativePath: rawRelativePath).isEligible
     }
 
+    func catalogFolderIsDiscoverable(relativePath rawRelativePath: String) async -> Bool {
+        let relativePath = (rawRelativePath as NSString).standardizingPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !relativePath.isEmpty, relativePath != "..", !relativePath.hasPrefix("../") else { return false }
+        let absolutePath = fullPath(forRelativePath: relativePath)
+        let standardizedAbsolutePath = (absolutePath as NSString).standardizingPath
+        let rootPrefix = standardizedRootPath.hasSuffix("/") ? standardizedRootPath : standardizedRootPath + "/"
+        guard standardizedAbsolutePath.hasPrefix(rootPrefix) else { return false }
+
+        var isDirectory = ObjCBool(false)
+        guard fm.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
+        if skipSymlinks && pathContainsSymlinkComponent(relativePath: relativePath) { return false }
+        let canonicalPath = URL(fileURLWithPath: standardizedAbsolutePath).resolvingSymlinksInPath().path
+        let canonicalPrefix = canonicalRootPath.hasSuffix("/") ? canonicalRootPath : canonicalRootPath + "/"
+        guard canonicalPath == canonicalRootPath || canonicalPath.hasPrefix(canonicalPrefix) else { return false }
+
+        if enableHierarchicalIgnores {
+            return await !(isIgnoredHierarchical(relativePath: relativePath, isDirectory: true) || isIgnoredPrefixCheck(relativePath: relativePath, isDirectory: true))
+        }
+        return !isIgnoredPrefixCheck(relativePath: relativePath, isDirectory: true)
+    }
+
     public func catalogRegularFileEligibility(relativePath rawRelativePath: String) async -> CatalogRegularFileEligibility {
         let relativePath = (rawRelativePath as NSString).standardizingPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !relativePath.isEmpty, !relativePath.hasPrefix("../"), relativePath != ".." else {
@@ -98,6 +119,19 @@ extension FileSystemService {
             isIgnoredPrefixCheck(relativePath: relativePath)
         }
         return isIgnored ? .ineligible(.ignored) : .eligible
+    }
+
+    func registerExplicitlyManagedRegularFile(relativePath rawRelativePath: String) async -> CatalogRegularFileEligibility {
+        let eligibility = await catalogRegularFileEligibility(relativePath: rawRelativePath)
+        switch eligibility {
+        case .eligible, .ineligible(.ignored):
+            let relativePath = (rawRelativePath as NSString).standardizingPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            visitedPaths.insert(relativePath)
+            visitedItems[relativePath] = false
+        case .ineligible:
+            break
+        }
+        return eligibility
     }
 
     func pathContainsSymlinkComponent(relativePath: String) -> Bool {
@@ -686,7 +720,7 @@ extension FileSystemService {
             let shouldIgnore: Bool = if enableHierarchicalIgnores {
                 await isIgnoredHierarchical(relativePath: relPath, isDirectory: isDir)
             } else {
-                isIgnoredPrefixCheck(relativePath: relPath)
+                isIgnoredPrefixCheck(relativePath: relPath, isDirectory: isDir)
             }
 
             #if DEBUG
@@ -1024,7 +1058,7 @@ extension FileSystemService {
                     if await !isIgnoredHierarchicalDir(parent) {
                         trackFolder(parent, eventId: eventId)
                     }
-                } else if !isIgnoredPrefixCheck(relativePath: parent) {
+                } else if !isIgnoredPrefixCheck(relativePath: parent, isDirectory: true) {
                     trackFolder(parent, eventId: eventId)
                 }
             }

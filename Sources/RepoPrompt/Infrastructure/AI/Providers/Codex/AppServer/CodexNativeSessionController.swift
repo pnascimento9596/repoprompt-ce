@@ -277,7 +277,6 @@ final class CodexNativeSessionController {
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
-        var startNewThreadsEphemerally: Bool = false
 
         static func agentModeDefault(
             forceExperimentalSteering: Bool,
@@ -312,8 +311,7 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider,
-                startNewThreadsEphemerally: false
+                computerUseEnabledProvider: computerUseEnabledProvider
             )
         }
     }
@@ -871,9 +869,6 @@ final class CodexNativeSessionController {
                 }
                 if !baseInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     params["baseInstructions"] = baseInstructions
-                }
-                if options.startNewThreadsEphemerally {
-                    params["ephemeral"] = true
                 }
                 result = try await requestWithCompatibleAppServerRequestValueStyle(
                     method: "thread/start",

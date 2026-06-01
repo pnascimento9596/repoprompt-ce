@@ -1022,8 +1022,7 @@ extension OracleViewModel {
             overrideMode: effectiveMode,
             gitInclusionOverride: nil,
             gitBaseOverride: nil,
-            selectionOverride: selectionOverride,
-            queryOrigin: .oracle
+            selectionOverride: selectionOverride
         )
         let queryId = activeQueryId(for: chatID) ?? currentQueryId
 

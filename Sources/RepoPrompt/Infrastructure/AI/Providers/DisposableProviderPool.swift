@@ -25,8 +25,7 @@ actor DisposableProviderPool {
     func createProvider(
         for model: AIModel,
         ollamaURL: URL? = nil,
-        azureConfiguration: AzureOpenAIConfiguration? = nil,
-        startNewCodexThreadsEphemerally: Bool = false
+        azureConfiguration: AzureOpenAIConfiguration? = nil
     ) async throws -> AIProvider {
         let providerType = model.providerType
 
@@ -44,8 +43,7 @@ actor DisposableProviderPool {
             return try await createStandardProvider(
                 for: model,
                 ollamaURL: ollamaURL,
-                azureConfiguration: azureConfiguration,
-                startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally
+                azureConfiguration: azureConfiguration
             )
         }
     }
@@ -137,8 +135,7 @@ actor DisposableProviderPool {
     private func createStandardProvider(
         for model: AIModel,
         ollamaURL: URL?,
-        azureConfiguration: AzureOpenAIConfiguration?,
-        startNewCodexThreadsEphemerally: Bool
+        azureConfiguration: AzureOpenAIConfiguration?
     ) async throws -> AIProvider {
         let providerType = model.providerType
 
@@ -164,8 +161,7 @@ actor DisposableProviderPool {
             key: finalKey,
             ollamaURL: ollamaURL,
             azureConfiguration: azureConfiguration,
-            model: model.rawValue,
-            startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally
+            model: model.rawValue
         )
     }
 

@@ -5,8 +5,7 @@ class AIProviderFactory {
         for providerType: AIProviderType,
         keyManager: KeyManager,
         ollamaURL: URL? = nil,
-        azureConfiguration: AzureOpenAIConfiguration? = nil,
-        startNewCodexThreadsEphemerally: Bool = false
+        azureConfiguration: AzureOpenAIConfiguration? = nil
     ) async throws -> AIProvider {
         // If Azure config is provided, skip key fetching
         if providerType == .azure, let config = azureConfiguration {
@@ -14,8 +13,7 @@ class AIProviderFactory {
                 for: providerType,
                 key: "",
                 ollamaURL: ollamaURL,
-                azureConfiguration: config,
-                startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally
+                azureConfiguration: config
             )
         }
 
@@ -25,8 +23,7 @@ class AIProviderFactory {
                 for: providerType,
                 key: "",
                 ollamaURL: ollamaURL,
-                azureConfiguration: azureConfiguration,
-                startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally
+                azureConfiguration: azureConfiguration
             )
         }
 
@@ -37,8 +34,7 @@ class AIProviderFactory {
             for: providerType,
             key: key,
             ollamaURL: ollamaURL,
-            azureConfiguration: azureConfiguration,
-            startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally
+            azureConfiguration: azureConfiguration
         )
     }
 
@@ -47,8 +43,7 @@ class AIProviderFactory {
         key: String,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
-        model: String? = nil,
-        startNewCodexThreadsEphemerally: Bool = false
+        model: String? = nil
     ) async throws -> AIProvider {
         switch providerType {
         case .anthropic:
@@ -87,7 +82,7 @@ class AIProviderFactory {
             return ClaudeCodeProvider()
         case .codex:
             // Standard non-agent Codex chat owns a fresh app-server client per request.
-            return CodexCLIProvider(startNewCodexThreadsEphemerally: startNewCodexThreadsEphemerally)
+            return CodexCLIProvider()
         case .openCode:
             return OpenCodeCLIProvider()
         case .cursor:

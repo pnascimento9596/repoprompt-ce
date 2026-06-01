@@ -8,6 +8,64 @@ import Foundation
 extension FileSystemService {
     // MARK: - File and folder manipulation utilities
 
+    private func mutationTarget(
+        forRelativePath rawRelativePath: String,
+        rejectExistingLeafSymlink: Bool = true
+    ) throws -> (relativePath: String, url: URL) {
+        guard !rawRelativePath.hasPrefix("/"), !StandardizedPath.containsNUL(rawRelativePath) else {
+            throw FileSystemError.invalidRelativePath
+        }
+        let relativePath = StandardizedPath.relative(rawRelativePath)
+        guard !relativePath.isEmpty,
+              relativePath != "..",
+              !relativePath.hasPrefix("../")
+        else {
+            throw FileSystemError.invalidRelativePath
+        }
+
+        let url = rootURL.appendingPathComponent(relativePath).standardizedFileURL
+        guard url.path != standardizedRootPath,
+              StandardizedPath.isDescendant(url.path, of: standardizedRootPath)
+        else {
+            throw FileSystemError.invalidRelativePath
+        }
+
+        var current = rootURL
+        for component in relativePath.split(separator: "/").dropLast() {
+            current.appendPathComponent(String(component))
+            guard !pathIsSymbolicLink(current.path) else { throw FileSystemError.invalidRelativePath }
+            var isDirectory = ObjCBool(false)
+            guard fm.fileExists(atPath: current.path, isDirectory: &isDirectory) else { break }
+            guard isDirectory.boolValue else { throw FileSystemError.invalidRelativePath }
+        }
+
+        let canonicalParentPath = url.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path
+        guard canonicalParentPath == canonicalRootPath || StandardizedPath.isDescendant(canonicalParentPath, of: canonicalRootPath) else {
+            throw FileSystemError.invalidRelativePath
+        }
+        if rejectExistingLeafSymlink, pathIsSymbolicLink(url.path) {
+            throw FileSystemError.invalidRelativePath
+        }
+        return (relativePath, url)
+    }
+
+    private func pathIsSymbolicLink(_ path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return false }
+        return info.st_mode & S_IFMT == S_IFLNK
+    }
+
+    private func requireRegularMutationSource(relativePath: String) async throws {
+        switch await catalogRegularFileEligibility(relativePath: relativePath) {
+        case .eligible, .ineligible(.ignored):
+            return
+        case .ineligible(.missingOrDirectory):
+            throw FileSystemError.fileNotFound
+        case .ineligible:
+            throw FileSystemError.invalidRelativePath
+        }
+    }
+
     /// Atomically move/rename a **file** inside the same root.
     func moveFile(
         atRelativePath oldRelPath: String,
@@ -16,15 +74,12 @@ extension FileSystemService {
         let fm = fm // Cache for multiple calls in this method
 
         // --- prepare -----------------------------------------------------
-        // ── 0. Validate that both paths are *relative* to `self.path` ──────────
-        guard !oldRelPath.hasPrefix("/"),
-              !newRelPath.hasPrefix("/")
-        else {
-            throw FileSystemError.invalidRelativePath
-        }
-
-        let oldFull = fullPath(forRelativePath: oldRelPath)
-        let newFull = fullPath(forRelativePath: newRelPath)
+        // ── 0. Validate that both paths stay inside the loaded root ─────────────
+        let oldTarget = try mutationTarget(forRelativePath: oldRelPath)
+        let newTarget = try mutationTarget(forRelativePath: newRelPath)
+        let oldFull = oldTarget.url.path
+        let newFull = newTarget.url.path
+        try await requireRegularMutationSource(relativePath: oldTarget.relativePath)
 
         // 1) Source must exist
         guard fm.fileExists(atPath: oldFull, isDirectory: nil) else {
@@ -43,6 +98,7 @@ extension FileSystemService {
             withIntermediateDirectories: true,
             attributes: nil
         )
+        _ = try mutationTarget(forRelativePath: newTarget.relativePath)
 
         // --- 1. do I/O off-actor ----------------------------------------
         // 4) Perform the move on disk
@@ -54,10 +110,19 @@ extension FileSystemService {
             throw FileSystemError.failedToCreateFile(error)
         }
 
+        let destinationEligibility = await catalogRegularFileEligibility(relativePath: newTarget.relativePath)
+        switch destinationEligibility {
+        case .eligible, .ineligible(.ignored):
+            break
+        case .ineligible:
+            try? FileManager.default.moveItem(atPath: newFull, toPath: oldFull)
+            throw FileSystemError.invalidRelativePath
+        }
+
         // --- 2. in-memory bookkeeping (still inside actor) --------------
         // 5) Immediate in‑memory bookkeeping (fixes race window) ───────────────
-        let stdOld = (oldRelPath as NSString).standardizingPath
-        let stdNew = (newRelPath as NSString).standardizingPath
+        let stdOld = oldTarget.relativePath
+        let stdNew = newTarget.relativePath
 
         if let wasDir = visitedItems.removeValue(forKey: stdOld) {
             visitedItems[stdNew] = wasDir // will be 'false' for files
@@ -78,12 +143,14 @@ extension FileSystemService {
     func createFile(atRelativePath relativePath: String, content: String) async throws {
         let fm = fm // Cache for multiple calls in this method
         // --- prepare -----------------------------------------------------
-        let fullPath = fullPath(forRelativePath: relativePath)
-        let fullURL = URL(fileURLWithPath: fullPath)
+        let target = try mutationTarget(forRelativePath: relativePath)
+        let fullPath = target.url.path
+        let fullURL = target.url
 
         // Ensure directory exists (this is fast, keep it in-actor)
         let directoryURL = fullURL.deletingLastPathComponent()
         try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
+        _ = try mutationTarget(forRelativePath: target.relativePath)
 
         // Check if file already exists
         if fm.fileExists(atPath: fullPath, isDirectory: nil) {
@@ -111,52 +178,48 @@ extension FileSystemService {
             throw FileSystemError.failedToCreateFile(error)
         }
 
+        switch await catalogRegularFileEligibility(relativePath: target.relativePath) {
+        case .eligible, .ineligible(.ignored):
+            break
+        case .ineligible:
+            try? fm.removeItem(at: fullURL)
+            forgetTrackedPath(target.relativePath)
+            throw FileSystemError.invalidRelativePath
+        }
+
         // --- 2. in-memory bookkeeping (still inside actor) --------------
         // update encoding cache (new files default to UTF-8)
-        encodingMap[relativePath] = .utf8
+        encodingMap[target.relativePath] = .utf8
 
         // update visited* sets
-        if !visitedPaths.contains(relativePath) {
-            visitedPaths.insert(relativePath)
-            visitedItems[relativePath] = false
+        if !visitedPaths.contains(target.relativePath) {
+            visitedPaths.insert(target.relativePath)
+            visitedItems[target.relativePath] = false
         }
 
         // emit a *synthetic* delta so the UI updates immediately
-        changePublisher.send([.fileAdded(relativePath)])
+        changePublisher.send([.fileAdded(target.relativePath)])
     }
 
     func deleteFile(atRelativePath relativePath: String) async throws {
-        let fullPath = fullPath(forRelativePath: relativePath)
-        let url = URL(fileURLWithPath: fullPath)
+        let target = try mutationTarget(forRelativePath: relativePath)
+        try await requireRegularMutationSource(relativePath: target.relativePath)
+        let url = target.url
         do {
             try fm.removeItem(at: url)
             fileSystemDebugLog("File deleted at \(url.path)")
         } catch {
             throw FileSystemError.failedToDeleteFile(error)
         }
+        forgetTrackedPath(target.relativePath)
+        changePublisher.send([.fileRemoved(target.relativePath)])
     }
 
     func moveItemToTrash(atRelativePath relativePath: String) async throws {
-        guard !relativePath.hasPrefix("/") else {
-            throw FileSystemError.invalidRelativePath
-        }
-
-        let normalizedRelativePath = Self.trimPathSlashes((relativePath as NSString).standardizingPath)
-        guard !normalizedRelativePath.isEmpty,
-              normalizedRelativePath != ".",
-              !normalizedRelativePath.hasPrefix("../"),
-              normalizedRelativePath != ".."
-        else {
-            throw FileSystemError.invalidRelativePath
-        }
-
-        let url = rootURL.appendingPathComponent(normalizedRelativePath).standardizedFileURL
+        let target = try mutationTarget(forRelativePath: relativePath)
+        let normalizedRelativePath = target.relativePath
+        let url = target.url
         let fullPath = url.path
-        guard fullPath != standardizedRootPath,
-              hasDirectoryPrefix(fullPath, standardizedRootPath)
-        else {
-            throw FileSystemError.invalidRelativePath
-        }
 
         var isDirectory = ObjCBool(false)
         guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
@@ -186,6 +249,12 @@ extension FileSystemService {
         }
     }
 
+    private func forgetTrackedPath(_ relativePath: String) {
+        encodingMap.removeValue(forKey: relativePath)
+        visitedPaths.remove(relativePath)
+        visitedItems.removeValue(forKey: relativePath)
+    }
+
     private func moveURLToTrash(_ url: URL) throws -> URL? {
         #if DEBUG
             return try fm.moveItemToTrash(at: url)
@@ -199,12 +268,21 @@ extension FileSystemService {
     /// Re-written non-blocking version
     func editFile(atRelativePath relativePath: String, newContent: String) async throws {
         // --- prepare -----------------------------------------------------
-        let fullPath = fullPath(forRelativePath: relativePath)
-        let fullURL = URL(fileURLWithPath: fullPath)
+        let target = try mutationTarget(forRelativePath: relativePath)
+        let fullPath = target.url.path
+        let fullURL = target.url
         guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
             throw FileSystemError.fileNotFound
         }
-        let enc = encodingMap[relativePath] ?? .utf8
+        switch await catalogRegularFileEligibility(relativePath: target.relativePath) {
+        case .eligible, .ineligible(.ignored):
+            break
+        case .ineligible(.missingOrDirectory):
+            throw FileSystemError.fileNotFound
+        case .ineligible:
+            throw FileSystemError.invalidRelativePath
+        }
+        let enc = encodingMap[target.relativePath] ?? .utf8
         guard let data = newContent.data(using: enc) else {
             throw FileSystemError.failedToEditFile(
                 NSError(
@@ -224,19 +302,26 @@ extension FileSystemService {
             throw FileSystemError.failedToEditFile(error)
         }
 
+        switch await catalogRegularFileEligibility(relativePath: target.relativePath) {
+        case .eligible, .ineligible(.ignored):
+            break
+        case .ineligible:
+            throw FileSystemError.invalidRelativePath
+        }
+
         // --- 2. in-memory bookkeeping (still inside actor) --------------
         // refresh encoding cache
-        encodingMap[relativePath] = enc
+        encodingMap[target.relativePath] = enc
 
         // update visited* sets so later FSEvents don't look "new"
-        if !visitedPaths.contains(relativePath) {
-            visitedPaths.insert(relativePath)
-            visitedItems[relativePath] = false
+        if !visitedPaths.contains(target.relativePath) {
+            visitedPaths.insert(target.relativePath)
+            visitedItems[target.relativePath] = false
         }
 
         // emit a *synthetic* delta so the UI updates immediately, with mtime if available
-        let mdate = try? await getFileModificationDate(atRelativePath: relativePath)
-        changePublisher.send([.fileModified(relativePath, mdate)])
+        let mdate = try? await getFileModificationDate(atRelativePath: target.relativePath)
+        changePublisher.send([.fileModified(target.relativePath, mdate)])
     }
 
     func checkFilePermissions(atRelativePath relativePath: String) -> Bool {

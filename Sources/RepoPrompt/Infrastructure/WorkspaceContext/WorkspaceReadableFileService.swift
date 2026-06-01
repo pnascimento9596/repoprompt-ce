@@ -19,6 +19,22 @@ struct WorkspaceReadableFileService {
     ) async -> WorkspaceReadableFileHandle? {
         let trimmed = normalizedInput(userPath)
         guard !trimmed.isEmpty else { return nil }
+        switch await store.lookupCatalogFileForExplicitRequest(trimmed, rootScope: rootScope) {
+        case let .matched(file):
+            return .workspace(file)
+        case .ambiguous, .blocked:
+            return nil
+        case .noCandidate:
+            break
+        }
+        switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
+        case let .some(.materialized(file)):
+            return .workspace(file)
+        case .some(.ambiguous), .some(.blocked):
+            return nil
+        case .some(.noCandidate), .none:
+            break
+        }
         if let workspaceFile = await store.lookupPath(
             WorkspacePathLookupRequest(userPath: trimmed, profile: profile, rootScope: rootScope)
         )?.file {

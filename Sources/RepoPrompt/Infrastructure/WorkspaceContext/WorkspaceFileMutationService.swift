@@ -37,6 +37,22 @@ struct WorkspaceFileMutationService {
             guard await store.pruneMissingCatalogFilesForExactMutationLookup(trimmed, rootScope: rootScope) else { return nil }
             guard await store.exactPathResolutionIssue(for: trimmed, kind: .file, rootScope: rootScope) == nil else { return nil }
         }
+        switch await store.lookupCatalogFileForExplicitRequest(trimmed, rootScope: rootScope) {
+        case let .matched(file):
+            return await store.validateCatalogFileStillPresent(file)
+        case .ambiguous, .blocked:
+            return nil
+        case .noCandidate:
+            break
+        }
+        switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
+        case let .some(.materialized(file)):
+            return await store.validateCatalogFileStillPresent(file)
+        case .some(.ambiguous), .some(.blocked):
+            return nil
+        case .some(.noCandidate), .none:
+            break
+        }
         guard let file = await store.lookupPath(
             WorkspacePathLookupRequest(userPath: trimmed, profile: .moveSourceExact, rootScope: rootScope)
         )?.file else { return nil }
@@ -50,6 +66,18 @@ struct WorkspaceFileMutationService {
         let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
         if let file = await exactExistingFile(trimmed, rootScope: rootScope) {
             return file
+        }
+        switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
+        case let .some(.materialized(file)):
+            if let current = await store.validateCatalogFileStillPresent(file) { return current }
+        case .some(.ambiguous):
+            throw FileManagerError.fileSystemServiceNotFoundWithContext(
+                "Path '\(userPath)' matches multiple workspace roots. Use a root-qualified or absolute path."
+            )
+        case .some(.blocked):
+            throw FileManagerError.fileSystemServiceNotFoundWithContext("Unsafe workspace file path: \(userPath).")
+        case .some(.noCandidate), .none:
+            break
         }
         if let issue = await store.exactPathResolutionIssue(for: trimmed, kind: .file, rootScope: rootScope) {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(PathResolutionIssueRenderer.message(for: issue))

@@ -82,6 +82,20 @@ enum WorkspaceFileCatalogMaterializationResult: Equatable {
     }
 }
 
+enum WorkspaceExplicitFileMaterializationResult: Equatable {
+    case materialized(WorkspaceFileRecord)
+    case noCandidate
+    case blocked
+    case ambiguous
+}
+
+enum WorkspaceExplicitCatalogFileLookupResult: Equatable {
+    case matched(WorkspaceFileRecord)
+    case noCandidate
+    case blocked
+    case ambiguous
+}
+
 actor WorkspaceFileContextStore {
     private struct RootState {
         let root: WorkspaceRootRecord
@@ -119,6 +133,11 @@ actor WorkspaceFileContextStore {
         }
     #endif
 
+    private enum ExplicitDiskLookupCandidatesResult {
+        case candidates([(rootID: UUID, relativePath: String)])
+        case ambiguousAlias
+    }
+
     private struct RootIndexBuffers {
         var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
         var filesByID: [UUID: WorkspaceFileRecord] = [:]
@@ -132,6 +151,8 @@ actor WorkspaceFileContextStore {
     private var filesByID: [UUID: WorkspaceFileRecord] = [:]
     private var folderIDsByStandardizedFullPath: [String: UUID] = [:]
     private var fileIDsByStandardizedFullPath: [String: UUID] = [:]
+    private var managedOnlyFileIDs = Set<UUID>()
+    private var managedOnlyFolderIDs = Set<UUID>()
     private var rootLoadOrder: [UUID] = []
     private var unloadingRootPaths: Set<String> = []
     private var unloadWaitersByRootPath: [String: [UUID: CheckedContinuation<Void, Error>]] = [:]
@@ -263,6 +284,7 @@ actor WorkspaceFileContextStore {
     private func handleObservedFileSystemDeltas(_ deltas: [FileSystemDelta], root: WorkspaceRootRecord) async {
         guard rootStatesByID[root.id] != nil else { return }
         for delta in deltas {
+            guard await isDiscoveryFacingFileSystemDelta(delta, rootID: root.id) else { continue }
             yieldFileSystemDeltaEvent(WorkspaceFileSystemDeltaEvent(
                 rootID: root.id,
                 rootPath: root.standardizedFullPath,
@@ -274,15 +296,35 @@ actor WorkspaceFileContextStore {
         await applyPreparedIndexDeltas(rootID: root.id, deltas: preparedDeltas)
     }
 
+    private func isDiscoveryFacingFileSystemDelta(_ delta: FileSystemDelta, rootID: UUID) async -> Bool {
+        guard let state = rootStatesByID[rootID] else { return false }
+        switch delta {
+        case let .fileAdded(relativePath):
+            return await state.service.catalogEligibleRegularFileExists(relativePath: relativePath)
+        case let .folderAdded(relativePath):
+            return await state.service.catalogFolderIsDiscoverable(relativePath: relativePath)
+        case let .fileRemoved(relativePath), let .fileModified(relativePath, _):
+            guard let file = file(rootID: rootID, relativePath: relativePath) else { return false }
+            return isDiscoverableFileID(file.id)
+        case let .folderRemoved(relativePath), let .folderModified(relativePath, _):
+            guard let folder = folder(rootID: rootID, relativePath: relativePath) else { return false }
+            return isDiscoverableFolderID(folder.id)
+        }
+    }
+
     func files(inRoot rootID: UUID) -> [WorkspaceFileRecord] {
         guard let state = rootStatesByID[rootID] else { return [] }
-        return state.fileIDsByRelativePath.values.compactMap { filesByID[$0] }
+        return state.fileIDsByRelativePath.values
+            .filter(isDiscoverableFileID)
+            .compactMap { filesByID[$0] }
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
     }
 
     func folders(inRoot rootID: UUID) -> [WorkspaceFolderRecord] {
         guard let state = rootStatesByID[rootID] else { return [] }
-        return state.folderIDsByRelativePath.values.compactMap { foldersByID[$0] }
+        return state.folderIDsByRelativePath.values
+            .filter(isDiscoverableFolderID)
+            .compactMap { foldersByID[$0] }
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
     }
 
@@ -294,10 +336,10 @@ actor WorkspaceFileContextStore {
         let roots = rootsForPathLookup(scope: rootScope)
         let allowedRootIDs = Set(roots.map(\.id))
         let folderCount = foldersByID.values.reduce(into: 0) { count, folder in
-            if allowedRootIDs.contains(folder.rootID) { count += 1 }
+            if allowedRootIDs.contains(folder.rootID), isDiscoverableFolderID(folder.id) { count += 1 }
         }
         let fileCount = filesByID.values.reduce(into: 0) { count, file in
-            if allowedRootIDs.contains(file.rootID) { count += 1 }
+            if allowedRootIDs.contains(file.rootID), isDiscoverableFileID(file.id) { count += 1 }
         }
         return WorkspaceCatalogDiagnostics(
             generation: scopedSnapshotGeneration(scope: rootScope),
@@ -313,7 +355,7 @@ actor WorkspaceFileContextStore {
         let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
         let allowedRootIDs = Set(rootsByID.keys)
         let files = filesByID.values
-            .filter { allowedRootIDs.contains($0.rootID) }
+            .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.id) }
             .sorted {
                 if $0.standardizedFullPath == $1.standardizedFullPath {
                     return $0.id.uuidString < $1.id.uuidString
@@ -329,7 +371,7 @@ actor WorkspaceFileContextStore {
             rootScope: rootScope,
             rootCount: roots.count,
             folderCount: foldersByID.values.reduce(into: 0) { count, folder in
-                if allowedRootIDs.contains(folder.rootID) { count += 1 }
+                if allowedRootIDs.contains(folder.rootID), isDiscoverableFolderID(folder.id) { count += 1 }
             },
             fileCount: files.count
         )
@@ -354,13 +396,16 @@ actor WorkspaceFileContextStore {
     }
 
     func directFolderChildren(folderID: UUID) -> WorkspaceDirectFolderChildrenSnapshot? {
-        guard let folder = foldersByID[folderID],
+        guard isDiscoverableFolderID(folderID),
+              let folder = foldersByID[folderID],
               let state = rootStatesByID[folder.rootID]
         else { return nil }
         let childFolders = (state.childFolderIDsByFolderID[folderID] ?? [])
+            .filter(isDiscoverableFolderID)
             .compactMap { foldersByID[$0] }
             .sorted(by: compareDirectChildFolders)
         let childFiles = (state.childFileIDsByFolderID[folderID] ?? [])
+            .filter(isDiscoverableFileID)
             .compactMap { filesByID[$0] }
             .sorted(by: compareDirectChildFiles)
         return WorkspaceDirectFolderChildrenSnapshot(
@@ -524,7 +569,9 @@ actor WorkspaceFileContextStore {
     }
 
     func allCodemapSnapshots() -> [WorkspaceCodemapSnapshot] {
-        codemapSnapshotsByFileID.values.sorted { $0.fullPath < $1.fullPath }
+        codemapSnapshotsByFileID.values
+            .filter { isDiscoverableFileID($0.fileID) }
+            .sorted { $0.fullPath < $1.fullPath }
     }
 
     func allCodemapFileAPIs() -> [FileAPI] {
@@ -532,21 +579,24 @@ actor WorkspaceFileContextStore {
     }
 
     func codemapSnapshotDictionary() -> [UUID: WorkspaceCodemapSnapshot] {
-        codemapSnapshotsByFileID
+        codemapSnapshotsByFileID.filter { isDiscoverableFileID($0.key) }
     }
 
     func codemapSnapshots(inRoot rootID: UUID) -> [WorkspaceCodemapSnapshot] {
         guard let fileIDs = codemapFileIDsByRootID[rootID] else { return [] }
-        return fileIDs.compactMap { codemapSnapshotsByFileID[$0] }
+        return fileIDs
+            .filter(isDiscoverableFileID)
+            .compactMap { codemapSnapshotsByFileID[$0] }
             .sorted { $0.relativePath < $1.relativePath }
     }
 
     func codemapSnapshot(fileID: UUID) -> WorkspaceCodemapSnapshot? {
-        codemapSnapshotsByFileID[fileID]
+        guard isDiscoverableFileID(fileID) else { return nil }
+        return codemapSnapshotsByFileID[fileID]
     }
 
     func codemapSnapshot(rootID: UUID, relativePath: String) -> WorkspaceCodemapSnapshot? {
-        guard let file = file(rootID: rootID, relativePath: relativePath) else { return nil }
+        guard let file = file(rootID: rootID, relativePath: relativePath), isDiscoverableFileID(file.id) else { return nil }
         return codemapSnapshotsByFileID[file.id]
     }
 
@@ -556,6 +606,7 @@ actor WorkspaceFileContextStore {
         var droppedPaths: [String] = []
         for result in results {
             guard let fileID = fileIDsByStandardizedFullPath[result.fullPath],
+                  isDiscoverableFileID(fileID),
                   let file = filesByID[fileID],
                   let state = rootStatesByID[file.rootID]
             else {
@@ -588,7 +639,7 @@ actor WorkspaceFileContextStore {
         return Array(Set(droppedPaths)).sorted()
     }
 
-    func ensureIndexedFiles(paths: [String]) -> [String] {
+    func ensureIndexedFiles(paths: [String]) async -> [String] {
         var indexed: [String] = []
         var upsertedFilesByRoot: [UUID: [WorkspaceFileRecord]] = [:]
         for rawPath in paths {
@@ -600,7 +651,9 @@ actor WorkspaceFileContextStore {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
             let relativePath = relativePath(for: fullPath, rootPath: root.standardizedFullPath)
-            guard !relativePath.isEmpty else { continue }
+            guard !relativePath.isEmpty,
+                  await state.service.catalogEligibleRegularFileExists(relativePath: relativePath)
+            else { continue }
             var indexes = RootIndexBuffers()
             let hierarchy = relativePath.split(separator: "/").count
             indexFiles(
@@ -675,10 +728,26 @@ actor WorkspaceFileContextStore {
         profile: PathLocateProfile,
         rootScope: WorkspaceLookupRootScope
     ) async -> WorkspacePathLookupResult? {
-        if let direct = directAbsoluteLookup(userPath, rootScope: rootScope) {
+        switch lookupCatalogFileForExplicitRequest(userPath, rootScope: rootScope) {
+        case let .matched(file):
+            return lookupPath(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+        case .ambiguous, .blocked:
+            return nil
+        case .noCandidate:
+            break
+        }
+        switch try? await materializeExplicitlyRequestedFile(userPath, rootScope: rootScope) {
+        case let .some(.materialized(file)):
+            return lookupPath(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+        case .some(.ambiguous), .some(.blocked):
+            return nil
+        case .some(.noCandidate), .none:
+            break
+        }
+        if let direct = directAbsoluteLookup(userPath, rootScope: rootScope), isDiscoverableLookupResult(direct) {
             return direct
         }
-        if let direct = directUnambiguousRelativeLookup(userPath, rootScope: rootScope) {
+        if let direct = directUnambiguousRelativeLookup(userPath, rootScope: rootScope), isDiscoverableLookupResult(direct) {
             return direct
         }
         return await lookupPath(userPath, profile: profile, rootScope: rootScope)
@@ -710,9 +779,15 @@ actor WorkspaceFileContextStore {
         return matches.count == 1 ? matches[0] : nil
     }
 
+    private func isDiscoverableLookupResult(_ result: WorkspacePathLookupResult) -> Bool {
+        if let file = result.file, !isDiscoverableFileID(file.id) { return false }
+        if let folder = result.folder, !isDiscoverableFolderID(folder.id) { return false }
+        return true
+    }
+
     private func descendantFileIDs(in folderID: UUID, state: RootState) -> Set<UUID> {
-        var fileIDs = Set(state.childFileIDsByFolderID[folderID] ?? [])
-        for childFolderID in state.childFolderIDsByFolderID[folderID] ?? [] {
+        var fileIDs = Set((state.childFileIDsByFolderID[folderID] ?? []).filter(isDiscoverableFileID))
+        for childFolderID in (state.childFolderIDsByFolderID[folderID] ?? []).filter(isDiscoverableFolderID) {
             fileIDs.formUnion(descendantFileIDs(in: childFolderID, state: state))
         }
         return fileIDs
@@ -748,6 +823,10 @@ actor WorkspaceFileContextStore {
         startFolder: WorkspaceFolderRecord?
     ) -> FileTreeSelectionSnapshot {
         let selectedFileIDs = selectedStoreFileIDs
+        let explicitlyIncludedManagedOnlyFileIDs = request.mode == .selected
+            ? Set(selectedFileIDs.filter { managedOnlyFileIDs.contains($0) })
+            : []
+        let explicitlyIncludedManagedOnlyFolderIDs = managedOnlyAncestorFolderIDs(for: explicitlyIncludedManagedOnlyFileIDs)
         let roots: [FileTreeFolderSnapshot]
         if let startFolder,
            let state = rootStatesByID[startFolder.rootID],
@@ -758,7 +837,9 @@ actor WorkspaceFileContextStore {
                 startFolder,
                 rootStandardizedPath: root.standardizedFullPath,
                 state: state,
-                visited: &visited
+                visited: &visited,
+                explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
+                explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ).map { [$0] } ?? []
         } else if request.startPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
             roots = []
@@ -773,7 +854,9 @@ actor WorkspaceFileContextStore {
                     rootFolder,
                     rootStandardizedPath: root.standardizedFullPath,
                     state: state,
-                    visited: &visited
+                    visited: &visited,
+                    explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
+                    explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
                 )
             }
         }
@@ -1246,8 +1329,11 @@ actor WorkspaceFileContextStore {
         for entry in statesToUnload {
             let rootID = entry.rootID
             let state = entry.state
+            let discoverableFolderIDsByPath = state.folderIDsByRelativePath.filter { isDiscoverableFolderID($0.value) }
+            let discoverableFileIDsByPath = state.fileIDsByRelativePath.filter { isDiscoverableFileID($0.value) }
             rootPathsToUnload.append(state.root.standardizedFullPath)
             for folderID in state.folderIDsByRelativePath.values {
+                managedOnlyFolderIDs.remove(folderID)
                 if let folder = foldersByID.removeValue(forKey: folderID),
                    folderIDsByStandardizedFullPath[folder.standardizedFullPath] == folderID
                 {
@@ -1255,6 +1341,7 @@ actor WorkspaceFileContextStore {
                 }
             }
             for fileID in state.fileIDsByRelativePath.values {
+                managedOnlyFileIDs.remove(fileID)
                 if let file = filesByID.removeValue(forKey: fileID),
                    fileIDsByStandardizedFullPath[file.standardizedFullPath] == fileID
                 {
@@ -1268,10 +1355,10 @@ actor WorkspaceFileContextStore {
                 rootID: rootID,
                 rootPath: state.root.standardizedFullPath,
                 generation: generation,
-                removedFileIDs: Array(state.fileIDsByRelativePath.values),
-                removedFolderIDs: Array(state.folderIDsByRelativePath.values),
-                removedFilePaths: Array(state.fileIDsByRelativePath.keys).sorted(),
-                removedFolderPaths: Array(state.folderIDsByRelativePath.keys).sorted(),
+                removedFileIDs: Array(discoverableFileIDsByPath.values),
+                removedFolderIDs: Array(discoverableFolderIDsByPath.values),
+                removedFilePaths: Array(discoverableFileIDsByPath.keys).sorted(),
+                removedFolderPaths: Array(discoverableFolderIDsByPath.keys).sorted(),
                 requiresFullResync: true,
                 isRootUnload: true
             ))
@@ -1538,7 +1625,7 @@ actor WorkspaceFileContextStore {
         var requests: [CodeScanActor.ScanRequest] = []
         requests.reserveCapacity(files.count)
         for file in files {
-            guard let state = rootStatesByID[file.rootID] else { continue }
+            guard isDiscoverableFileID(file.id), let state = rootStatesByID[file.rootID] else { continue }
             do {
                 let loaded = try await state.service.loadContentWithDate(ofRelativePath: file.standardizedRelativePath)
                 guard let content = loaded.content else { continue }
@@ -1578,7 +1665,9 @@ actor WorkspaceFileContextStore {
         }
         if let file = file(rootID: rootID, relativePath: standardizedRelativePath) {
             invalidateCodemapSnapshot(rootID: rootID, relativePath: standardizedRelativePath)
-            publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
+            if isDiscoverableFileID(file.id) {
+                publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
+            }
             return .materialized(file)
         }
         return try await materializeCatalogFileAfterDiskWrite(rootID: rootID, relativePath: standardizedRelativePath)
@@ -1589,17 +1678,28 @@ actor WorkspaceFileContextStore {
         let oldPath = StandardizedPath.relative(oldRelativePath)
         let newPath = StandardizedPath.relative(newRelativePath)
         let oldFile = file(rootID: rootID, relativePath: oldPath)
+        let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         try await state.service.moveFile(
             atRelativePath: oldPath,
             toRelativePath: newPath
         )
+        let destinationEligibility = await state.service.catalogRegularFileEligibility(relativePath: newPath)
+        let destinationManagedOnly: Bool
+        switch destinationEligibility {
+        case .eligible:
+            destinationManagedOnly = false
+        case .ineligible(.ignored):
+            destinationManagedOnly = true
+        case let .ineligible(reason):
+            throw WorkspaceFileContextStoreError.catalogMaterializationFailed("moved file is not catalog-eligible at destination: \(reason.description)")
+        }
         removeFile(relativePath: oldPath, rootID: rootID)
-        indexFile(relativePath: newPath, root: state.root)
+        indexFile(relativePath: newPath, root: state.root, managedOnly: destinationManagedOnly)
         publishAppliedIndexEvent(
             root: state.root,
-            upsertedFiles: file(rootID: rootID, relativePath: newPath).map { [$0] } ?? [],
-            removedFileIDs: oldFile.map { [$0.id] } ?? [],
-            removedFilePaths: oldFile.map { [$0.standardizedRelativePath] } ?? []
+            upsertedFiles: destinationManagedOnly ? [] : (file(rootID: rootID, relativePath: newPath).map { [$0] } ?? []),
+            removedFileIDs: oldFileWasDiscoverable ? (oldFile.map { [$0.id] } ?? []) : [],
+            removedFilePaths: oldFileWasDiscoverable ? (oldFile.map { [$0.standardizedRelativePath] } ?? []) : []
         )
     }
 
@@ -1607,6 +1707,7 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         let oldFile = file(rootID: rootID, relativePath: standardizedRelativePath)
+        let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         do {
             try await state.service.deleteFile(atRelativePath: standardizedRelativePath)
         } catch FileSystemError.fileNotFound {
@@ -1616,7 +1717,7 @@ actor WorkspaceFileContextStore {
             throw FileSystemError.fileNotFound
         }
         removeFile(relativePath: standardizedRelativePath, rootID: rootID)
-        if let oldFile {
+        if let oldFile, oldFileWasDiscoverable {
             publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
         }
     }
@@ -1625,7 +1726,9 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         let oldFile = file(rootID: rootID, relativePath: standardizedRelativePath)
+        let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         let oldFolder = folder(rootID: rootID, relativePath: standardizedRelativePath)
+        let oldFolderWasDiscoverable = oldFolder.map { isDiscoverableFolderID($0.id) } ?? false
         do {
             try await state.service.moveItemToTrash(atRelativePath: standardizedRelativePath)
         } catch FileSystemError.fileNotFound {
@@ -1636,15 +1739,17 @@ actor WorkspaceFileContextStore {
         }
         if let oldFile {
             removeFile(relativePath: standardizedRelativePath, rootID: rootID)
-            publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
+            if oldFileWasDiscoverable {
+                publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
+            }
         } else if let oldFolder {
             let removal = removeFolderTree(relativePath: standardizedRelativePath, rootID: rootID)
             publishAppliedIndexEvent(
                 root: state.root,
                 removedFileIDs: removal.fileIDs,
-                removedFolderIDs: removal.folderIDs.isEmpty ? [oldFolder.id] : removal.folderIDs,
+                removedFolderIDs: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs,
                 removedFilePaths: removal.filePaths,
-                removedFolderPaths: removal.folderPaths.isEmpty ? [oldFolder.standardizedRelativePath] : removal.folderPaths
+                removedFolderPaths: removal.folderPaths.isEmpty && oldFolderWasDiscoverable ? [oldFolder.standardizedRelativePath] : removal.folderPaths
             )
         }
     }
@@ -1719,6 +1824,114 @@ actor WorkspaceFileContextStore {
         return pruned
     }
 
+    /// Returns an exact cataloged file without touching disk. Disk recovery for ignored
+    /// files is intentionally reserved for absolute-path misses.
+    func lookupCatalogFileForExplicitRequest(
+        _ userPath: String,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) -> WorkspaceExplicitCatalogFileLookupResult {
+        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .noCandidate }
+        guard !StandardizedPath.containsNUL(trimmed) else { return .blocked }
+
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let standardized = StandardizedPath.absolute(expanded)
+        let roots = rootRefs(scope: rootScope)
+
+        if standardized.hasPrefix("/") {
+            guard let root = roots
+                .filter({ StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) })
+                .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })
+            else { return .noCandidate }
+            let relativePath = String(standardized.dropFirst(root.standardizedFullPath.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard let file = file(rootID: root.id, relativePath: relativePath) else { return .noCandidate }
+            return .matched(file)
+        }
+
+        switch WorkspaceAliasResolver.resolve(
+            userPath: standardized,
+            roots: roots,
+            options: RootAliasOptions(requireRemainder: true)
+        ) {
+        case let .prefixed(root, _, remainder):
+            guard let file = file(rootID: root.id, relativePath: remainder) else { return .noCandidate }
+            return .matched(file)
+        case .ambiguous:
+            return .ambiguous
+        case .bareRoot, .notAliasPrefixed:
+            break
+        }
+
+        let relativePath = StandardizedPath.relative(standardized)
+        guard !relativePath.isEmpty,
+              relativePath != "..",
+              !relativePath.hasPrefix("../")
+        else { return .blocked }
+        let matches = roots.compactMap { file(rootID: $0.id, relativePath: relativePath) }
+        guard matches.count <= 1 else { return .ambiguous }
+        return matches.first.map(WorkspaceExplicitCatalogFileLookupResult.matched) ?? .noCandidate
+    }
+
+    /// Resolves an exact file path that the caller explicitly requested, even when
+    /// discovery policy hides it. Ignore rules remain discovery filters: background scans,
+    /// replay, tree rendering, search, and fuzzy matching still skip managed-only files.
+    func materializeExplicitlyRequestedFile(
+        _ userPath: String,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) async throws -> WorkspaceExplicitFileMaterializationResult {
+        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .noCandidate }
+        guard !StandardizedPath.containsNUL(trimmed) else { return .blocked }
+        guard (trimmed as NSString).expandingTildeInPath.hasPrefix("/") else { return .noCandidate }
+
+        let candidates: [(rootID: UUID, relativePath: String)]
+        switch explicitDiskLookupCandidates(for: trimmed, rootScope: rootScope) {
+        case let .candidates(resolvedCandidates):
+            candidates = resolvedCandidates
+        case .ambiguousAlias:
+            return .ambiguous
+        }
+        var materializable: [(rootID: UUID, relativePath: String, managedOnly: Bool)] = []
+        var foundBlockedCandidate = false
+        for candidate in candidates {
+            guard let state = rootStatesByID[candidate.rootID] else { continue }
+            switch await state.service.catalogRegularFileEligibility(relativePath: candidate.relativePath) {
+            case .eligible:
+                materializable.append((candidate.rootID, candidate.relativePath, false))
+            case .ineligible(.ignored):
+                materializable.append((candidate.rootID, candidate.relativePath, true))
+            case .ineligible(.missingOrDirectory):
+                pruneCatalogFileMissingOnDisk(rootID: candidate.rootID, relativePath: candidate.relativePath, publishDelta: true)
+                continue
+            case .ineligible:
+                foundBlockedCandidate = true
+            }
+        }
+        guard materializable.count <= 1 else { return .ambiguous }
+        guard let candidate = materializable.first,
+              let state = rootStatesByID[candidate.rootID]
+        else { return foundBlockedCandidate ? .blocked : .noCandidate }
+        let registeredEligibility = await state.service.registerExplicitlyManagedRegularFile(relativePath: candidate.relativePath)
+        let managedOnly: Bool
+        switch registeredEligibility {
+        case .eligible:
+            managedOnly = false
+        case .ineligible(.ignored):
+            managedOnly = true
+        case .ineligible(.missingOrDirectory):
+            pruneCatalogFileMissingOnDisk(rootID: candidate.rootID, relativePath: candidate.relativePath, publishDelta: true)
+            return .noCandidate
+        case .ineligible:
+            return .blocked
+        }
+        return try .materialized(materializeCatalogRegularFile(
+            rootID: candidate.rootID,
+            relativePath: candidate.relativePath,
+            managedOnly: managedOnly
+        ))
+    }
+
     @discardableResult
     func materializeCatalogFileAfterDiskWrite(
         rootID: UUID,
@@ -1728,6 +1941,11 @@ actor WorkspaceFileContextStore {
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         let eligibility = await state.service.catalogRegularFileEligibility(relativePath: standardizedRelativePath)
         switch eligibility {
+        case .ineligible(.ignored):
+            // A direct app/MCP write is an explicit request to manage this exact file.
+            // Keep it available for follow-up read_file/apply_edits calls without making
+            // ignored siblings discoverable through scans or replay.
+            return try .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: true))
         case let .ineligible(reason):
             guard isExpectedDiskWriteCatalogIneligibility(reason) else {
                 throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
@@ -1736,11 +1954,92 @@ actor WorkspaceFileContextStore {
             }
             return .ineligible(reason)
         case .eligible:
+            return try .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: false))
+        }
+    }
+
+    private func explicitDiskLookupCandidates(
+        for userPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) -> ExplicitDiskLookupCandidatesResult {
+        let expanded = (userPath as NSString).expandingTildeInPath
+        let standardized = StandardizedPath.absolute(expanded)
+        let roots = rootRefs(scope: rootScope)
+        var candidates: [(rootID: UUID, relativePath: String)] = []
+        var seen = Set<String>()
+
+        func append(root: WorkspaceRootRef, relativePath rawRelativePath: String) {
+            let relativePath = StandardizedPath.relative(rawRelativePath)
+            guard !relativePath.isEmpty,
+                  relativePath != "..",
+                  !relativePath.hasPrefix("../")
+            else { return }
+            let absolutePath = StandardizedPath.join(
+                standardizedRoot: root.standardizedFullPath,
+                standardizedRelativePath: relativePath
+            )
+            guard StandardizedPath.isDescendant(absolutePath, of: root.standardizedFullPath) else { return }
+            let key = "\(root.id.uuidString)|\(relativePath)"
+            guard seen.insert(key).inserted else { return }
+            candidates.append((root.id, relativePath))
+        }
+
+        func appendAbsolute(_ absolutePath: String) {
+            guard let root = roots
+                .filter({ StandardizedPath.isDescendant(absolutePath, of: $0.standardizedFullPath) })
+                .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })
+            else { return }
+            let relativePath = String(absolutePath.dropFirst(root.standardizedFullPath.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            append(root: root, relativePath: relativePath)
+        }
+
+        if standardized.hasPrefix("/") {
+            appendAbsolute(standardized)
+            return .candidates(candidates)
+        }
+
+        switch WorkspaceAliasResolver.resolve(
+            userPath: standardized,
+            roots: roots,
+            options: RootAliasOptions(requireRemainder: true)
+        ) {
+        case let .prefixed(root, _, remainder):
+            append(root: root, relativePath: remainder)
+            return .candidates(candidates)
+        case .ambiguous:
+            return .ambiguousAlias
+        case .bareRoot, .notAliasPrefixed:
             break
         }
 
+        for root in roots {
+            append(root: root, relativePath: standardized)
+        }
+        return .candidates(candidates)
+    }
+
+    private func materializeCatalogRegularFile(
+        rootID: UUID,
+        relativePath: String,
+        managedOnly: Bool
+    ) throws -> WorkspaceFileRecord {
+        let state = try state(for: rootID)
+        let standardizedRelativePath = StandardizedPath.relative(relativePath)
         if let existing = file(rootID: rootID, relativePath: standardizedRelativePath) {
-            return .materialized(existing)
+            let wasManagedOnly = managedOnlyFileIDs.contains(existing.id)
+            if !managedOnly {
+                promoteToDiscoverable(existing)
+                if wasManagedOnly {
+                    invalidatePathMatchSnapshot(affectedRootKinds: [state.root.kind])
+                    publishAppliedIndexEvent(
+                        root: state.root,
+                        upsertedFiles: [existing],
+                        upsertedFolders: discoverableParentFolders(for: standardizedRelativePath, rootID: rootID)
+                    )
+                }
+            }
+            return existing
         }
 
         guard regularFileAppearsPresentOnDisk(root: state.root, relativePath: standardizedRelativePath) else {
@@ -1748,19 +2047,20 @@ actor WorkspaceFileContextStore {
                 "eligible file disappeared before it could be added to the workspace catalog: \(standardizedRelativePath)"
             )
         }
-        let existingFolderPaths = Set(state.folderIDsByRelativePath.keys)
-        indexFile(relativePath: standardizedRelativePath, root: state.root)
+        indexFile(relativePath: standardizedRelativePath, root: state.root, managedOnly: managedOnly)
         guard let file = file(rootID: rootID, relativePath: standardizedRelativePath) else {
             throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
                 "eligible file exists on disk but the workspace catalog did not return a record: \(standardizedRelativePath)"
             )
         }
-        publishAppliedIndexEvent(
-            root: state.root,
-            upsertedFiles: [file],
-            upsertedFolders: newlyIndexedParentFolders(for: standardizedRelativePath, rootID: rootID, existingFolderPaths: existingFolderPaths)
-        )
-        return .materialized(file)
+        if !managedOnly {
+            publishAppliedIndexEvent(
+                root: state.root,
+                upsertedFiles: [file],
+                upsertedFolders: discoverableParentFolders(for: standardizedRelativePath, rootID: rootID)
+            )
+        }
+        return file
     }
 
     private func isExpectedDiskWriteCatalogIneligibility(_ reason: CatalogRegularFileIneligibilityReason) -> Bool {
@@ -1792,8 +2092,9 @@ actor WorkspaceFileContextStore {
         guard let state = rootStatesByID[rootID],
               let oldFile = file(rootID: rootID, relativePath: relativePath)
         else { return false }
+        let oldFileWasDiscoverable = isDiscoverableFileID(oldFile.id)
         removeFile(relativePath: oldFile.standardizedRelativePath, rootID: rootID)
-        if publishDelta {
+        if publishDelta, oldFileWasDiscoverable {
             publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
         }
         return true
@@ -1812,14 +2113,15 @@ actor WorkspaceFileContextStore {
         guard let state = rootStatesByID[rootID],
               let oldFolder = folder(rootID: rootID, relativePath: standardizedRelativePath)
         else { return false }
+        let oldFolderWasDiscoverable = isDiscoverableFolderID(oldFolder.id)
         let removal = removeFolderTree(relativePath: standardizedRelativePath, rootID: rootID)
         if publishDelta {
             publishAppliedIndexEvent(
                 root: state.root,
                 removedFileIDs: removal.fileIDs,
-                removedFolderIDs: removal.folderIDs.isEmpty ? [oldFolder.id] : removal.folderIDs,
+                removedFolderIDs: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs,
                 removedFilePaths: removal.filePaths,
-                removedFolderPaths: removal.folderPaths.isEmpty ? [oldFolder.standardizedRelativePath] : removal.folderPaths
+                removedFolderPaths: removal.folderPaths.isEmpty && oldFolderWasDiscoverable ? [oldFolder.standardizedRelativePath] : removal.folderPaths
             )
         }
         return true
@@ -1854,8 +2156,12 @@ actor WorkspaceFileContextStore {
                     if !existed {
                         upsertedFolders.append(contentsOf: newlyIndexedParentFolders(for: relativePath, rootID: rootID, existingFolderPaths: existingFolderPaths))
                     }
+                    upsertedFolders.append(contentsOf: discoverableParentFolders(for: relativePath, rootID: rootID))
                 }
             case .folderAdded:
+                guard let state = rootStatesByID[rootID],
+                      await state.service.catalogFolderIsDiscoverable(relativePath: relativePath)
+                else { continue }
                 indexFolder(relativePath: relativePath, root: root)
                 if let folder = folder(rootID: rootID, relativePath: relativePath) {
                     // Same upsert semantics as files: repeated folder add deltas are
@@ -1864,25 +2170,29 @@ actor WorkspaceFileContextStore {
                 }
             case .fileRemoved:
                 if let oldFile = file(rootID: rootID, relativePath: relativePath) {
+                    let oldFileWasDiscoverable = isDiscoverableFileID(oldFile.id)
                     removeFile(relativePath: relativePath, rootID: rootID)
-                    removedFileIDs.append(oldFile.id)
-                    removedFilePaths.append(oldFile.standardizedRelativePath)
+                    if oldFileWasDiscoverable {
+                        removedFileIDs.append(oldFile.id)
+                        removedFilePaths.append(oldFile.standardizedRelativePath)
+                    }
                 }
             case .folderRemoved:
                 if let oldFolder = folder(rootID: rootID, relativePath: relativePath) {
+                    let oldFolderWasDiscoverable = isDiscoverableFolderID(oldFolder.id)
                     let removal = removeFolderTree(relativePath: relativePath, rootID: rootID)
                     removedFileIDs.append(contentsOf: removal.fileIDs)
-                    removedFolderIDs.append(contentsOf: removal.folderIDs.isEmpty ? [oldFolder.id] : removal.folderIDs)
+                    removedFolderIDs.append(contentsOf: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs)
                     removedFilePaths.append(contentsOf: removal.filePaths)
-                    removedFolderPaths.append(contentsOf: removal.folderPaths.isEmpty ? [oldFolder.standardizedRelativePath] : removal.folderPaths)
+                    removedFolderPaths.append(contentsOf: removal.folderPaths.isEmpty && oldFolderWasDiscoverable ? [oldFolder.standardizedRelativePath] : removal.folderPaths)
                 }
             case .fileModified:
                 if let file = file(rootID: rootID, relativePath: relativePath) {
                     invalidateCodemapSnapshot(rootID: rootID, relativePath: relativePath)
-                    modifiedFileIDs.append(file.id)
+                    if isDiscoverableFileID(file.id) { modifiedFileIDs.append(file.id) }
                 }
             case .folderModified:
-                if let folder = folder(rootID: rootID, relativePath: relativePath) {
+                if let folder = folder(rootID: rootID, relativePath: relativePath), isDiscoverableFolderID(folder.id) {
                     modifiedFolderIDs.append(folder.id)
                 }
             }
@@ -2078,10 +2388,30 @@ actor WorkspaceFileContextStore {
         profile: PathLocateProfile = .mcpSelection,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> [String: WorkspaceFileRecord] {
-        let requests = paths.map { WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope) }
-        let results = await lookupPaths(requests)
         var files: [String: WorkspaceFileRecord] = [:]
+        var generalLookupPaths: [String] = []
         for path in paths {
+            switch lookupCatalogFileForExplicitRequest(path, rootScope: rootScope) {
+            case let .matched(file):
+                files[path] = file
+                continue
+            case .ambiguous, .blocked:
+                continue
+            case .noCandidate:
+                break
+            }
+            switch try? await materializeExplicitlyRequestedFile(path, rootScope: rootScope) {
+            case let .some(.materialized(file)):
+                files[path] = file
+            case .some(.ambiguous), .some(.blocked):
+                continue
+            case .some(.noCandidate), .none:
+                generalLookupPaths.append(path)
+            }
+        }
+        let requests = generalLookupPaths.map { WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope) }
+        let results = await lookupPaths(requests)
+        for path in generalLookupPaths where files[path] == nil {
             if let file = results[path]?.file {
                 files[path] = file
             }
@@ -2104,6 +2434,7 @@ actor WorkspaceFileContextStore {
         let roots = rootRefs(scope: rootScope)
         if cleaned.hasPrefix("/") {
             if let folderID = folderIDsByStandardizedFullPath[StandardizedPath.absolute(cleaned)],
+               isDiscoverableFolderID(folderID),
                let folder = foldersByID[folderID],
                let root = rootRefs(scope: rootScope).first(where: { $0.id == folder.rootID })
             {
@@ -2116,7 +2447,7 @@ actor WorkspaceFileContextStore {
                     return (folder, ClientPathFormatter.displayPath(root: root, relativePath: "", visibleRoots: roots), nil)
                 }
             case let .prefixed(root, _, remainder):
-                if let folder = folder(rootID: root.id, relativePath: remainder) {
+                if let folder = folder(rootID: root.id, relativePath: remainder), isDiscoverableFolderID(folder.id) {
                     return (folder, ClientPathFormatter.displayPath(root: root, relativePath: folder.standardizedRelativePath, visibleRoots: roots), nil)
                 }
             case let .ambiguous(alias, matchingRoots):
@@ -2132,7 +2463,7 @@ actor WorkspaceFileContextStore {
                 return (folder, ClientPathFormatter.displayPath(root: root, relativePath: "", visibleRoots: roots), nil)
             }
         case let .prefixed(root, _, remainder):
-            if let folder = folder(rootID: root.id, relativePath: remainder) {
+            if let folder = folder(rootID: root.id, relativePath: remainder), isDiscoverableFolderID(folder.id) {
                 return (folder, ClientPathFormatter.displayPath(root: root, relativePath: folder.standardizedRelativePath, visibleRoots: roots), nil)
             }
         case let .ambiguous(alias, matchingRoots):
@@ -2143,7 +2474,7 @@ actor WorkspaceFileContextStore {
 
         let relative = StandardizedPath.relative(cleaned)
         let directRelativeMatches = roots.compactMap { root -> (WorkspaceRootRef, WorkspaceFolderRecord)? in
-            guard let folder = folder(rootID: root.id, relativePath: relative) else { return nil }
+            guard let folder = folder(rootID: root.id, relativePath: relative), isDiscoverableFolderID(folder.id) else { return nil }
             return (root, folder)
         }
         if directRelativeMatches.count == 1, let match = directRelativeMatches.first {
@@ -2189,9 +2520,9 @@ actor WorkspaceFileContextStore {
         case .file:
             return fileIDsByStandardizedFullPath[absolute] != nil
         case .folder:
-            return folderIDsByStandardizedFullPath[absolute] != nil
+            return folderIDsByStandardizedFullPath[absolute].map(isDiscoverableFolderID) ?? false
         case .either:
-            return fileIDsByStandardizedFullPath[absolute] != nil || folderIDsByStandardizedFullPath[absolute] != nil
+            return fileIDsByStandardizedFullPath[absolute] != nil || (folderIDsByStandardizedFullPath[absolute].map(isDiscoverableFolderID) ?? false)
         }
     }
 
@@ -2237,6 +2568,7 @@ actor WorkspaceFileContextStore {
         var fileRecords: [String: FileRecord] = [:]
         for file in filesByID.values.sorted(by: { $0.standardizedFullPath < $1.standardizedFullPath }) {
             guard allowedRootIDs.contains(file.rootID),
+                  isDiscoverableFileID(file.id),
                   let root = rootStatesByID[file.rootID]?.root,
                   fileRecords[file.standardizedFullPath] == nil
             else { continue }
@@ -2250,6 +2582,7 @@ actor WorkspaceFileContextStore {
         var folderRecords: [String: FolderRecord] = [:]
         for folder in foldersByID.values.sorted(by: { $0.standardizedFullPath < $1.standardizedFullPath }) {
             guard allowedRootIDs.contains(folder.rootID),
+                  isDiscoverableFolderID(folder.id),
                   let root = rootStatesByID[folder.rootID]?.root,
                   folderRecords[folder.standardizedFullPath] == nil
             else { continue }
@@ -2374,16 +2707,50 @@ actor WorkspaceFileContextStore {
         indexFolders([FSItemDTO(relativePath: relativePath, isDirectory: true, hierarchy: relativePath.split(separator: "/").count)], root: root, state: &state, indexes: &stagedIndexes)
         commit(stagedIndexes)
         rootStatesByID[root.id] = state
+        if let folder = folder(rootID: root.id, relativePath: relativePath) {
+            promoteFolderToDiscoverable(folder)
+        }
         invalidatePathMatchSnapshot(affectedRootKinds: [root.kind])
     }
 
-    private func indexFile(relativePath: String, root: WorkspaceRootRecord) {
+    private func indexFile(relativePath: String, root: WorkspaceRootRecord, managedOnly: Bool = false) {
         guard var state = rootStatesByID[root.id] else { return }
+        let existingFolderPaths = Set(state.folderIDsByRelativePath.keys)
         var stagedIndexes = RootIndexBuffers()
         indexFiles([FSItemDTO(relativePath: relativePath, isDirectory: false, hierarchy: relativePath.split(separator: "/").count)], root: root, state: &state, indexes: &stagedIndexes)
         commit(stagedIndexes)
         rootStatesByID[root.id] = state
+        if let file = file(rootID: root.id, relativePath: relativePath) {
+            if managedOnly {
+                managedOnlyFileIDs.insert(file.id)
+                for folder in newlyIndexedParentFolders(for: relativePath, rootID: root.id, existingFolderPaths: existingFolderPaths) {
+                    managedOnlyFolderIDs.insert(folder.id)
+                }
+            } else {
+                promoteToDiscoverable(file)
+            }
+        }
         invalidatePathMatchSnapshot(affectedRootKinds: [root.kind])
+    }
+
+    private func discoverableParentFolders(for fileRelativePath: String, rootID: UUID) -> [WorkspaceFolderRecord] {
+        guard let state = rootStatesByID[rootID] else { return [] }
+        let standardizedPath = StandardizedPath.relative(fileRelativePath)
+        var current = (standardizedPath as NSString).deletingLastPathComponent
+        var folders: [WorkspaceFolderRecord] = []
+        while !current.isEmpty, current != "." {
+            let key = StandardizedPath.relative(current)
+            if let folderID = state.folderIDsByRelativePath[key],
+               isDiscoverableFolderID(folderID),
+               let folder = foldersByID[folderID]
+            {
+                folders.append(folder)
+            }
+            let next = (key as NSString).deletingLastPathComponent
+            guard next != key else { break }
+            current = next
+        }
+        return folders.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
     }
 
     private func newlyIndexedParentFolders(
@@ -2423,6 +2790,10 @@ actor WorkspaceFileContextStore {
         modifiedFileIDs: [UUID] = [],
         modifiedFolderIDs: [UUID] = []
     ) {
+        let upsertedFiles = upsertedFiles.filter { isDiscoverableFileID($0.id) }
+        let upsertedFolders = upsertedFolders.filter { isDiscoverableFolderID($0.id) }
+        let modifiedFileIDs = modifiedFileIDs.filter(isDiscoverableFileID)
+        let modifiedFolderIDs = modifiedFolderIDs.filter(isDiscoverableFolderID)
         guard !upsertedFiles.isEmpty || !upsertedFolders.isEmpty || !removedFileIDs.isEmpty || !removedFolderIDs.isEmpty || !removedFilePaths.isEmpty || !removedFolderPaths.isEmpty || !modifiedFileIDs.isEmpty || !modifiedFolderIDs.isEmpty else { return }
         let generation = nextAppliedIndexGeneration(forRootID: root.id)
         yieldAppliedIndexEvent(WorkspaceAppliedIndexBatchEvent(
@@ -2466,6 +2837,7 @@ actor WorkspaceFileContextStore {
               let file = filesByID.removeValue(forKey: fileID)
         else { return nil }
         fileIDsByStandardizedFullPath.removeValue(forKey: file.standardizedFullPath)
+        managedOnlyFileIDs.remove(fileID)
         codemapSnapshotsByFileID.removeValue(forKey: fileID)
         codemapFileIDsByRootID[file.rootID]?.remove(fileID)
         if let parentID = file.parentFolderID {
@@ -2487,7 +2859,8 @@ actor WorkspaceFileContextStore {
         var removedFileIDs: [UUID] = []
         var removedFilePaths: [String] = []
         for path in filePaths {
-            if let removedFileID = removeFile(relativePath: path, state: &state) {
+            let wasDiscoverable = state.fileIDsByRelativePath[path].map(isDiscoverableFileID) ?? false
+            if let removedFileID = removeFile(relativePath: path, state: &state), wasDiscoverable {
                 removedFileIDs.append(removedFileID)
                 removedFilePaths.append(path)
             }
@@ -2502,8 +2875,12 @@ actor WorkspaceFileContextStore {
             guard let id = state.folderIDsByRelativePath.removeValue(forKey: path),
                   let removed = foldersByID.removeValue(forKey: id)
             else { continue }
-            removedFolderIDs.append(id)
-            removedFolderPaths.append(path)
+            let wasDiscoverable = isDiscoverableFolderID(id)
+            if wasDiscoverable {
+                removedFolderIDs.append(id)
+                removedFolderPaths.append(path)
+            }
+            managedOnlyFolderIDs.remove(id)
             folderIDsByStandardizedFullPath.removeValue(forKey: removed.standardizedFullPath)
             if let parentID = removed.parentFolderID {
                 state.childFolderIDsByFolderID[parentID]?.removeAll { $0 == id }
@@ -2523,6 +2900,29 @@ actor WorkspaceFileContextStore {
         return (removedFileIDs, removedFolderIDs, removedFilePaths, removedFolderPaths)
     }
 
+    private func isDiscoverableFileID(_ fileID: UUID) -> Bool {
+        !managedOnlyFileIDs.contains(fileID)
+    }
+
+    private func isDiscoverableFolderID(_ folderID: UUID) -> Bool {
+        !managedOnlyFolderIDs.contains(folderID)
+    }
+
+    private func promoteToDiscoverable(_ file: WorkspaceFileRecord) {
+        managedOnlyFileIDs.remove(file.id)
+        if let folderID = file.parentFolderID, let folder = foldersByID[folderID] {
+            promoteFolderToDiscoverable(folder)
+        }
+    }
+
+    private func promoteFolderToDiscoverable(_ folder: WorkspaceFolderRecord) {
+        var folderID: UUID? = folder.id
+        while let id = folderID {
+            managedOnlyFolderIDs.remove(id)
+            folderID = foldersByID[id]?.parentFolderID
+        }
+    }
+
     private func ensureCodeScanResultTask() {
         guard codeScanResultTask == nil else { return }
         let actor = codeScanActor
@@ -2538,7 +2938,8 @@ actor WorkspaceFileContextStore {
     private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) {
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         for result in results {
-            guard let file = filesByID[result.fileID],
+            guard isDiscoverableFileID(result.fileID),
+                  let file = filesByID[result.fileID],
                   let state = rootStatesByID[file.rootID],
                   state.root.standardizedFullPath == (result.rootFolderPath as NSString).standardizingPath
             else { continue }
@@ -2611,18 +3012,34 @@ actor WorkspaceFileContextStore {
         return state
     }
 
+    private func managedOnlyAncestorFolderIDs(for fileIDs: Set<UUID>) -> Set<UUID> {
+        var folderIDs = Set<UUID>()
+        for fileID in fileIDs {
+            var folderID = filesByID[fileID]?.parentFolderID
+            while let currentFolderID = folderID {
+                folderIDs.insert(currentFolderID)
+                folderID = foldersByID[currentFolderID]?.parentFolderID
+            }
+        }
+        return folderIDs
+    }
+
     private func makeFileTreeFolderSnapshot(
         _ folder: WorkspaceFolderRecord,
         rootStandardizedPath: String,
         state: RootState,
-        visited: inout Set<UUID>
+        visited: inout Set<UUID>,
+        explicitlyIncludedManagedOnlyFileIDs: Set<UUID> = [],
+        explicitlyIncludedManagedOnlyFolderIDs: Set<UUID> = []
     ) -> FileTreeFolderSnapshot? {
         guard visited.insert(folder.id).inserted else { return nil }
 
         let childFolders = (state.childFolderIDsByFolderID[folder.id] ?? [])
+            .filter { isDiscoverableFolderID($0) || explicitlyIncludedManagedOnlyFolderIDs.contains($0) }
             .compactMap { foldersByID[$0] }
             .sorted { $0.name < $1.name }
         let childFiles = (state.childFileIDsByFolderID[folder.id] ?? [])
+            .filter { isDiscoverableFileID($0) || explicitlyIncludedManagedOnlyFileIDs.contains($0) }
             .compactMap { filesByID[$0] }
             .sorted { $0.name < $1.name }
 
@@ -2633,7 +3050,9 @@ actor WorkspaceFileContextStore {
                 childFolder,
                 rootStandardizedPath: rootStandardizedPath,
                 state: state,
-                visited: &visited
+                visited: &visited,
+                explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
+                explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ) {
                 children.append(.folder(snapshot))
             }
