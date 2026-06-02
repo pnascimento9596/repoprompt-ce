@@ -261,10 +261,12 @@ shasum -a 256 SHA256SUMS
 Dispatch the environment-scoped **Promote Release** workflow from protected
 `main` with the same tag and that reviewed digest. Before the protected
 promotion job starts, a fresh runner downloads the reviewed ZIP and checksum
-manifest with a narrowly scoped source token, verifies the reviewed digest and
-ZIP checksum, validates the helper layout statically, and runs the helper
-`--version` smoke under a minimal secret-free environment. The protected job
-then runs:
+manifest with a source-repository token scoped only to contents access. GitHub
+requires contents write permission for that token to read draft release assets;
+the token is used only for the download step. The runner verifies the reviewed
+digest and ZIP checksum, validates the helper layout statically, and runs the
+helper `--version` smoke under a minimal secret-free environment. The protected
+job then runs:
 
 ```bash
 ./Scripts/promote_release.sh promote

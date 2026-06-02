@@ -422,6 +422,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             return ToolResultDTOs.SearchResultDTO(totalMatches: 0, totalFiles: 0, contentMatches: 0, pathMatches: 0, limitHit: false, perFileCounts: [], pathMatchLines: [], contentMatchGroups: [], errorMessage: parts.issue, suggestion: parts.suggestion, worktreeScope: worktreeScope)
         }
 
+        let dtoBuildState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.dtoBuild)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.dtoBuild, dtoBuildState) }
+
         let visibleRootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
         let allRootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
         let baseDisplayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(visibleRoots: visibleRootRefs, allRoots: allRootRefs)

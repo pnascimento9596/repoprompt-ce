@@ -115,6 +115,10 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`workspace_loading_snapshot` is only available in DEBUG builds.")
                 #endif
+            case "mcp_read_search_capture_begin":
+                return debugMCPReadSearchCaptureBeginPayload(op: op, arguments: arguments)
+            case "mcp_read_search_capture_snapshot":
+                return debugMCPReadSearchCaptureSnapshotPayload(op: op, arguments: arguments)
             case "bootstrap_diagnostics":
                 return await debugBootstrapDiagnosticsPayload(op: op)
             case "sparkle_status":

@@ -32,6 +32,9 @@ private func detectEncodingFull(_ data: Data) -> String.Encoding {
 
 extension FileSystemService {
     func loadContent(ofRelativePath relativePath: String) async throws -> String? {
+        let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
+
         // Early, no-IO short-circuit for known-binary extensions
         let relExt = ((relativePath as NSString).pathExtension).lowercased()
         if !relExt.isEmpty, Self.alwaysBinaryExtensions.contains(relExt) {

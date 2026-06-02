@@ -49,8 +49,10 @@ jobs:
     needs: validate-ref
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
+    # GitHub hides draft release assets from read-only workflow tokens. This
+    # token is used only by the download step; helper execution below uses env -i.
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Check out trusted release tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd

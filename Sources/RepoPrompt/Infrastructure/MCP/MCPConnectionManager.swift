@@ -5935,11 +5935,16 @@ actor ServerNetworkManager {
                                         }
 
                                         // Build well‑structured, human‑readable content blocks for the result
-                                        let contentBlocks = Self.formatToolResult(
-                                            toolName: toolName,
-                                            args: effectiveArgsForFormatter,
-                                            value: value
-                                        )
+                                        let contentBlocks = EditFlowPerf.measure(
+                                            EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                            EditFlowPerf.Dimensions(toolName: toolName)
+                                        ) {
+                                            Self.formatToolResult(
+                                                toolName: toolName,
+                                                args: effectiveArgsForFormatter,
+                                                value: value
+                                            )
+                                        }
 
                                         // Fire completion observer with result for detailed UI rendering
                                         if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped success") {
@@ -5998,11 +6003,16 @@ actor ServerNetworkManager {
                                     }
 
                                     // Build well‑structured, human‑readable content blocks for the result
-                                    let contentBlocks = Self.formatToolResult(
-                                        toolName: toolName,
-                                        args: effectiveArgsForFormatter,
-                                        value: value
-                                    )
+                                    let contentBlocks = EditFlowPerf.measure(
+                                        EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                        EditFlowPerf.Dimensions(toolName: toolName)
+                                    ) {
+                                        Self.formatToolResult(
+                                            toolName: toolName,
+                                            args: effectiveArgsForFormatter,
+                                            value: value
+                                        )
+                                    }
 
                                     // Fire completion observer with result for detailed UI rendering
                                     if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global success") {

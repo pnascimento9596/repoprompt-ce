@@ -119,6 +119,7 @@ actor WorkspaceFileContextStore {
         private var rootLoadWillStartHandler: (@Sendable (String) async -> Void)?
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
+        private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
             rootLoadWillStartHandler = handler
@@ -130,6 +131,10 @@ actor WorkspaceFileContextStore {
 
         func setRootUnloadDidDetachHandler(_ handler: (@Sendable ([String]) async -> Void)?) {
             rootUnloadDidDetachHandler = handler
+        }
+
+        func setEnsureIndexedFilesEligibilityDidResolveHandler(_ handler: (@Sendable (UUID, String) async -> Void)?) {
+            ensureIndexedFilesEligibilityDidResolveHandler = handler
         }
     #endif
 
@@ -143,6 +148,11 @@ actor WorkspaceFileContextStore {
         var filesByID: [UUID: WorkspaceFileRecord] = [:]
         var folderIDsByStandardizedFullPath: [String: UUID] = [:]
         var fileIDsByStandardizedFullPath: [String: UUID] = [:]
+    }
+
+    private struct SearchCatalogSnapshotCacheEntry {
+        let validationToken: UInt64
+        let snapshot: WorkspaceSearchCatalogSnapshot
     }
 
     private var rootStatesByID: [UUID: RootState] = [:]
@@ -163,6 +173,8 @@ actor WorkspaceFileContextStore {
         .visibleWorkspacePlusGitData: 0,
         .allLoaded: 0
     ]
+    private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]
+    private static let maxCachedSearchCatalogSnapshotScopes = 16
     private static let defaultMaxPendingDeltasPerRoot = 10000
     private let pathMatchWorker = PathMatchWorker()
     private let codeScanActor = CodeScanActor()
@@ -351,6 +363,24 @@ actor WorkspaceFileContextStore {
     }
 
     func searchCatalogSnapshot(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> WorkspaceSearchCatalogSnapshot {
+        let catalogSnapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.catalogSnapshot)
+        let validationToken = searchCatalogSnapshotValidationToken(scope: rootScope)
+        if let cached = searchCatalogSnapshotsByScope[rootScope] {
+            if cached.validationToken == validationToken {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Search.catalogSnapshot,
+                    catalogSnapshotState,
+                    EditFlowPerf.Dimensions(
+                        fileCount: cached.snapshot.diagnostics.fileCount,
+                        cacheHit: true,
+                        rootCount: cached.snapshot.diagnostics.rootCount,
+                        folderCount: cached.snapshot.diagnostics.folderCount
+                    )
+                )
+                return cached.snapshot
+            }
+            searchCatalogSnapshotsByScope.removeValue(forKey: rootScope)
+        }
         let roots = rootsForPathLookup(scope: rootScope)
         let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
         let allowedRootIDs = Set(rootsByID.keys)
@@ -375,7 +405,7 @@ actor WorkspaceFileContextStore {
             },
             fileCount: files.count
         )
-        return WorkspaceSearchCatalogSnapshot(
+        let snapshot = WorkspaceSearchCatalogSnapshot(
             generation: diagnostics.generation,
             rootScope: rootScope,
             roots: roots,
@@ -383,6 +413,18 @@ actor WorkspaceFileContextStore {
             entries: entries,
             diagnostics: diagnostics
         )
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.Search.catalogSnapshot,
+            catalogSnapshotState,
+            EditFlowPerf.Dimensions(
+                fileCount: diagnostics.fileCount,
+                cacheHit: false,
+                rootCount: diagnostics.rootCount,
+                folderCount: diagnostics.folderCount
+            )
+        )
+        cacheSearchCatalogSnapshot(snapshot, validationToken: validationToken, scope: rootScope)
+        return snapshot
     }
 
     func directFolderChildren(
@@ -646,27 +688,45 @@ actor WorkspaceFileContextStore {
             let fullPath = StandardizedPath.absolute(rawPath)
             guard fileIDsByStandardizedFullPath[fullPath] == nil,
                   let root = loadedRoot(containing: fullPath),
-                  var state = rootStatesByID[root.id]
+                  let service = rootStatesByID[root.id]?.service
             else { continue }
+            let originalRootID = root.id
+            let originalRootPath = root.standardizedFullPath
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else { continue }
-            let relativePath = relativePath(for: fullPath, rootPath: root.standardizedFullPath)
+            let relativePath = relativePath(for: fullPath, rootPath: originalRootPath)
             guard !relativePath.isEmpty,
-                  await state.service.catalogEligibleRegularFileExists(relativePath: relativePath)
+                  await service.catalogEligibleRegularFileExists(relativePath: relativePath)
+            else { continue }
+            #if DEBUG
+                if let ensureIndexedFilesEligibilityDidResolveHandler {
+                    await ensureIndexedFilesEligibilityDidResolveHandler(originalRootID, fullPath)
+                }
+            #endif
+            guard fileIDsByStandardizedFullPath[fullPath] == nil,
+                  folderIDsByStandardizedFullPath[fullPath] == nil,
+                  var state = rootStatesByID[originalRootID],
+                  state.root.id == originalRootID,
+                  state.root.standardizedFullPath == originalRootPath,
+                  rootIDsByStandardizedPath[originalRootPath] == originalRootID,
+                  loadedRoot(containing: fullPath)?.id == originalRootID,
+                  state.fileIDsByRelativePath[relativePath] == nil,
+                  state.folderIDsByRelativePath[relativePath] == nil
             else { continue }
             var indexes = RootIndexBuffers()
             let hierarchy = relativePath.split(separator: "/").count
             indexFiles(
                 [FSItemDTO(relativePath: relativePath, isDirectory: false, hierarchy: hierarchy)],
-                root: root,
+                root: state.root,
                 state: &state,
                 indexes: &indexes
             )
             guard !indexes.filesByID.isEmpty else { continue }
             commit(indexes)
-            rootStatesByID[root.id] = state
+            rootStatesByID[originalRootID] = state
+            clearSearchCatalogSnapshotCache()
             indexed.append(fullPath)
-            upsertedFilesByRoot[root.id, default: []].append(contentsOf: indexes.filesByID.values)
+            upsertedFilesByRoot[originalRootID, default: []].append(contentsOf: indexes.filesByID.values)
         }
         if !indexed.isEmpty {
             let affectedKinds = Set(upsertedFilesByRoot.keys.compactMap { rootStatesByID[$0]?.root.kind })
@@ -1253,6 +1313,7 @@ actor WorkspaceFileContextStore {
             statesToUnload.append((rootID, state))
         }
         guard !statesToUnload.isEmpty else { return }
+        clearSearchCatalogSnapshotCache()
         #if DEBUG
             let rootUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let rootUnloadFolderCount = statesToUnload.reduce(0) { $0 + $1.state.folderIDsByRelativePath.count }
@@ -1830,9 +1891,26 @@ actor WorkspaceFileContextStore {
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) -> WorkspaceExplicitCatalogFileLookupResult {
+        #if DEBUG || EDIT_FLOW_PERF
+            var exactCatalogLookupOutcome = "noCandidate"
+            let exactCatalogLookupActorBody = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogLookupActorBody)
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.ReadFile.exactCatalogLookupActorBody,
+                    exactCatalogLookupActorBody,
+                    EditFlowPerf.Dimensions(outcome: exactCatalogLookupOutcome)
+                )
+            }
+        #endif
+
         let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noCandidate }
-        guard !StandardizedPath.containsNUL(trimmed) else { return .blocked }
+        guard !StandardizedPath.containsNUL(trimmed) else {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "blocked"
+            #endif
+            return .blocked
+        }
 
         let expanded = (trimmed as NSString).expandingTildeInPath
         let standardized = StandardizedPath.absolute(expanded)
@@ -1846,6 +1924,9 @@ actor WorkspaceFileContextStore {
             let relativePath = String(standardized.dropFirst(root.standardizedFullPath.count))
                 .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard let file = file(rootID: root.id, relativePath: relativePath) else { return .noCandidate }
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "matched"
+            #endif
             return .matched(file)
         }
 
@@ -1856,8 +1937,14 @@ actor WorkspaceFileContextStore {
         ) {
         case let .prefixed(root, _, remainder):
             guard let file = file(rootID: root.id, relativePath: remainder) else { return .noCandidate }
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "matched"
+            #endif
             return .matched(file)
         case .ambiguous:
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "ambiguous"
+            #endif
             return .ambiguous
         case .bareRoot, .notAliasPrefixed:
             break
@@ -1867,10 +1954,24 @@ actor WorkspaceFileContextStore {
         guard !relativePath.isEmpty,
               relativePath != "..",
               !relativePath.hasPrefix("../")
-        else { return .blocked }
+        else {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "blocked"
+            #endif
+            return .blocked
+        }
         let matches = roots.compactMap { file(rootID: $0.id, relativePath: relativePath) }
-        guard matches.count <= 1 else { return .ambiguous }
-        return matches.first.map(WorkspaceExplicitCatalogFileLookupResult.matched) ?? .noCandidate
+        guard matches.count <= 1 else {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "ambiguous"
+            #endif
+            return .ambiguous
+        }
+        guard let match = matches.first else { return .noCandidate }
+        #if DEBUG || EDIT_FLOW_PERF
+            exactCatalogLookupOutcome = "matched"
+        #endif
+        return .matched(match)
     }
 
     /// Resolves an exact file path that the caller explicitly requested, even when
@@ -2320,6 +2421,26 @@ actor WorkspaceFileContextStore {
         return nil
     }
 
+    func lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
+        _ userPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspacePathLookupResult? {
+        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !StandardizedPath.containsNUL(trimmed) else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        let standardizedPath = StandardizedPath.absolute(expanded)
+        guard let root = rootsForPathLookup(scope: rootScope)
+            .filter({ StandardizedPath.isDescendant(standardizedPath, of: $0.standardizedFullPath) })
+            .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })
+        else { return nil }
+        let relativePath = relativePath(for: standardizedPath, rootPath: root.standardizedFullPath)
+        guard let result = lookupPath(rootID: root.id, relativePath: relativePath),
+              isDiscoverableLookupResult(result)
+        else { return nil }
+        return result
+    }
+
     func rootRefs(scope: WorkspaceLookupRootScope = .allLoaded) -> [WorkspaceRootRef] {
         rootsForPathLookup(scope: scope).map {
             WorkspaceRootRef(id: $0.id, name: $0.name, fullPath: $0.standardizedFullPath)
@@ -2618,6 +2739,31 @@ actor WorkspaceFileContextStore {
         (catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope)
     }
 
+    private func searchCatalogSnapshotValidationToken(scope: WorkspaceLookupRootScope) -> UInt64 {
+        switch scope {
+        case .sessionBoundWorkspace:
+            scopedSnapshotGeneration(scope: .allLoaded)
+        default:
+            scopedSnapshotGeneration(scope: scope)
+        }
+    }
+
+    private func cacheSearchCatalogSnapshot(
+        _ snapshot: WorkspaceSearchCatalogSnapshot,
+        validationToken: UInt64,
+        scope: WorkspaceLookupRootScope
+    ) {
+        if searchCatalogSnapshotsByScope[scope] == nil,
+           searchCatalogSnapshotsByScope.count >= Self.maxCachedSearchCatalogSnapshotScopes
+        {
+            clearSearchCatalogSnapshotCache()
+        }
+        searchCatalogSnapshotsByScope[scope] = SearchCatalogSnapshotCacheEntry(
+            validationToken: validationToken,
+            snapshot: snapshot
+        )
+    }
+
     private func scopeDiscriminator(_ scope: WorkspaceLookupRootScope) -> UInt64 {
         switch scope {
         case .visibleWorkspace:
@@ -2692,8 +2838,13 @@ actor WorkspaceFileContextStore {
         return (expanded as NSString).standardizingPath
     }
 
+    private func clearSearchCatalogSnapshotCache() {
+        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)
+    }
+
     private func invalidatePathMatchSnapshot(affectedRootKinds: Set<WorkspaceRootKind>) {
         bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)
+        clearSearchCatalogSnapshotCache()
         invalidatePathMatchCache()
     }
 

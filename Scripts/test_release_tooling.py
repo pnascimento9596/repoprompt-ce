@@ -150,6 +150,8 @@ class ReleaseToolingTests(unittest.TestCase):
 
         reviewed_smoke = promote_workflow.split("\n  smoke-reviewed-helper:", 1)[1].split("\n  promote:", 1)[0]
         self.assertNotIn("environment: release", reviewed_smoke)
+        self.assertIn("contents: write", reviewed_smoke)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", reviewed_smoke)
         self.assertIn("reviewed_checksums_sha256", reviewed_smoke)
         self.assertIn("validate_embedded_mcp_helper_layout.sh", reviewed_smoke)
         self.assertIn("env -i", reviewed_smoke)

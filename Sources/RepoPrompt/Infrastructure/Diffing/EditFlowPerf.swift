@@ -1,9 +1,12 @@
 import Foundation
+#if DEBUG
+    import Synchronization
+#endif
 #if DEBUG || EDIT_FLOW_PERF
     import os
 #endif
 
-/// Lightweight, gated instrumentation for apply_edits hot paths.
+/// Lightweight, gated instrumentation for hot-path diagnostics.
 ///
 /// Keep this utility safe for broad use:
 /// - disabled by default and cheap on the fast path;
@@ -12,7 +15,15 @@ import Foundation
 /// - never pass raw paths, patterns, replacement text, file content, or diffs.
 enum EditFlowPerf {
     #if DEBUG || EDIT_FLOW_PERF
-        typealias IntervalState = OSSignpostIntervalState
+        struct IntervalState {
+            let signpostState: OSSignpostIntervalState?
+            #if DEBUG
+                let debugCaptureEpoch: UInt64?
+                let debugCaptureStartNanoseconds: UInt64?
+                let debugCaptureStageName: String
+                let debugCaptureDimensions: String
+            #endif
+        }
     #else
         struct IntervalState {}
     #endif
@@ -67,6 +78,10 @@ enum EditFlowPerf {
         var scopeCount: Int?
         var warningCount: Int?
         var fileAction: String?
+        var rootCount: Int?
+        var folderCount: Int?
+        var pendingRootCount: Int?
+        var pendingRawEventCount: Int?
 
         init(
             toolName: String? = nil,
@@ -117,7 +132,11 @@ enum EditFlowPerf {
             changeCount: Int? = nil,
             scopeCount: Int? = nil,
             warningCount: Int? = nil,
-            fileAction: String? = nil
+            fileAction: String? = nil,
+            rootCount: Int? = nil,
+            folderCount: Int? = nil,
+            pendingRootCount: Int? = nil,
+            pendingRawEventCount: Int? = nil
         ) {
             self.toolName = Self.sanitizedLabel(toolName)
             self.runPurpose = Self.sanitizedLabel(runPurpose)
@@ -168,6 +187,10 @@ enum EditFlowPerf {
             self.scopeCount = Self.nonNegative(scopeCount)
             self.warningCount = Self.nonNegative(warningCount)
             self.fileAction = Self.sanitizedLabel(fileAction)
+            self.rootCount = Self.nonNegative(rootCount)
+            self.folderCount = Self.nonNegative(folderCount)
+            self.pendingRootCount = Self.nonNegative(pendingRootCount)
+            self.pendingRawEventCount = Self.nonNegative(pendingRawEventCount)
         }
 
         fileprivate var logDescription: String {
@@ -221,6 +244,10 @@ enum EditFlowPerf {
             append("scopeCount", scopeCount, to: &parts)
             append("warningCount", warningCount, to: &parts)
             append("fileAction", fileAction, to: &parts)
+            append("rootCount", rootCount, to: &parts)
+            append("folderCount", folderCount, to: &parts)
+            append("pendingRootCount", pendingRootCount, to: &parts)
+            append("pendingRawEventCount", pendingRawEventCount, to: &parts)
             return parts.joined(separator: " ")
         }
 
@@ -268,6 +295,9 @@ enum EditFlowPerf {
             static let policyGating: StaticString = "EditFlow.MCPToolCall.PolicyGating"
             static let observerCallbacks: StaticString = "EditFlow.MCPToolCall.ObserverCallbacks"
             static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
+            static let preToolFilesystemFlush: StaticString = "EditFlow.MCPToolCall.PreToolFilesystemFlush"
+            static let providerExecution: StaticString = "EditFlow.MCPToolCall.ProviderExecution"
+            static let formatResult: StaticString = "EditFlow.MCPToolCall.FormatResult"
         }
 
         enum ApplyEdits {
@@ -304,6 +334,29 @@ enum EditFlowPerf {
             static let regexLineByLineScan: StaticString = "EditFlow.Search.RegexLineByLineScan"
             static let literalScan: StaticString = "EditFlow.Search.LiteralScan"
             static let materializeMatches: StaticString = "EditFlow.Search.MaterializeMatches"
+            static let catalogSnapshot: StaticString = "EditFlow.Search.CatalogSnapshot"
+            static let dtoBuild: StaticString = "EditFlow.Search.DTOBuild"
+        }
+
+        enum ReadFile {
+            static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
+            static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
+            static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
+            static let folderResolution: StaticString = "EditFlow.ReadFile.FolderResolution"
+            static let externalFolderGuard: StaticString = "EditFlow.ReadFile.ExternalFolderGuard"
+            static let readableServiceResolution: StaticString = "EditFlow.ReadFile.ReadableServiceResolution"
+            static let exactCatalogLookupAwait: StaticString = "EditFlow.ReadFile.ExactCatalogLookupAwait"
+            static let exactCatalogLookupActorBody: StaticString = "EditFlow.ReadFile.ExactCatalogLookupActorBody"
+            static let explicitMaterialization: StaticString = "EditFlow.ReadFile.ExplicitMaterialization"
+            static let generalLookupFallback: StaticString = "EditFlow.ReadFile.GeneralLookupFallback"
+            static let externalFileFallback: StaticString = "EditFlow.ReadFile.ExternalFileFallback"
+            static let workspaceContentLoad: StaticString = "EditFlow.ReadFile.WorkspaceContentLoad"
+            static let splitPreservingLineEndings: StaticString = "EditFlow.ReadFile.SplitPreservingLineEndings"
+            static let buildSlice: StaticString = "EditFlow.ReadFile.BuildSlice"
+        }
+
+        enum FileSystem {
+            static let contentLoadActorBody: StaticString = "EditFlow.FileSystem.ContentLoadActorBody"
         }
 
         enum Transcript {
@@ -341,6 +394,263 @@ enum EditFlowPerf {
         }
     }
 
+    #if DEBUG
+        struct DebugCaptureStageAggregate {
+            let stageName: String
+            let sanitizedDimensions: String
+            let sampleCount: Int
+            let p50MS: Double
+            let p95MS: Double
+            let maxMS: Double
+            let totalMS: Double
+
+            var payload: [String: Any] {
+                [
+                    "stage_name": stageName,
+                    "sanitized_dimensions": sanitizedDimensions,
+                    "sample_count": sampleCount,
+                    "p50_ms": Self.roundedMS(p50MS),
+                    "p95_ms": Self.roundedMS(p95MS),
+                    "max_ms": Self.roundedMS(maxMS),
+                    "total_ms": Self.roundedMS(totalMS)
+                ]
+            }
+
+            private static func roundedMS(_ value: Double) -> Double {
+                (value * 1000).rounded() / 1000
+            }
+        }
+
+        struct DebugCaptureSnapshot {
+            let label: String
+            let active: Bool
+            let startedAt: Date?
+            let finishedAt: Date?
+            let maxSamples: Int
+            let retainedSampleCount: Int
+            let droppedSampleCount: Int
+            let stages: [DebugCaptureStageAggregate]
+
+            var payload: [String: Any] {
+                [
+                    "label": label,
+                    "active": active,
+                    "started_at": startedAt?.timeIntervalSince1970 ?? NSNull(),
+                    "finished_at": finishedAt?.timeIntervalSince1970 ?? NSNull(),
+                    "max_samples": maxSamples,
+                    "retained_sample_count": retainedSampleCount,
+                    "dropped_sample_count": droppedSampleCount,
+                    "stages": stages.map(\.payload)
+                ]
+            }
+        }
+
+        enum DebugCaptureBeginResult {
+            case started(DebugCaptureSnapshot)
+            case busy(DebugCaptureSnapshot)
+        }
+
+        private struct DebugCaptureKey: Hashable {
+            let stageName: String
+            let sanitizedDimensions: String
+        }
+
+        private struct DebugCaptureStart {
+            let epoch: UInt64
+            let startNanoseconds: UInt64
+        }
+
+        private final class DebugCaptureActiveHint {
+            @available(macOS 15.0, *)
+            private final class AtomicStorage {
+                let value = Atomic(false)
+            }
+
+            private let storage: AnyObject?
+
+            init() {
+                if #available(macOS 15.0, *) {
+                    storage = AtomicStorage()
+                } else {
+                    storage = nil
+                }
+            }
+
+            func loadIfAvailable() -> Bool? {
+                if #available(macOS 15.0, *), let storage = storage as? AtomicStorage {
+                    return storage.value.load(ordering: .acquiring)
+                }
+                return nil
+            }
+
+            func store(_ active: Bool) {
+                if #available(macOS 15.0, *), let storage = storage as? AtomicStorage {
+                    storage.value.store(active, ordering: .releasing)
+                }
+            }
+        }
+
+        private final class DebugCaptureRecorder {
+            private static let sampleLimitRange = 100 ... 100_000
+
+            private let lock = NSLock()
+            private let activeHint = DebugCaptureActiveHint()
+            private var active = false
+            private var captureEpoch: UInt64 = 0
+            private var label = ""
+            private var startedAt: Date?
+            private var finishedAt: Date?
+            private var maxSamples = 20000
+            private var retainedSampleCount = 0
+            private var droppedSampleCount = 0
+            private var samplesByKey: [DebugCaptureKey: [Double]] = [:]
+
+            var isActive: Bool {
+                if let active = activeHint.loadIfAvailable() {
+                    return active
+                }
+                lock.lock()
+                defer { lock.unlock() }
+                return active
+            }
+
+            func begin(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !active else { return .busy(snapshotLocked()) }
+                captureEpoch += 1
+                self.label = Self.sanitizedLabel(label)
+                // Defense in depth for non-MCP callers; MCP controls reject out-of-range input earlier.
+                self.maxSamples = Self.clampedMaxSamples(maxSamples)
+                active = true
+                startedAt = Date()
+                finishedAt = nil
+                retainedSampleCount = 0
+                droppedSampleCount = 0
+                samplesByKey.removeAll(keepingCapacity: true)
+                activeHint.store(true)
+                return .started(snapshotLocked())
+            }
+
+            func snapshot(finish: Bool) -> DebugCaptureSnapshot {
+                lock.lock()
+                defer { lock.unlock() }
+                if finish, active {
+                    active = false
+                    activeHint.store(false)
+                    finishedAt = Date()
+                }
+                return snapshotLocked()
+            }
+
+            func resetForTesting() {
+                lock.lock()
+                active = false
+                activeHint.store(false)
+                label = ""
+                startedAt = nil
+                finishedAt = nil
+                maxSamples = 20000
+                retainedSampleCount = 0
+                droppedSampleCount = 0
+                samplesByKey.removeAll(keepingCapacity: false)
+                lock.unlock()
+            }
+
+            func startTimestampIfActive() -> DebugCaptureStart? {
+                if let active = activeHint.loadIfAvailable(), !active { return nil }
+                lock.lock()
+                defer { lock.unlock() }
+                guard active else { return nil }
+                return DebugCaptureStart(epoch: captureEpoch, startNanoseconds: DispatchTime.now().uptimeNanoseconds)
+            }
+
+            func record(stageName: String, sanitizedDimensions: String, captureEpoch: UInt64, startNanoseconds: UInt64) {
+                let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds - startNanoseconds
+                let elapsedMS = Double(elapsedNanoseconds) / 1_000_000.0
+                lock.lock()
+                defer { lock.unlock() }
+                guard active, captureEpoch == self.captureEpoch else { return }
+                guard retainedSampleCount < maxSamples else {
+                    droppedSampleCount += 1
+                    return
+                }
+                let key = DebugCaptureKey(stageName: stageName, sanitizedDimensions: sanitizedDimensions)
+                samplesByKey[key, default: []].append(elapsedMS)
+                retainedSampleCount += 1
+            }
+
+            private static func clampedMaxSamples(_ maxSamples: Int) -> Int {
+                min(max(maxSamples, sampleLimitRange.lowerBound), sampleLimitRange.upperBound)
+            }
+
+            private static func sanitizedLabel(_ label: String) -> String {
+                let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+                let replacement = UnicodeScalar("_")
+                let scalars = trimmed.unicodeScalars.map { scalar in
+                    allowed.contains(scalar) ? scalar : replacement
+                }
+                return String(String.UnicodeScalarView(scalars.prefix(64)))
+            }
+
+            private func snapshotLocked() -> DebugCaptureSnapshot {
+                let stages = samplesByKey.map { key, samples in
+                    let sorted = samples.sorted()
+                    return DebugCaptureStageAggregate(
+                        stageName: key.stageName,
+                        sanitizedDimensions: key.sanitizedDimensions,
+                        sampleCount: sorted.count,
+                        p50MS: nearestRank(sorted, percentile: 0.50),
+                        p95MS: nearestRank(sorted, percentile: 0.95),
+                        maxMS: sorted.last ?? 0,
+                        totalMS: sorted.reduce(0, +)
+                    )
+                }
+                .sorted {
+                    if $0.stageName == $1.stageName {
+                        return $0.sanitizedDimensions < $1.sanitizedDimensions
+                    }
+                    return $0.stageName < $1.stageName
+                }
+                return DebugCaptureSnapshot(
+                    label: label,
+                    active: active,
+                    startedAt: startedAt,
+                    finishedAt: finishedAt,
+                    maxSamples: maxSamples,
+                    retainedSampleCount: retainedSampleCount,
+                    droppedSampleCount: droppedSampleCount,
+                    stages: stages
+                )
+            }
+
+            private func nearestRank(_ sorted: [Double], percentile: Double) -> Double {
+                guard !sorted.isEmpty else { return 0 }
+                let rank = Int(ceil(percentile * Double(sorted.count))) - 1
+                return sorted[min(max(rank, 0), sorted.count - 1)]
+            }
+        }
+
+        private static let debugCaptureRecorder = DebugCaptureRecorder()
+
+        static var isDebugCaptureActive: Bool {
+            debugCaptureRecorder.isActive
+        }
+
+        static func beginDebugCapture(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
+            debugCaptureRecorder.begin(label: label, maxSamples: maxSamples)
+        }
+
+        static func debugCaptureSnapshot(finish: Bool) -> DebugCaptureSnapshot {
+            debugCaptureRecorder.snapshot(finish: finish)
+        }
+
+        static func resetDebugCaptureForTesting() {
+            debugCaptureRecorder.resetForTesting()
+        }
+    #endif
+
     #if DEBUG || EDIT_FLOW_PERF
         private static let signposter = OSSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
         private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
@@ -356,30 +666,88 @@ enum EditFlowPerf {
             environmentEnabled || UserDefaults.standard.bool(forKey: "editFlowPerfEnabled")
         }
 
+        private static var shouldCaptureIntervals: Bool {
+            #if DEBUG
+                isDebugCaptureActive
+            #else
+                false
+            #endif
+        }
+
+        private static func makeIntervalState(_ name: StaticString, dimensions: Dimensions) -> IntervalState? {
+            let signpostState = isEnabled ? signposter.beginInterval(name) : nil
+            #if DEBUG
+                let debugCaptureStart = debugCaptureRecorder.startTimestampIfActive()
+                guard signpostState != nil || debugCaptureStart != nil else { return nil }
+                return IntervalState(
+                    signpostState: signpostState,
+                    debugCaptureEpoch: debugCaptureStart?.epoch,
+                    debugCaptureStartNanoseconds: debugCaptureStart?.startNanoseconds,
+                    debugCaptureStageName: String(describing: name),
+                    debugCaptureDimensions: dimensions.logDescription
+                )
+            #else
+                guard signpostState != nil else { return nil }
+                return IntervalState(signpostState: signpostState)
+            #endif
+        }
+
         @discardableResult
         static func begin(_ name: StaticString) -> IntervalState? {
-            guard isEnabled else { return nil }
-            return signposter.beginInterval(name)
+            guard isEnabled || shouldCaptureIntervals else { return nil }
+            return makeIntervalState(name, dimensions: Dimensions())
         }
 
         @discardableResult
         static func begin(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) -> IntervalState? {
-            guard isEnabled else { return nil }
-            logDimensions(dimensions())
-            return signposter.beginInterval(name)
+            guard isEnabled || shouldCaptureIntervals else { return nil }
+            let renderedDimensions = dimensions()
+            if isEnabled {
+                logDimensions(renderedDimensions)
+            }
+            return makeIntervalState(name, dimensions: renderedDimensions)
         }
 
         static func end(_ name: StaticString, _ state: IntervalState?) {
             guard let state else { return }
-            signposter.endInterval(name, state)
+            #if DEBUG
+                if let captureEpoch = state.debugCaptureEpoch,
+                   let startNanoseconds = state.debugCaptureStartNanoseconds
+                {
+                    debugCaptureRecorder.record(
+                        stageName: state.debugCaptureStageName,
+                        sanitizedDimensions: state.debugCaptureDimensions,
+                        captureEpoch: captureEpoch,
+                        startNanoseconds: startNanoseconds
+                    )
+                }
+            #endif
+            if let signpostState = state.signpostState {
+                signposter.endInterval(name, signpostState)
+            }
         }
 
         static func end(_ name: StaticString, _ state: IntervalState?, _ dimensions: @autoclosure () -> Dimensions) {
             guard let state else { return }
+            let renderedDimensions = dimensions()
             if isEnabled {
-                logDimensions(dimensions())
+                logDimensions(renderedDimensions)
             }
-            signposter.endInterval(name, state)
+            #if DEBUG
+                if let captureEpoch = state.debugCaptureEpoch,
+                   let startNanoseconds = state.debugCaptureStartNanoseconds
+                {
+                    debugCaptureRecorder.record(
+                        stageName: state.debugCaptureStageName,
+                        sanitizedDimensions: renderedDimensions.isEmpty ? state.debugCaptureDimensions : renderedDimensions.logDescription,
+                        captureEpoch: captureEpoch,
+                        startNanoseconds: startNanoseconds
+                    )
+                }
+            #endif
+            if let signpostState = state.signpostState {
+                signposter.endInterval(name, signpostState)
+            }
         }
 
         static func event(_ name: StaticString) {

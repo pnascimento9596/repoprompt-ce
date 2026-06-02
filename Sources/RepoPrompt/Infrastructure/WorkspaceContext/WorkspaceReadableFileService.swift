@@ -12,6 +12,25 @@ struct WorkspaceReadableFileService {
         self.homeDirectoryURL = homeDirectoryURL
     }
 
+    static func exactAbsoluteCatalogHitInput(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        return expanded
+    }
+
+    func resolveExactAbsoluteWorkspaceCatalogHit(
+        _ rawPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> WorkspaceFileRecord? {
+        guard let absolutePath = Self.exactAbsoluteCatalogHitInput(rawPath) else { return nil }
+        guard case let .matched(file) = await store.lookupCatalogFileForExplicitRequest(absolutePath, rootScope: rootScope) else {
+            return nil
+        }
+        return file
+    }
+
     func resolveReadableFile(
         _ userPath: String,
         profile: PathLocateProfile = .mcpRead,
@@ -19,7 +38,25 @@ struct WorkspaceReadableFileService {
     ) async -> WorkspaceReadableFileHandle? {
         let trimmed = normalizedInput(userPath)
         guard !trimmed.isEmpty else { return nil }
-        switch await store.lookupCatalogFileForExplicitRequest(trimmed, rootScope: rootScope) {
+        let exactCatalogLookupAwait = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogLookupAwait)
+        let exactCatalogLookup = await store.lookupCatalogFileForExplicitRequest(trimmed, rootScope: rootScope)
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.exactCatalogLookupAwait,
+            exactCatalogLookupAwait,
+            EditFlowPerf.Dimensions(outcome: {
+                switch exactCatalogLookup {
+                case .matched:
+                    "matched"
+                case .noCandidate:
+                    "noCandidate"
+                case .ambiguous:
+                    "ambiguous"
+                case .blocked:
+                    "blocked"
+                }
+            }())
+        )
+        switch exactCatalogLookup {
         case let .matched(file):
             return .workspace(file)
         case .ambiguous, .blocked:
@@ -27,7 +64,27 @@ struct WorkspaceReadableFileService {
         case .noCandidate:
             break
         }
-        switch try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope) {
+        let explicitMaterialization = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.explicitMaterialization)
+        let materialization = try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope)
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.explicitMaterialization,
+            explicitMaterialization,
+            EditFlowPerf.Dimensions(outcome: {
+                switch materialization {
+                case .some(.materialized):
+                    "materialized"
+                case .some(.noCandidate):
+                    "noCandidate"
+                case .some(.ambiguous):
+                    "ambiguous"
+                case .some(.blocked):
+                    "blocked"
+                case .none:
+                    "error"
+                }
+            }())
+        )
+        switch materialization {
         case let .some(.materialized(file)):
             return .workspace(file)
         case .some(.ambiguous), .some(.blocked):
@@ -35,13 +92,27 @@ struct WorkspaceReadableFileService {
         case .some(.noCandidate), .none:
             break
         }
-        if let workspaceFile = await store.lookupPath(
+        let generalLookupFallback = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.generalLookupFallback)
+        let workspaceFile = await store.lookupPath(
             WorkspacePathLookupRequest(userPath: trimmed, profile: profile, rootScope: rootScope)
-        )?.file {
+        )?.file
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.generalLookupFallback,
+            generalLookupFallback,
+            EditFlowPerf.Dimensions(outcome: workspaceFile == nil ? "noCandidate" : "matched")
+        )
+        if let workspaceFile {
             return .workspace(workspaceFile)
         }
         guard trimmed.hasPrefix("/") else { return nil }
-        return resolveAlwaysReadableExternalFile(atAbsolutePath: trimmed).map { .external($0) }
+        let externalFileFallback = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.externalFileFallback)
+        let externalFile = resolveAlwaysReadableExternalFile(atAbsolutePath: trimmed)
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.externalFileFallback,
+            externalFileFallback,
+            EditFlowPerf.Dimensions(outcome: externalFile == nil ? "noCandidate" : "external")
+        )
+        return externalFile.map { .external($0) }
     }
 
     func resolveAlwaysReadableExternalFolderDisplayPath(_ userPath: String) -> String? {

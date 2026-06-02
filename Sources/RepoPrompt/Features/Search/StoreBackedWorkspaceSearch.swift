@@ -313,7 +313,11 @@ enum StoreBackedWorkspaceSearch {
                 issues.append(issue)
                 continue
             }
-            if let lookup = await store.lookupPath(WorkspacePathLookupRequest(userPath: normalized, profile: .mcpSearchScope, rootScope: rootScope)) {
+            var lookup = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(normalized, rootScope: rootScope)
+            if lookup == nil {
+                lookup = await store.lookupPath(WorkspacePathLookupRequest(userPath: normalized, profile: .mcpSearchScope, rootScope: rootScope))
+            }
+            if let lookup {
                 if let file = lookup.file {
                     let root = scopedRoots.first { $0.id == file.rootID }
                     appendClause(.exactFile(absPath: file.standardizedFullPath, relPath: file.standardizedRelativePath, restrictedRootPath: root?.standardizedFullPath))

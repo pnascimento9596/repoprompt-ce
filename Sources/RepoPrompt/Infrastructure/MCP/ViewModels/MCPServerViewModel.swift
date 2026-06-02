@@ -1966,7 +1966,19 @@ final class MCPServerViewModel: ObservableObject {
         timeoutSeconds: Int = 10000, // Default ~2.7 hour timeout (matches Codex tool_timeout_sec)
         body: @escaping @Sendable () async throws -> T // ← @escaping added
     ) async throws -> T {
-        if flush { _ = await promptVM.workspaceFileContextStore.flushPendingServiceEventsForAllRoots() }
+        if flush {
+            let flushState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.preToolFilesystemFlush)
+            let flushSamples = await promptVM.workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.MCPToolCall.preToolFilesystemFlush,
+                flushState,
+                EditFlowPerf.Dimensions(
+                    rootCount: flushSamples.count,
+                    pendingRootCount: flushSamples.count(where: { $0.pendingRawEventCountBeforeFlush > 0 }),
+                    pendingRawEventCount: flushSamples.reduce(0) { $0 + $1.pendingRawEventCountBeforeFlush }
+                )
+            )
+        }
 
         // Eagerly attempt to bind any queued tab context for this connection
         // This ensures non-tab-scoped tools (like get_file_tree, file_search) can
@@ -2002,7 +2014,9 @@ final class MCPServerViewModel: ObservableObject {
         // Propagate TaskLocal connectionID so tools can resolve tab context
         let task = Task {
             try await ServerNetworkManager.withConnectionID(capturedConnectionID) {
-                try await body()
+                try await EditFlowPerf.measure(EditFlowPerf.Stage.MCPToolCall.providerExecution) {
+                    try await body()
+                }
             }
         }
 
@@ -2904,29 +2918,76 @@ final class MCPServerViewModel: ObservableObject {
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
         let store = promptVM.workspaceFileContextStore
-        if let issue = await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
-            throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
-        }
-
-        let roots = await store.rootRefs(scope: lookupRootScope)
-        let folderResolution = await store.resolveFolderInput(path, rootScope: lookupRootScope, profile: .mcpRead)
-        if let folder = folderResolution.folder {
-            let displayPath = folderResolution.displayPath ?? ClientPathFormatter.displayAbsolutePath(fullPath: folder.standardizedFullPath, visibleRoots: roots)
-            throw MCPError.invalidParams("'\(displayPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
-        }
-
         let readableService = WorkspaceReadableFileService(store: store)
-        if let externalFolderPath = readableService.resolveAlwaysReadableExternalFolderDisplayPath(path) {
-            throw MCPError.invalidParams("'\(externalFolderPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
-        }
+        let (roots, readableFile): ([WorkspaceRootRef], WorkspaceReadableFileHandle?) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
+            let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)
+            let exactPathIssue = await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.exactPathIssueDetection,
+                exactPathIssueDetection,
+                EditFlowPerf.Dimensions(outcome: exactPathIssue == nil ? "noIssue" : "issue")
+            )
+            if let issue = exactPathIssue {
+                throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+            }
 
-        let readableFile = await readableService.resolveReadableFile(path, profile: .mcpRead, rootScope: lookupRootScope)
+            let rootRefsLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.rootRefsLookup)
+            let roots = await store.rootRefs(scope: lookupRootScope)
+            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
+
+            if let exactAbsoluteCatalogHit = await readableService.resolveExactAbsoluteWorkspaceCatalogHit(path, rootScope: lookupRootScope) {
+                return (roots, WorkspaceReadableFileHandle.workspace(exactAbsoluteCatalogHit))
+            }
+
+            let folderResolutionStage = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolution)
+            let folderResolution = await store.resolveFolderInput(path, rootScope: lookupRootScope, profile: .mcpRead)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.folderResolution,
+                folderResolutionStage,
+                EditFlowPerf.Dimensions(outcome: folderResolution.folder == nil ? "noFolder" : "folder")
+            )
+            if let folder = folderResolution.folder {
+                let displayPath = folderResolution.displayPath ?? ClientPathFormatter.displayAbsolutePath(fullPath: folder.standardizedFullPath, visibleRoots: roots)
+                throw MCPError.invalidParams("'\(displayPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
+            }
+
+            let externalFolderGuard = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.externalFolderGuard)
+            let externalFolderPath = readableService.resolveAlwaysReadableExternalFolderDisplayPath(path)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.externalFolderGuard,
+                externalFolderGuard,
+                EditFlowPerf.Dimensions(outcome: externalFolderPath == nil ? "noFolder" : "folder")
+            )
+            if let externalFolderPath {
+                throw MCPError.invalidParams("'\(externalFolderPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
+            }
+
+            let readableServiceResolution = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.readableServiceResolution)
+            let readableFile = await readableService.resolveReadableFile(path, profile: .mcpRead, rootScope: lookupRootScope)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.readableServiceResolution,
+                readableServiceResolution,
+                EditFlowPerf.Dimensions(outcome: {
+                    switch readableFile {
+                    case .some(.workspace):
+                        "workspace"
+                    case .some(.external):
+                        "external"
+                    case .none:
+                        "noCandidate"
+                    }
+                }())
+            )
+            return (roots, readableFile)
+        }
         let full: String
         let displayPath: String
         let shouldAutoSelect: Bool
         switch readableFile {
         case let .workspace(file):
-            guard let workspaceContent = try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath) else {
+            guard let workspaceContent = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.workspaceContentLoad, operation: {
+                try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+            }) else {
                 throw MCPError.internalError("content unavailable")
             }
             full = workspaceContent
@@ -2949,7 +3010,9 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         // Preserve original line endings and total line count
-        let pairs = String.splitContentPreservingAllLineEndings(full)
+        let pairs = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.splitPreservingLineEndings) {
+            String.splitContentPreservingAllLineEndings(full)
+        }
         let total = pairs.count
 
         // Validate parameter combinations
@@ -2997,11 +3060,11 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
-        let contentSlice: String = {
+        let contentSlice = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.buildSlice) {
             if total == 0 { return "" }
             let slice = pairs[first ..< lastExclusive]
             return slice.map { $0.line + $0.ending }.joined()
-        }()
+        }
 
         // Prepare metadata for the displayed slice
         let shownFirst = total == 0 ? 0 : (first + 1)
