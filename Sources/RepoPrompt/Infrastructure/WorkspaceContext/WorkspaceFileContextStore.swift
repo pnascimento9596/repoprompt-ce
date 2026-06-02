@@ -145,6 +145,11 @@ actor WorkspaceFileContextStore {
         var fileIDsByStandardizedFullPath: [String: UUID] = [:]
     }
 
+    private struct SearchCatalogSnapshotCacheEntry {
+        let validationToken: UInt64
+        let snapshot: WorkspaceSearchCatalogSnapshot
+    }
+
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -163,6 +168,8 @@ actor WorkspaceFileContextStore {
         .visibleWorkspacePlusGitData: 0,
         .allLoaded: 0
     ]
+    private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]
+    private static let maxCachedSearchCatalogSnapshotScopes = 16
     private static let defaultMaxPendingDeltasPerRoot = 10000
     private let pathMatchWorker = PathMatchWorker()
     private let codeScanActor = CodeScanActor()
@@ -352,6 +359,23 @@ actor WorkspaceFileContextStore {
 
     func searchCatalogSnapshot(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> WorkspaceSearchCatalogSnapshot {
         let catalogSnapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.catalogSnapshot)
+        let validationToken = searchCatalogSnapshotValidationToken(scope: rootScope)
+        if let cached = searchCatalogSnapshotsByScope[rootScope] {
+            if cached.validationToken == validationToken {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Search.catalogSnapshot,
+                    catalogSnapshotState,
+                    EditFlowPerf.Dimensions(
+                        fileCount: cached.snapshot.diagnostics.fileCount,
+                        cacheHit: true,
+                        rootCount: cached.snapshot.diagnostics.rootCount,
+                        folderCount: cached.snapshot.diagnostics.folderCount
+                    )
+                )
+                return cached.snapshot
+            }
+            searchCatalogSnapshotsByScope.removeValue(forKey: rootScope)
+        }
         let roots = rootsForPathLookup(scope: rootScope)
         let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
         let allowedRootIDs = Set(rootsByID.keys)
@@ -389,10 +413,12 @@ actor WorkspaceFileContextStore {
             catalogSnapshotState,
             EditFlowPerf.Dimensions(
                 fileCount: diagnostics.fileCount,
+                cacheHit: false,
                 rootCount: diagnostics.rootCount,
                 folderCount: diagnostics.folderCount
             )
         )
+        cacheSearchCatalogSnapshot(snapshot, validationToken: validationToken, scope: rootScope)
         return snapshot
     }
 
@@ -676,6 +702,7 @@ actor WorkspaceFileContextStore {
             guard !indexes.filesByID.isEmpty else { continue }
             commit(indexes)
             rootStatesByID[root.id] = state
+            clearSearchCatalogSnapshotCache()
             indexed.append(fullPath)
             upsertedFilesByRoot[root.id, default: []].append(contentsOf: indexes.filesByID.values)
         }
@@ -1264,6 +1291,7 @@ actor WorkspaceFileContextStore {
             statesToUnload.append((rootID, state))
         }
         guard !statesToUnload.isEmpty else { return }
+        clearSearchCatalogSnapshotCache()
         #if DEBUG
             let rootUnloadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let rootUnloadFolderCount = statesToUnload.reduce(0) { $0 + $1.state.folderIDsByRelativePath.count }
@@ -2669,6 +2697,31 @@ actor WorkspaceFileContextStore {
         (catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope)
     }
 
+    private func searchCatalogSnapshotValidationToken(scope: WorkspaceLookupRootScope) -> UInt64 {
+        switch scope {
+        case .sessionBoundWorkspace:
+            scopedSnapshotGeneration(scope: .allLoaded)
+        default:
+            scopedSnapshotGeneration(scope: scope)
+        }
+    }
+
+    private func cacheSearchCatalogSnapshot(
+        _ snapshot: WorkspaceSearchCatalogSnapshot,
+        validationToken: UInt64,
+        scope: WorkspaceLookupRootScope
+    ) {
+        if searchCatalogSnapshotsByScope[scope] == nil,
+           searchCatalogSnapshotsByScope.count >= Self.maxCachedSearchCatalogSnapshotScopes
+        {
+            clearSearchCatalogSnapshotCache()
+        }
+        searchCatalogSnapshotsByScope[scope] = SearchCatalogSnapshotCacheEntry(
+            validationToken: validationToken,
+            snapshot: snapshot
+        )
+    }
+
     private func scopeDiscriminator(_ scope: WorkspaceLookupRootScope) -> UInt64 {
         switch scope {
         case .visibleWorkspace:
@@ -2743,8 +2796,13 @@ actor WorkspaceFileContextStore {
         return (expanded as NSString).standardizingPath
     }
 
+    private func clearSearchCatalogSnapshotCache() {
+        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)
+    }
+
     private func invalidatePathMatchSnapshot(affectedRootKinds: Set<WorkspaceRootKind>) {
         bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)
+        clearSearchCatalogSnapshotCache()
         invalidatePathMatchCache()
     }
 

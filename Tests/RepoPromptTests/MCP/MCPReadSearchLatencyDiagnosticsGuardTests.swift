@@ -90,6 +90,22 @@
             XCTAssertTrue(store.contains("#if DEBUG || EDIT_FLOW_PERF\n                exactCatalogLookupOutcome ="))
         }
 
+        func testSearchCatalogSnapshotCacheRemainsBoundedGenerationKeyedAndCoarselyDiagnosed() throws {
+            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            XCTAssertTrue(store.contains("private static let maxCachedSearchCatalogSnapshotScopes = 16"))
+            XCTAssertTrue(store.contains("private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]"))
+            XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
+            XCTAssertTrue(store.contains("private func clearSearchCatalogSnapshotCache() {\n        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)\n    }"))
+            XCTAssertTrue(store.contains("rootStatesByID[root.id] = state\n            clearSearchCatalogSnapshotCache()\n            indexed.append(fullPath)"))
+            XCTAssertTrue(store.contains("guard !statesToUnload.isEmpty else { return }\n        clearSearchCatalogSnapshotCache()\n        #if DEBUG"))
+            XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache()\n        invalidatePathMatchCache()"))
+            XCTAssertTrue(store.contains("#endif\n        invalidatePathMatchCache()\n        finishRootUnload(for: unloadingPaths)"))
+            XCTAssertTrue(store.contains("cacheHit: true"))
+            XCTAssertTrue(store.contains("cacheHit: false"))
+            XCTAssertFalse(store.contains("Dimensions(rootScope:"))
+            XCTAssertFalse(store.contains("Dimensions(path:"))
+        }
+
         func testInactiveCaptureFastPathRemainsAtomicAndUnusedOutputBytesIsAbsent() throws {
             let perf = try source("Sources/RepoPrompt/Infrastructure/Diffing/EditFlowPerf.swift")
             XCTAssertTrue(perf.contains("Lightweight, gated instrumentation for hot-path diagnostics."))

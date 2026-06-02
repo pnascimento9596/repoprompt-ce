@@ -149,6 +149,237 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         XCTAssertEqual(files.count(where: { $0.standardizedRelativePath == "A.swift" }), 1)
     }
 
+    #if DEBUG
+        func testSearchCatalogSnapshotCacheReusesUnchangedScopeAndPreservesOrderingDiagnostics() async throws {
+            let rootA = try makeTemporaryRoot(name: "SearchSnapshotReuseA")
+            let rootB = try makeTemporaryRoot(name: "SearchSnapshotReuseB")
+            try write("b", to: rootA.appendingPathComponent("Nested/B.swift"))
+            try write("a", to: rootA.appendingPathComponent("A.swift"))
+            try write("c", to: rootB.appendingPathComponent("C.swift"))
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: rootA.path)
+            _ = try await store.loadRoot(path: rootB.path)
+            startSearchCatalogSnapshotCapture(label: "snapshot-reuse")
+            defer { EditFlowPerf.resetDebugCaptureForTesting() }
+
+            let cold = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            let warm = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let buckets = searchCatalogSnapshotBuckets(capture)
+
+            XCTAssertEqual(warm, cold)
+            XCTAssertEqual(cold.entries.map(\.standardizedFullPath), cold.entries.map(\.standardizedFullPath).sorted())
+            XCTAssertEqual(cold.diagnostics.rootScope, .visibleWorkspace)
+            XCTAssertEqual(cold.diagnostics.rootCount, 2)
+            XCTAssertEqual(cold.diagnostics.folderCount, 3)
+            XCTAssertEqual(cold.diagnostics.fileCount, 3)
+            XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 1)
+            XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1)
+            XCTAssertEqual(capture.droppedSampleCount, 0)
+        }
+    #endif
+
+    func testSearchCatalogSnapshotCacheInvalidatesAcrossAddRemoveMoveAndRootLifecycle() async throws {
+        let rootA = try makeTemporaryRoot(name: "SearchSnapshotLifecycleA")
+        let rootB = try makeTemporaryRoot(name: "SearchSnapshotLifecycleB")
+        try write("seed", to: rootA.appendingPathComponent("Seed.swift"))
+        try write("other", to: rootB.appendingPathComponent("Other.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let recordA = try await store.loadRoot(path: rootA.path)
+        _ = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        _ = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+
+        try write("added", to: rootA.appendingPathComponent("Added.swift"))
+        await store.replayObservedFileSystemDeltas(rootID: recordA.id, deltas: [.fileAdded("Added.swift")])
+        var snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(Set(snapshot.files.map(\.standardizedRelativePath)), ["Added.swift", "Seed.swift"])
+
+        try await store.moveFile(rootID: recordA.id, from: "Added.swift", to: "Moved.swift")
+        snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(Set(snapshot.files.map(\.standardizedRelativePath)), ["Moved.swift", "Seed.swift"])
+
+        try FileManager.default.removeItem(at: rootA.appendingPathComponent("Moved.swift"))
+        await store.replayObservedFileSystemDeltas(rootID: recordA.id, deltas: [.fileRemoved("Moved.swift")])
+        snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(snapshot.files.map(\.standardizedRelativePath), ["Seed.swift"])
+
+        let recordB = try await store.loadRoot(path: rootB.path)
+        snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(Set(snapshot.files.map(\.standardizedRelativePath)), ["Other.swift", "Seed.swift"])
+
+        await store.unloadRoot(id: recordB.id)
+        snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(snapshot.files.map(\.standardizedRelativePath), ["Seed.swift"])
+    }
+
+    #if DEBUG
+        func testSearchCatalogSnapshotCacheClearsImmediatelyWhenRootUnloadDetachesBeforeAwaitedTeardown() async throws {
+            let retainedRoot = try makeTemporaryRoot(name: "SearchSnapshotRetainedDuringUnload")
+            let detachedRoot = try makeTemporaryRoot(name: "SearchSnapshotDetachedDuringUnload")
+            try write("retained", to: retainedRoot.appendingPathComponent("Retained.swift"))
+            try write("detached", to: detachedRoot.appendingPathComponent("Detached.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let retainedRecord = try await store.loadRoot(path: retainedRoot.path)
+            let detachedRecord = try await store.loadRoot(path: detachedRoot.path)
+            let warm = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            XCTAssertEqual(Set(warm.roots.map(\.id)), [retainedRecord.id, detachedRecord.id])
+            XCTAssertEqual(Set(warm.files.map(\.standardizedRelativePath)), ["Detached.swift", "Retained.swift"])
+
+            let unloadGate = AsyncGate()
+            await store.setRootUnloadDidDetachHandler { _ in
+                await unloadGate.markStartedAndWaitForRelease()
+            }
+            let unloadTask = Task {
+                await store.unloadRoot(id: detachedRecord.id)
+            }
+            await unloadGate.waitUntilStarted()
+
+            let suspended = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            XCTAssertEqual(suspended.roots.map(\.id), [retainedRecord.id])
+            XCTAssertEqual(suspended.files.map(\.standardizedRelativePath), ["Retained.swift"])
+
+            await unloadGate.release()
+            await unloadTask.value
+            await store.setRootUnloadDidDetachHandler(nil)
+            let completed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            XCTAssertEqual(completed.roots.map(\.id), suspended.roots.map(\.id))
+            XCTAssertEqual(completed.files.map(\.standardizedFullPath), suspended.files.map(\.standardizedFullPath))
+        }
+    #endif
+
+    func testEnsureIndexedFilesClearsWarmSearchSnapshotAcrossMultipleLateFiles() async throws {
+        let root = try makeTemporaryRoot(name: "SearchSnapshotEnsureIndexedMultiple")
+        try write("seed", to: root.appendingPathComponent("Seed.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        _ = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        _ = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+
+        let lateA = root.appendingPathComponent("LateA.swift")
+        let lateB = root.appendingPathComponent("Nested/LateB.swift")
+        try write("a", to: lateA)
+        try write("b", to: lateB)
+        let indexed = await store.ensureIndexedFiles(paths: [lateA.path, lateB.path])
+        XCTAssertEqual(indexed, [lateA.path, lateB.path])
+
+        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(Set(snapshot.files.map(\.standardizedRelativePath)), ["LateA.swift", "Nested/LateB.swift", "Seed.swift"])
+    }
+
+    func testSearchCatalogSnapshotCacheKeepsManagedOnlyIgnoredFileHiddenAndReflectsPromotion() async throws {
+        let root = try makeTemporaryRoot(name: "SearchSnapshotManagedOnlyPromotion")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+        let host = WorkspaceFileEditHost(store: store, lookupRootScope: .visibleWorkspace, createPathResolutionPolicy: .canonicalAliasFirst, selectCreatedFiles: false)
+        _ = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+
+        try await host.writeText(path: "Hidden.ignored", content: "hidden", overwrite: false)
+        var snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let hiddenRecord = await store.file(rootID: record.id, relativePath: "Hidden.ignored")
+        XCTAssertNotNil(hiddenRecord)
+        XCTAssertFalse(snapshot.files.contains { $0.standardizedRelativePath == "Hidden.ignored" })
+        let warmHiddenSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertEqual(warmHiddenSnapshot, snapshot)
+
+        try await store.moveFile(rootID: record.id, from: "Hidden.ignored", to: "Visible.md")
+        snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        XCTAssertTrue(snapshot.files.contains { $0.standardizedRelativePath == "Visible.md" })
+        XCTAssertFalse(snapshot.files.contains { $0.standardizedRelativePath == "Hidden.ignored" })
+    }
+
+    func testSearchCatalogSnapshotCacheSeparatesStaticScopes() async throws {
+        let visibleRoot = try makeTemporaryRoot(name: "SearchSnapshotVisible")
+        let gitDataRoot = try makeTemporaryRoot(name: "SearchSnapshotGitData")
+        let supplementalRoot = try makeTemporaryRoot(name: "SearchSnapshotSupplemental")
+        try write("visible", to: visibleRoot.appendingPathComponent("Visible.swift"))
+        try write("git", to: gitDataRoot.appendingPathComponent("GitData.swift"))
+        try write("system", to: supplementalRoot.appendingPathComponent("System.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let visible = try await store.loadRoot(path: visibleRoot.path)
+        let gitData = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
+        let supplemental = try await store.loadRoot(path: supplementalRoot.path, kind: .supplementalSystem)
+
+        let visibleSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let gitDataSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspacePlusGitData)
+        let allLoadedSnapshot = await store.searchCatalogSnapshot(rootScope: .allLoaded)
+        XCTAssertEqual(visibleSnapshot.roots.map(\.id), [visible.id])
+        XCTAssertEqual(gitDataSnapshot.roots.map(\.id), [visible.id, gitData.id])
+        XCTAssertEqual(allLoadedSnapshot.roots.map(\.id), [visible.id, gitData.id, supplemental.id])
+        let warmVisibleSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let warmGitDataSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspacePlusGitData)
+        let warmAllLoadedSnapshot = await store.searchCatalogSnapshot(rootScope: .allLoaded)
+        XCTAssertEqual(warmVisibleSnapshot, visibleSnapshot)
+        XCTAssertEqual(warmGitDataSnapshot, gitDataSnapshot)
+        XCTAssertEqual(warmAllLoadedSnapshot, allLoadedSnapshot)
+    }
+
+    func testSearchCatalogSnapshotCacheSeparatesSessionBoundScopesAndInvalidatesWorktreeChanges() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "SearchSnapshotLogical")
+        let worktreeA = try makeTemporaryRoot(name: "SearchSnapshotWorktreeA")
+        let worktreeB = try makeTemporaryRoot(name: "SearchSnapshotWorktreeB")
+        try write("logical", to: logicalRoot.appendingPathComponent("Logical.swift"))
+        try write("a", to: worktreeA.appendingPathComponent("A.swift"))
+        try write("b", to: worktreeB.appendingPathComponent("B.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let recordA = try await store.loadRoot(path: worktreeA.path, kind: .sessionWorktree)
+        let recordB = try await store.loadRoot(path: worktreeB.path, kind: .sessionWorktree)
+        let scopeA = WorkspaceLookupRootScope.sessionBoundWorkspace(logicalRootPaths: [logicalRoot.path], physicalRootPaths: [worktreeA.path])
+        let scopeB = WorkspaceLookupRootScope.sessionBoundWorkspace(logicalRootPaths: [logicalRoot.path], physicalRootPaths: [worktreeB.path])
+
+        let initialA = await store.searchCatalogSnapshot(rootScope: scopeA)
+        let initialB = await store.searchCatalogSnapshot(rootScope: scopeB)
+        XCTAssertEqual(initialA.roots.map(\.id), [recordA.id])
+        XCTAssertEqual(initialB.roots.map(\.id), [recordB.id])
+        let warmA = await store.searchCatalogSnapshot(rootScope: scopeA)
+        let warmB = await store.searchCatalogSnapshot(rootScope: scopeB)
+        XCTAssertEqual(warmA, initialA)
+        XCTAssertEqual(warmB, initialB)
+
+        try write("added", to: worktreeA.appendingPathComponent("Added.swift"))
+        await store.replayObservedFileSystemDeltas(rootID: recordA.id, deltas: [.fileAdded("Added.swift")])
+        let changedA = await store.searchCatalogSnapshot(rootScope: scopeA)
+        let unchangedB = await store.searchCatalogSnapshot(rootScope: scopeB)
+        XCTAssertEqual(changedA.generation, initialA.generation)
+        XCTAssertEqual(Set(changedA.files.map(\.standardizedRelativePath)), ["A.swift", "Added.swift"])
+        XCTAssertEqual(unchangedB.files.map(\.standardizedRelativePath), ["B.swift"])
+    }
+
+    #if DEBUG
+        func testSearchCatalogSnapshotCacheClearsBeforeSeventeenthScopeInsert() async {
+            let store = WorkspaceFileContextStore()
+            let scopes = (0 ... 16).map { index in
+                WorkspaceLookupRootScope.sessionBoundWorkspace(
+                    logicalRootPaths: ["/logical/\(index)"],
+                    physicalRootPaths: ["/physical/\(index)"]
+                )
+            }
+            startSearchCatalogSnapshotCapture(label: "snapshot-cap")
+            defer { EditFlowPerf.resetDebugCaptureForTesting() }
+
+            for scope in scopes.prefix(16) {
+                _ = await store.searchCatalogSnapshot(rootScope: scope)
+            }
+            _ = await store.searchCatalogSnapshot(rootScope: scopes[0])
+            _ = await store.searchCatalogSnapshot(rootScope: scopes[16])
+            _ = await store.searchCatalogSnapshot(rootScope: scopes[0])
+
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let buckets = searchCatalogSnapshotBuckets(capture)
+            XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 18)
+            XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1)
+            XCTAssertEqual(capture.retainedSampleCount, 19)
+            XCTAssertEqual(capture.droppedSampleCount, 0)
+        }
+    #endif
+
     func testFileTreeSnapshotSupportsFoldersOnlyMode() async throws {
         let root = try makeTemporaryRoot(name: "FoldersOnlyTree")
         let selectedURL = root.appendingPathComponent("Sources/Selected.swift")
@@ -2115,6 +2346,22 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         if let id { XCTAssertEqual(folder.id, id) }
         return folder
     }
+
+    #if DEBUG
+        private func startSearchCatalogSnapshotCapture(label: String) {
+            EditFlowPerf.resetDebugCaptureForTesting()
+            switch EditFlowPerf.beginDebugCapture(label: label, maxSamples: 100) {
+            case .started:
+                break
+            case .busy:
+                XCTFail("Search catalog snapshot capture should start")
+            }
+        }
+
+        private func searchCatalogSnapshotBuckets(_ snapshot: EditFlowPerf.DebugCaptureSnapshot) -> [EditFlowPerf.DebugCaptureStageAggregate] {
+            snapshot.stages.filter { $0.stageName == String(describing: EditFlowPerf.Stage.Search.catalogSnapshot) }
+        }
+    #endif
 
     private func makeTemporaryRoot(name: String) throws -> URL {
         let url = FileManager.default.temporaryDirectory
