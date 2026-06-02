@@ -5172,6 +5172,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
 
         @_spi(TestSupport)
+        public func test_settleCodexComputerUseActivationAfterTurn(
+            _ session: AgentModeViewModel.TabSession,
+            reason: String = "test"
+        ) {
+            settleCodexComputerUseActivationAfterTurn(session, reason: reason)
+        }
+
+        @_spi(TestSupport)
         public static func test_mergeCommandRunningUpdates(
             existing: CodexNativeSessionController.CommandExecutionRunningUpdate,
             incoming: CodexNativeSessionController.CommandExecutionRunningUpdate
