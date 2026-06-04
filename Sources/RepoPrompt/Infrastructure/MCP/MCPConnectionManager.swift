@@ -3361,7 +3361,7 @@ actor ServerNetworkManager {
                             guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             let windowID = await self.ensureWindowBindingIfUnambiguous(connectionID: connectionID, reason: "handshake")
                             guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
-                            let ready = await toolCatalogReadiness.awaitReady(
+                            let ready = await self.toolCatalogReadiness.awaitReady(
                                 windowID: windowID,
                                 timeout: MCPToolCatalogReadiness.defaultTimeout
                             )
@@ -3371,7 +3371,7 @@ actor ServerNetworkManager {
                             }
 
                             if let windowID {
-                                await toolCatalogReadiness.warmToolCache(windowID: windowID)
+                                await self.toolCatalogReadiness.warmToolCache(windowID: windowID)
                             }
                         }
                     } else {
@@ -4007,7 +4007,7 @@ actor ServerNetworkManager {
         MCPBindingResolver(
             collectMatchesForContextID: { contextID in
                 await MainActor.run {
-                    runtimeSessionRegistry.windowStates().compactMap { windowState in
+                    self.runtimeSessionRegistry.windowStates().compactMap { windowState in
                         guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
                             return nil
                         }
@@ -4023,7 +4023,7 @@ actor ServerNetworkManager {
             },
             collectMatchesForWorkingDirs: { workingDirs in
                 await MainActor.run {
-                    runtimeSessionRegistry.windowStates().flatMap { windowState in
+                    self.runtimeSessionRegistry.windowStates().flatMap { windowState in
                         windowState.workspaceManager.bindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
                             MCPContextBindingMatch(
                                 windowID: windowState.windowID,
@@ -6931,8 +6931,8 @@ actor ServerNetworkManager {
                 EditFlowPerf.Stage.MCPToolCall.routingSnapshot,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
-                let sessions = await MainActor.run { runtimeSessionRegistry.routingSnapshot() }
-                let tools = await serviceRegistry.routeSnapshot()
+                let sessions = await MainActor.run { self.runtimeSessionRegistry.routingSnapshot() }
+                let tools = await self.serviceRegistry.routeSnapshot()
                 return (sessions, tools)
             }
             connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0.activeWindowCount) services=\(routingSnapshot.1.orderedRoutes.count) multi=\(routingSnapshot.0.isMultiWindowModeEffectivelyActive) bypass=\(bypassWindowRoutingForSnapshot)")
@@ -7275,7 +7275,7 @@ actor ServerNetworkManager {
 
                                         do {
                                             try await MainActor.run {
-                                                guard let windowState = runtimeSessionRegistry.window(withID: windowID) else {
+                                                guard let windowState = self.runtimeSessionRegistry.window(withID: windowID) else {
                                                     throw MCPError.invalidParams("Window \(windowID) not found")
                                                 }
                                                 let resolvedWorkspaceID = capturedTabContextHint?.workspaceID
@@ -7383,18 +7383,18 @@ actor ServerNetworkManager {
                                             guard windowCount <= 1 else { continue }
                                         }
                                         let invocationAllowed = await MainActor.run {
-                                            runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)
+                                            self.runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)
                                         }
                                         guard invocationAllowed else { continue }
                                     }
 
                                     @Sendable func ensureIndexedRouteStillInvocable() async throws {
                                         let isAllowed = await MainActor.run {
-                                            guard serviceRegistry.isRegistered(serviceIdentity: indexedRoute.serviceIdentity) else {
+                                            guard self.serviceRegistry.isRegistered(serviceIdentity: indexedRoute.serviceIdentity) else {
                                                 return false
                                             }
                                             guard let routeWindowID else { return true }
-                                            return runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)
+                                            return self.runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)
                                         }
                                         guard isAllowed else {
                                             throw MCPError.invalidParams("Selected MCP window is no longer available. Use bind_context op='list' to refresh window_id routing.")
