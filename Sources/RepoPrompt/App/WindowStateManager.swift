@@ -546,6 +546,8 @@ class WindowStatesManager: ObservableObject {
             let registerStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         allWindows.append(state)
+        ServerNetworkManager.shared.runtimeSessionRegistry.register(windowState: state)
+        state.mcpServer.windowDidRegister()
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "restore.window registered windowID=\(state.windowID) registeredWindows=\(allWindows.count) pendingRestoreEntries=\(restoreQueue.count)"
@@ -609,19 +611,30 @@ class WindowStatesManager: ObservableObject {
     }
 
     func unregisterWindowState(_ state: WindowState) {
+        let runtimeSessionRegistry = ServerNetworkManager.shared.runtimeSessionRegistry
+        runtimeSessionRegistry.beginDraining(windowID: state.windowID)
+        state.mcpServer.windowWillUnregister()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
         }
         explicitlyClosingWindowIDs.remove(state.windowID)
 
         // Skip notifications and updates during termination to prevent observation crashes
-        guard !isTerminating else { return }
+        guard !isTerminating else {
+            runtimeSessionRegistry.remove(windowID: state.windowID)
+            return
+        }
 
         // Notify that window count changed
         NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
 
-        // Inform the network manager that this window is gone
-        Task { await ServerNetworkManager.shared.clearWindowSelectionIfClosed(state.windowID) }
+        // Inform the network manager that this window is gone, then retire the route adapter.
+        Task {
+            await ServerNetworkManager.shared.clearWindowSelectionIfClosed(state.windowID)
+            await MainActor.run {
+                runtimeSessionRegistry.remove(windowID: state.windowID)
+            }
+        }
 
         // Then update shortcuts in case we lost a focused window
         updateKeyboardShortcutsState()

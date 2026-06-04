@@ -321,6 +321,7 @@ final class WindowRoutingService: Service {
     // ---------------------------------------------------------------------
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
+    private let serviceRegistry: MCPServiceRegistry
     private var previousDisabledTools: Set<String>
 
     /// Thread-safe tools storage
@@ -336,10 +337,12 @@ final class WindowRoutingService: Service {
     /// ---------------------------------------------------------------------
     init(
         windowStates: WindowStatesManager,
-        networkMgr: ServerNetworkManager
+        networkMgr: ServerNetworkManager,
+        serviceRegistry: MCPServiceRegistry? = nil
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
+        self.serviceRegistry = serviceRegistry ?? networkMgr.serviceRegistry
         previousDisabledTools = Set(UserDefaults.standard.stringArray(forKey: "mcp.disabledTools") ?? [])
 
         // Initialize cached tools and register service
@@ -347,7 +350,7 @@ final class WindowRoutingService: Service {
             await updateCachedTools()
 
             // Register only after tools are cached
-            ServiceRegistry.register(self)
+            self.serviceRegistry.register(self)
         }
 
         // Listen for changes to relevant MCP settings
@@ -382,7 +385,6 @@ final class WindowRoutingService: Service {
                     ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
                 }
 
-                await networkMgr.broadcastToolListChanged()
             }
         }
 
@@ -417,8 +419,6 @@ final class WindowRoutingService: Service {
                     ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
                 }
 
-                // Notify connected clients that the tool list has changed
-                await networkMgr.broadcastToolListChanged()
             }
         }
     }
@@ -3096,6 +3096,7 @@ final class WindowRoutingService: Service {
 
         // Update the cache with the new tools
         await toolsCache.update(newTools)
+        serviceRegistry.invalidateCatalog(for: self)
     }
 
     // ---------------------------------------------------------------------

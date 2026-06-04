@@ -38,6 +38,16 @@ done
 if [[ ! -f "Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
   fail "required shared MCP control message file missing"
 fi
+if [[ ! -f "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift" ]]; then
+  fail "required shared MCP bootstrap message file missing"
+fi
+if [[ ! -f "Sources/RepoPromptShared/MCP/MCPBootstrapEndpoint.swift" ]]; then
+  fail "required shared MCP bootstrap endpoint file missing"
+fi
+
+if [[ ! -f "docs/architecture/headless-core.md" ]]; then
+  fail "required headless-core architecture lock document missing"
+fi
 
 # Exact-snapshot Tree-sitter scanner support must remain narrow and reproducible.
 # Remove this block together with the support target only after validated upstream
@@ -196,6 +206,26 @@ if [[ "${#mcp_control_files[@]}" -ne 1 || "${mcp_control_files[0]:-}" != "Source
   printf '%s\n' "${mcp_control_files[@]}" >&2
 fi
 
+# 3b. MCPBootstrapMessages.swift has exactly one source of truth.
+mcp_bootstrap_message_files=()
+while IFS= read -r file; do
+  mcp_bootstrap_message_files+=("$file")
+done < <(find Sources -name MCPBootstrapMessages.swift -type f -print | sort)
+if [[ "${#mcp_bootstrap_message_files[@]}" -ne 1 || "${mcp_bootstrap_message_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift" ]]; then
+  fail "MCPBootstrapMessages.swift must exist only at Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift"
+  printf '%s\n' "${mcp_bootstrap_message_files[@]}" >&2
+fi
+
+# 3c. MCPBootstrapEndpoint.swift has exactly one source of truth.
+mcp_bootstrap_endpoint_files=()
+while IFS= read -r file; do
+  mcp_bootstrap_endpoint_files+=("$file")
+done < <(find Sources -name MCPBootstrapEndpoint.swift -type f -print | sort)
+if [[ "${#mcp_bootstrap_endpoint_files[@]}" -ne 1 || "${mcp_bootstrap_endpoint_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPBootstrapEndpoint.swift" ]]; then
+  fail "MCPBootstrapEndpoint.swift must exist only at Sources/RepoPromptShared/MCP/MCPBootstrapEndpoint.swift"
+  printf '%s\n' "${mcp_bootstrap_endpoint_files[@]}" >&2
+fi
+
 # 4. Parser fixtures and sample parser inputs must not live in app source.
 print_matches \
   "parser fixture/test directory found under app syntax parsing source" \
@@ -266,6 +296,7 @@ print_matches \
 # 8. Agent-authored reports and working notes stay local unless explicitly
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
+  "docs/architecture/headless-core.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/source-layout.md"
   "docs/open-source-readiness.md"

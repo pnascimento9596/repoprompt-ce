@@ -101,6 +101,15 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
+    def test_guardrails_delegate_to_make_aggregate_without_claiming_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            argv, lanes, _cwd, _env, timeout = registry.prepare({"operation": "guardrails"})
+
+        self.assertEqual(argv, ["make", "guardrails"])
+        self.assertEqual(lanes, [])
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
+
     def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)

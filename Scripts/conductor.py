@@ -856,7 +856,7 @@ class OperationRegistry:
         if operation == "doctor":
             return [script("doctor.sh")], lanes, cwd, env, effective_timeout
         if operation == "guardrails":
-            return [script("source_layout_guardrails.sh")], lanes, cwd, env, effective_timeout
+            return ["make", "guardrails"], lanes, cwd, env, effective_timeout
         if operation == "format":
             return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
         if operation == "format-check":

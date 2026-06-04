@@ -104,6 +104,97 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 
+    func testBindingResolverPreservesRequestedMappingReuseLivePersistedAndSingleHostPriority() async throws {
+        let contextID = UUID()
+        let workspaceID = UUID()
+        let matches = (1 ... 6).map { windowID in
+            match(windowID: windowID, tabID: contextID, workspaceID: workspaceID)
+        }
+
+        func resolvedWindowID(
+            requestedWindowID: Int? = nil,
+            existingWindowID: Int? = nil,
+            reusableWindowID: Int? = nil,
+            preferredLiveRunWindowID: Int? = nil,
+            preferredWindowID: Int? = nil
+        ) async throws -> Int? {
+            let resolver = makeResolver(
+                matchesByContextID: [contextID: matches],
+                existingWindowID: existingWindowID,
+                reusableWindowID: reusableWindowID,
+                preferredLiveRunWindowID: preferredLiveRunWindowID,
+                preferredWindowID: preferredWindowID
+            )
+            return try await resolver.resolveLogicalContextBinding(
+                connectionID: UUID(),
+                explicitContextID: contextID,
+                legacyTabID: nil,
+                workingDirs: [],
+                requestedWindowID: requestedWindowID
+            )?.windowID
+        }
+
+        let requested = try await resolvedWindowID(
+            requestedWindowID: 1,
+            existingWindowID: 2,
+            reusableWindowID: 3,
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(requested, 1)
+
+        let existing = try await resolvedWindowID(
+            existingWindowID: 2,
+            reusableWindowID: 3,
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(existing, 2)
+
+        let reused = try await resolvedWindowID(
+            reusableWindowID: 3,
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(reused, 3)
+
+        let live = try await resolvedWindowID(
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(live, 4)
+
+        let persisted = try await resolvedWindowID(preferredWindowID: 5)
+        XCTAssertEqual(persisted, 5)
+
+        let invalidImplicitCandidatesSkipped = try await resolvedWindowID(
+            existingWindowID: 99,
+            reusableWindowID: 98,
+            preferredLiveRunWindowID: 97,
+            preferredWindowID: 6
+        )
+        XCTAssertEqual(invalidImplicitCandidatesSkipped, 6)
+
+        let singleHostContextID = UUID()
+        let singleHostResolver = makeResolver(
+            matchesByContextID: [
+                singleHostContextID: [match(windowID: 9, tabID: singleHostContextID, workspaceID: workspaceID)]
+            ],
+            existingWindowID: 99,
+            reusableWindowID: 98,
+            preferredLiveRunWindowID: 97,
+            preferredWindowID: 96
+        )
+        let singleHostResolution = try await singleHostResolver.resolveLogicalContextBinding(
+            connectionID: UUID(),
+            explicitContextID: singleHostContextID,
+            legacyTabID: nil,
+            workingDirs: [],
+            requestedWindowID: nil
+        )
+        XCTAssertEqual(singleHostResolution?.windowID, 9)
+    }
+
     @MainActor
     func testPendingRunScopedStoreRequiresExactRunHint() {
         var store = MCPServerViewModel.PendingRunScopedContextStore()

@@ -40,6 +40,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     func testProductionRegistrationUsesCatalogServiceNotViewModel() async throws {
         #if DEBUG
             let window = Self.makeWindowWithoutAutoStart()
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
             let catalogService = window.mcpServer.windowMCPToolCatalogService
 
             try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in

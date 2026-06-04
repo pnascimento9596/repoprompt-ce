@@ -77,14 +77,16 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         // ───────────────────────────────────────────────────
         // Register global MCP app-wide helpers
+        let networkManager = ServerNetworkManager.shared
         let appSettingsMCPService = AppSettingsMCPService()
-        ServiceRegistry.register(appSettingsMCPService)
+        networkManager.serviceRegistry.register(appSettingsMCPService)
         self.appSettingsMCPService = appSettingsMCPService
 
         // Register global MCP window-routing helpers
         windowRoutingService = WindowRoutingService(
             windowStates: WindowStatesManager.shared,
-            networkMgr: ServerNetworkManager.shared
+            networkMgr: networkManager,
+            serviceRegistry: networkManager.serviceRegistry
         )
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization

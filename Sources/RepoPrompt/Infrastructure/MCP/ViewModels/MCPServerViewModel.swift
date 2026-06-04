@@ -153,6 +153,8 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
+    private let runtimeSessionRegistry: MCPRuntimeSessionRegistry
+    private let serviceRegistry: MCPServiceRegistry
     private let logger = Logger(label: "com.repoprompt.mcp")
 
     private var oracleToolService: MCPOracleToolService {
@@ -472,6 +474,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Whether this window's tools are enabled
     @Published var windowToolsEnabled: Bool = false {
         didSet {
+            runtimeSessionRegistry.setMCPEnabled(windowID: windowID, enabled: windowToolsEnabled)
             updateDashboardSubscriptionIfNeeded()
             recomputeCloseSafetyState()
             #if DEBUG || EDIT_FLOW_PERF
@@ -896,7 +899,7 @@ final class MCPServerViewModel: ObservableObject {
     var activeTabCompatibilityFallbackDiagnostics: [ActiveTabCompatibilityFallbackDiagnostic] = []
 
     var isMultiWindowModeEffectivelyActive: Bool {
-        WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
+        runtimeSessionRegistry.routingSnapshot().isMultiWindowModeEffectivelyActive
     }
 
     @MainActor
@@ -1569,6 +1572,8 @@ final class MCPServerViewModel: ObservableObject {
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
+        runtimeSessionRegistry = service.runtimeSessionRegistry
+        serviceRegistry = service.serviceRegistry
         self.windowID = windowID
         self.promptVM = promptVM
         self.oracleVM = oracleVM
@@ -1606,6 +1611,7 @@ final class MCPServerViewModel: ObservableObject {
 
         // Enable tools based on auto-start setting. CE builds do not license-gate MCP.
         windowToolsEnabled = GlobalSettingsStore.shared.mcpAutoStart()
+        runtimeSessionRegistry.setMCPEnabled(windowID: windowID, enabled: windowToolsEnabled)
     }
 
     // MARK: – Private helpers
@@ -1683,7 +1689,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Brings this window to front to show the approval overlay
     @MainActor
     private func bringWindowToFront() {
-        guard let windowState = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
+        guard let windowState = runtimeSessionRegistry.window(withID: windowID),
               let nsWindow = windowState.nsWindow
         else {
             return
@@ -1736,9 +1742,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Ensures tools are enabled and the window is joined before agent bootstrap continues.
     func ensureServerReadyForAgentBootstrap() async {
         let invalidateCatalogBeforeUpdate = !windowToolsEnabled
-            || !ServiceRegistry.services.contains { service in
-                (service as AnyObject) === (windowToolCatalogService as AnyObject)
-            }
+            || !serviceRegistry.contains(windowToolCatalogService)
         if !windowToolsEnabled {
             windowToolsEnabled = true
         }
@@ -1771,6 +1775,21 @@ final class MCPServerViewModel: ObservableObject {
         await service.refreshState()
     }
 
+    /// Reconcile pending auto-start after the window-backed runtime session becomes active.
+    @MainActor
+    func windowDidRegister() {
+        runtimeSessionRegistry.setMCPEnabled(windowID: windowID, enabled: windowToolsEnabled)
+        Task { await updateToolRegistration(invalidateCatalogBeforeUpdate: false) }
+    }
+
+    /// Remove routing eligibility before asynchronous listener and catalog cleanup completes.
+    @MainActor
+    func windowWillUnregister() {
+        runtimeSessionRegistry.beginDraining(windowID: windowID)
+        serviceRegistry.unregister(windowToolCatalogService)
+        Task { await service.leave(windowID: windowID) }
+    }
+
     /// Updates tool registration based on windowToolsEnabled state
     @MainActor
     private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {
@@ -1784,8 +1803,8 @@ final class MCPServerViewModel: ObservableObject {
             #endif
         }
 
-        if windowToolsEnabled {
-            ServiceRegistry.register(windowToolCatalogService) // idempotent
+        if windowToolsEnabled, runtimeSessionRegistry.hasActiveWindow(id: windowID) {
+            serviceRegistry.register(windowToolCatalogService) // idempotent
             do {
                 try await service.join(windowID: windowID)
                 await service.refreshState()
@@ -1793,7 +1812,7 @@ final class MCPServerViewModel: ObservableObject {
                 logger.error("Failed to join MCP: \(error)")
             }
         } else {
-            ServiceRegistry.unregister(windowToolCatalogService)
+            serviceRegistry.unregister(windowToolCatalogService)
             await service.leave(windowID: windowID)
             await service.refreshState()
         }
@@ -1967,6 +1986,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private func invalidateToolsCache() {
         windowToolCatalogService.invalidateToolsCache()
+        serviceRegistry.invalidateCatalog(for: windowToolCatalogService)
     }
 
     // =====================================================================
@@ -2483,7 +2503,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func requireTargetWindow() throws -> WindowState {
-        guard let targetWindow = WindowStatesManager.shared.window(withID: windowID) else {
+        guard let targetWindow = runtimeSessionRegistry.window(withID: windowID) else {
             throw MCPError.invalidParams("No valid target window found")
         }
         return targetWindow
@@ -2552,7 +2572,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func existingTabContextBindingAcrossWindows(for connectionID: UUID) -> ConnectionBindingSnapshot? {
-        let snapshots = WindowStatesManager.shared.allWindows.map {
+        let snapshots = runtimeSessionRegistry.windowStates().map {
             $0.mcpServer.connectionBindingSnapshot(forConnection: connectionID)
         }
         if let explicit = snapshots.first(where: { $0.bindingKind == .tabContext && $0.explicitlyBound && $0.runID == nil }) {

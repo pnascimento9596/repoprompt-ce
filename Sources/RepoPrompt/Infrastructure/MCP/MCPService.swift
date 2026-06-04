@@ -77,6 +77,15 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     private let controller = ServerController.shared
+    nonisolated let networkManager: ServerNetworkManager
+
+    nonisolated var runtimeSessionRegistry: MCPRuntimeSessionRegistry {
+        networkManager.runtimeSessionRegistry
+    }
+
+    nonisolated var serviceRegistry: MCPServiceRegistry {
+        networkManager.serviceRegistry
+    }
 
     /// Tracks which windows are participating in MCP
     private var participatingWindows = Set<Int>()
@@ -85,14 +94,15 @@ actor MCPService: Sendable {
     // MARK: - Initialization
 
     /// ──────────────────────────────────────────────
-    init() {
+    init(networkManager: ServerNetworkManager = .shared) {
+        self.networkManager = networkManager
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
             await controller.setApprovalCallback { [weak self] clientID in
                 await self?.setPendingApproval(clientID)
             }
-            await ServerNetworkManager.shared.setDashboardDidChangeHook { [weak self] in
+            await networkManager.setDashboardDidChangeHook { [weak self] in
                 Task { await self?.notifyDashboardUpdate() }
             }
         }
@@ -121,6 +131,13 @@ actor MCPService: Sendable {
     }
 
     func join(windowID: Int) async throws {
+        let isEligible = await MainActor.run {
+            runtimeSessionRegistry.hasMCPEnabledWindow(id: windowID)
+        }
+        guard isEligible else {
+            mcpServiceLog("Ignoring stale MCP join for unavailable window \(windowID)")
+            return
+        }
         let inserted = participatingWindows.insert(windowID).inserted
         mcpServiceLog("Window \(windowID) joining MCP (new: \(inserted), total: \(participatingWindows.count))")
 

@@ -53,6 +53,20 @@ Tests/
   RepoPromptTests/               # XCTest tests, support, and fixtures
 ```
 
+## Reserved future headless-core roots
+
+[`headless-core.md`](headless-core.md) locks a future library-first split without creating those roots yet. When the later physical-boundary item lands, use these reserved owners rather than inventing new generic buckets:
+
+```text
+Sources/
+  RepoPromptCore/                # reserved UI-independent host/session library root
+  RepoPromptCoreMacOS/           # reserved Apple/Darwin adapter library root
+  RepoPromptSyntaxCBridge/       # reserved narrow Tree-sitter declaration shim root
+  RepoPromptHeadless/            # reserved independently packaged direct-stdio host root
+```
+
+During Item 0, none of these directories is required to exist and `Package.swift` intentionally remains unchanged. `Scripts/core_boundary_guardrails.sh` is report-only: it scans `Sources/RepoPromptCore` if present, reports forbidden imports and app-owned references, and succeeds when the root is absent. Advisory findings do not fail `make guardrails`; enforcement and an independent core build lane are intentionally deferred until the physical boundary lands.
+
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
 - `Models`
@@ -123,15 +137,17 @@ No top-level `Sources/RepoPrompt/Notifications` exception remains; app-wide noti
 
 ## Guardrails
 
-Run the source-layout guardrails before or after source-layout-sensitive changes:
+Run the repository guardrails before or after source-layout-sensitive changes:
 
 ```bash
 make guardrails
-# or
-./Scripts/source_layout_guardrails.sh
+# coordinated entrypoint:
+make dev-guardrails
 ```
 
-The guardrail script verifies:
+For the source-layout check alone, run `./Scripts/source_layout_guardrails.sh`. For the advisory future-core scan alone during Item 0, run `bash ./Scripts/core_boundary_guardrails.sh`.
+
+The source-layout guardrail verifies:
 
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
@@ -144,6 +160,15 @@ The guardrail script verifies:
 - removed Prompt UI cleanup artifacts (`PresetBottomBar.swift`, `SelectedFileView.swift`, `SelectedFilesPanelViewModel.swift`) and unique stale symbols (`PresetBottomBar`, `SelectedFilesContentView`, `SelectedFilesPanelViewModel`, `PresetTwoPanePopover_Copy`, `CopyPresetPreviewView`, `PresetTwoPanePopover_Chat`) are not referenced from app source;
 - `App/WindowState.swift` does not reintroduce scoped `searchViewModel` wiring;
 - `WorkspaceFilesViewModel.swift` does not reintroduce the removed `loadContentsRecursively` eager-loading seam.
+
+The advisory core-boundary guardrail reports:
+
+- whether the reserved `Sources/RepoPromptCore` root exists yet;
+- forbidden Apple UI/platform imports under that future core root;
+- app-owned `WindowState`, `WindowStatesManager`, `NSApplication`, or `NSWorkspace` references under that future core root;
+- any accidental app-packaging reference to standalone `repoprompt-headless` / `rpce-headless` command names.
+
+During Item 0 those findings are report-only. Shared MCP single-sourcing and scanner compatibility remain enforced by the source-layout guardrail.
 
 ## Historical resolved items
 
@@ -162,6 +187,7 @@ The guardrail script verifies:
 Run the smallest focused validation that covers your change, then broaden as needed:
 
 ```bash
+make dev-guardrails
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
 make dev-test FILTER=CodexIntegrationConfigurationTests

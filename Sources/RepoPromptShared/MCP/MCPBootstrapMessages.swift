@@ -1,13 +1,9 @@
 //
 //  MCPBootstrapMessages.swift
-//  RepoPrompt
+//  RepoPromptShared
 //
 //  Shared bootstrap socket handshake message types.
 //  Used by both the app (BootstrapSocketServer) and CLI (repoprompt-mcp).
-//
-//  IMPORTANT: This file must be included in both targets:
-//  - RepoPrompt (app)
-//  - repoprompt-mcp (CLI)
 //
 
 import Foundation

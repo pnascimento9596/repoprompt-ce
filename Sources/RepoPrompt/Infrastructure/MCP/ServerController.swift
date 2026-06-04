@@ -255,6 +255,10 @@ final actor ServerController: ObservableObject {
         static func test_sanitizedAlwaysAllowedClients(_ clients: Set<String>) -> Set<String> {
             sanitizedAlwaysAllowedClients(clients)
         }
+
+        nonisolated static func test_bundledHelperPathMatches(expectedURL: URL, actualPath: String) -> Bool {
+            bundledHelperPathMatches(expectedURL: expectedURL, actualPath: actualPath)
+        }
     #endif
 
     /// Returns true iff the connecting process matches the app-bundled `repoprompt-mcp` executable.
@@ -268,6 +272,10 @@ final actor ServerController: ObservableObject {
         guard let actualPath = Self.executablePath(forPID: peerPID) else {
             return false
         }
+        return Self.bundledHelperPathMatches(expectedURL: expectedURL, actualPath: actualPath)
+    }
+
+    private nonisolated static func bundledHelperPathMatches(expectedURL: URL, actualPath: String) -> Bool {
         let expected = expectedURL.resolvingSymlinksInPath().standardizedFileURL.path
         let actual = URL(fileURLWithPath: actualPath).resolvingSymlinksInPath().standardizedFileURL.path
         return actual == expected

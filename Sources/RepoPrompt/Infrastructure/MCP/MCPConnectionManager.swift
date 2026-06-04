@@ -296,14 +296,30 @@ actor ServerNetworkManager {
     /// active client connections.  Use this when you need to reference the
     /// MCP listener from anywhere in the app.
     static let shared = ServerNetworkManager()
+    nonisolated let runtimeSessionRegistry: MCPRuntimeSessionRegistry
+    nonisolated let serviceRegistry: MCPServiceRegistry
+    nonisolated let toolCatalogReadiness: MCPToolCatalogReadiness
     private static let repoCLIPrefix = "RepoPrompt CLI"
-    private static let toolNameAliases: [String: String] = [
-        "discover_manage_selection": "manage_selection",
-        "discover_prompt": "prompt",
-        "discover_workspace_context": "workspace_context"
-    ]
+
+    init(
+        runtimeSessionRegistry: MCPRuntimeSessionRegistry = MCPRuntimeSessionRegistry(),
+        serviceRegistry: MCPServiceRegistry = MCPServiceRegistry()
+    ) {
+        self.runtimeSessionRegistry = runtimeSessionRegistry
+        self.serviceRegistry = serviceRegistry
+        toolCatalogReadiness = MCPToolCatalogReadiness(
+            runtimeSessionRegistry: runtimeSessionRegistry,
+            serviceRegistry: serviceRegistry
+        )
+        Task { @MainActor [weak self] in
+            serviceRegistry.setSnapshotDidChangeSink { [weak self] in
+                await self?.broadcastToolListChanged()
+            }
+        }
+    }
+
     nonisolated static func canonicalToolName(for name: String) -> String {
-        toolNameAliases[name] ?? name
+        MCPToolNameCanonicalizer.canonicalName(for: name)
     }
 
     private static func validatedLiveRunID(
@@ -348,7 +364,7 @@ actor ServerNetworkManager {
             return policyWindowID
         }
         let resolvedWindowID = await MainActor.run {
-            WindowStatesManager.shared.allWindows.first { $0.mcpServer.hasLiveRunID(runID) }?.windowID
+            runtimeSessionRegistry.windowStates().first { $0.mcpServer.hasLiveRunID(runID) }?.windowID
         }
         if let resolvedWindowID {
             windowIDByRunID[runID] = resolvedWindowID
@@ -1152,7 +1168,7 @@ actor ServerNetworkManager {
             // The VM API is identity-bound, so it is safe to scan all windows. This avoids
             // missing tools routed via a per-call _windowID override that differs from the
             // connection's sticky/default assigned window.
-            WindowStatesManager.shared.allWindows.reduce(into: 0) { partialResult, window in
+            runtimeSessionRegistry.windowStates(includeDraining: true).reduce(into: 0) { partialResult, window in
                 partialResult += window.mcpServer.cancelActiveToolsForConnection(
                     connectionID: connectionID,
                     reason: reason
@@ -1403,16 +1419,14 @@ actor ServerNetworkManager {
             return existing
         }
 
-        // Get window state on MainActor
-        let (mcpEnabledWindows, multiWindowEffective) = await MainActor.run {
-            let windows = WindowStatesManager.shared.allWindows.filter(\.mcpServer.windowToolsEnabled)
-            let effective = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
-            return (windows, effective)
+        let routingSnapshot = await MainActor.run { runtimeSessionRegistry.routingSnapshot() }
+        let mcpEnabledWindowIDs = routingSnapshot.orderedActiveWindowIDs.filter {
+            routingSnapshot.mcpEnabledWindowIDs.contains($0)
         }
+        let multiWindowEffective = routingSnapshot.isMultiWindowModeEffectivelyActive
 
         // Single MCP-enabled window → unambiguous binding
-        if mcpEnabledWindows.count == 1, let window = mcpEnabledWindows.first {
-            let windowID = window.windowID
+        if mcpEnabledWindowIDs.count == 1, let windowID = mcpEnabledWindowIDs.first {
             setConnectionWindowMapping(connectionID, windowID: windowID)
             connectionLog("\(reason): auto-bound connection \(connectionID) to single MCP-enabled window \(windowID)")
             return windowID
@@ -1425,14 +1439,13 @@ actor ServerNetworkManager {
         if let recordedWindowCount = windowCountAtConnectionTime[connectionID] {
             connectedDuringSingleWindow = recordedWindowCount == 1
         } else {
-            connectedDuringSingleWindow = !multiWindowEffective && mcpEnabledWindows.count <= 1
+            connectedDuringSingleWindow = !multiWindowEffective && mcpEnabledWindowIDs.count <= 1
             if multiWindowEffective {
                 connectionLog("\(reason): missing connection-time window count for \(connectionID); treating as multi-window")
             }
         }
         if connectedDuringSingleWindow || !multiWindowEffective {
-            if let firstWindow = await WindowStatesManager.shared.firstMCPEnabledWindow() {
-                let windowID = firstWindow.windowID
+            if let windowID = routingSnapshot.firstMCPEnabledWindowID {
                 setConnectionWindowMapping(connectionID, windowID: windowID)
                 let bindReason = connectedDuringSingleWindow ? "single-window-at-connect" : "single-window-mode"
                 connectionLog("\(reason): auto-bound connection \(connectionID) to window \(windowID) (\(bindReason))")
@@ -1540,7 +1553,7 @@ actor ServerNetworkManager {
         }
 
         let resolved = await MainActor.run { () -> (runID: UUID, windowID: Int)? in
-            for window in WindowStatesManager.shared.allWindows {
+            for window in runtimeSessionRegistry.windowStates() {
                 guard let candidateRunID = window.mcpServer.connectionIDToRunID[connectionID],
                       let runID = Self.validatedLiveRunID(
                           candidateRunID: candidateRunID,
@@ -1632,7 +1645,7 @@ actor ServerNetworkManager {
         // Fast path: if this connection is already mapped to this run in this window,
         // avoid re-registering and re-binding on every tool call.
         let alreadyMapped = await MainActor.run { () -> Bool in
-            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+            guard let window = runtimeSessionRegistry.window(withID: windowID) else {
                 return false
             }
             let mappedRun = window.mcpServer.connectionIDToRunID[connectionID]
@@ -1651,7 +1664,7 @@ actor ServerNetworkManager {
         }
 
         let registrationSucceeded = await MainActor.run { () -> Bool in
-            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+            guard let window = runtimeSessionRegistry.window(withID: windowID) else {
                 log.warning("mapConnectionToRunID: window \(windowID) not found for connection \(connectionID)")
                 return false
             }
@@ -2085,7 +2098,7 @@ actor ServerNetworkManager {
         }
 
         await MainActor.run {
-            let windows = WindowStatesManager.shared.allWindows.filter { window in
+            let windows = runtimeSessionRegistry.windowStates(includeDraining: true).filter { window in
                 guard let windowID else { return true }
                 return window.windowID == windowID
             }
@@ -3173,7 +3186,7 @@ actor ServerNetworkManager {
         // Routing logic treats nil as unknown and falls back to current window topology.
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let count = WindowStatesManager.shared.allWindows.count
+            let count = runtimeSessionRegistry.routingSnapshot().activeWindowCount
             await setWindowCountAtConnectionTime(
                 connectionID: connectionID,
                 lifecycleGeneration: lifecycleGeneration,
@@ -3348,7 +3361,7 @@ actor ServerNetworkManager {
                             guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             let windowID = await self.ensureWindowBindingIfUnambiguous(connectionID: connectionID, reason: "handshake")
                             guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
-                            let ready = await MCPToolCatalogReadiness.shared.awaitReady(
+                            let ready = await toolCatalogReadiness.awaitReady(
                                 windowID: windowID,
                                 timeout: MCPToolCatalogReadiness.defaultTimeout
                             )
@@ -3358,7 +3371,7 @@ actor ServerNetworkManager {
                             }
 
                             if let windowID {
-                                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
+                                await toolCatalogReadiness.warmToolCache(windowID: windowID)
                             }
                         }
                     } else {
@@ -3883,7 +3896,7 @@ actor ServerNetworkManager {
         }
 
         await MainActor.run {
-            let windows = WindowStatesManager.shared.allWindows
+            let windows = runtimeSessionRegistry.windowStates(includeDraining: true)
             let nameForCleanup = cleanupClientName
             if let windowID = assignedWindowID,
                let windowState = windows.first(where: { $0.windowID == windowID })
@@ -3994,7 +4007,7 @@ actor ServerNetworkManager {
         MCPBindingResolver(
             collectMatchesForContextID: { contextID in
                 await MainActor.run {
-                    WindowStatesManager.shared.allWindows.compactMap { windowState in
+                    runtimeSessionRegistry.windowStates().compactMap { windowState in
                         guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
                             return nil
                         }
@@ -4010,7 +4023,7 @@ actor ServerNetworkManager {
             },
             collectMatchesForWorkingDirs: { workingDirs in
                 await MainActor.run {
-                    WindowStatesManager.shared.allWindows.flatMap { windowState in
+                    runtimeSessionRegistry.windowStates().flatMap { windowState in
                         windowState.workspaceManager.bindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
                             MCPContextBindingMatch(
                                 windowID: windowState.windowID,
@@ -4922,7 +4935,7 @@ actor ServerNetworkManager {
 
             private func debugBindingSnapshot(for connectionID: UUID, selectedWindowID: Int?) async -> MCPServerViewModel.ConnectionBindingSnapshot {
                 await MainActor.run {
-                    let windows = WindowStatesManager.shared.allWindows
+                    let windows = runtimeSessionRegistry.windowStates()
                     let snapshots = windows.map { $0.mcpServer.connectionBindingSnapshot(forConnection: connectionID) }
                     if let explicit = snapshots.first(where: { $0.bindingKind == .tabContext && $0.explicitlyBound && $0.runID == nil }) {
                         return explicit
@@ -4978,7 +4991,7 @@ actor ServerNetworkManager {
 
             private func debugWindowObjects() async -> [[String: Any]] {
                 await MainActor.run {
-                    WindowStatesManager.shared.allWindows.map { window in
+                    runtimeSessionRegistry.windowStates().map { window in
                         let workspace = window.workspaceManager.activeWorkspace
                         let activeTabID = window.promptManager.activeComposeTabID
                         let workspaceID: Any = workspace?.id.uuidString ?? NSNull()
@@ -5768,7 +5781,7 @@ actor ServerNetworkManager {
             }
 
             func debugSeedRoutingAffinityPayload(connectionID: UUID, windowID: Int) async -> [String: Any] {
-                let exists = await MainActor.run { WindowStatesManager.shared.hasWindow(id: windowID) }
+                let exists = await MainActor.run { runtimeSessionRegistry.hasActiveWindow(id: windowID) }
                 guard exists else {
                     return ["ok": false, "op": "seed_routing_affinity", "code": "invalid_params", "error": "No window found for window_id \(windowID)."]
                 }
@@ -5916,7 +5929,7 @@ actor ServerNetworkManager {
             hydratePersistedPolicy: Bool = true
         ) async throws -> [String] {
             let windowID = await ensureWindowBindingIfUnambiguous(connectionID: connectionID, reason: "debug/tools/list")
-            let isReady = await MCPToolCatalogReadiness.shared.awaitReady(
+            let isReady = await toolCatalogReadiness.awaitReady(
                 windowID: windowID,
                 timeout: 5.0
             )
@@ -5924,7 +5937,7 @@ actor ServerNetworkManager {
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
             if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
+                await toolCatalogReadiness.warmToolCache(windowID: windowID)
             }
 
             if hydratePersistedPolicy {
@@ -5934,12 +5947,8 @@ actor ServerNetworkManager {
                 )
             }
 
-            let (disabled, registeredServices) = await MainActor.run {
-                (
-                    ToolAvailabilityStore.shared.effectiveDisabledTools,
-                    ServiceRegistry.services
-                )
-            }
+            let disabled = await MainActor.run { ToolAvailabilityStore.shared.effectiveDisabledTools }
+            let indexedToolSnapshot = await serviceRegistry.routeSnapshot()
             let policy = effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -5947,26 +5956,25 @@ actor ServerNetworkManager {
             var names: [String] = []
 
             if isEnabledState {
-                for service in registeredServices {
-                    for tool in await service.tools {
-                        guard !disabled.contains(tool.name) else { continue }
-                        guard !restricted.contains(tool.name) else { continue }
+                for route in indexedToolSnapshot.orderedRoutes {
+                    let tool = route.tool
+                    guard !disabled.contains(tool.name) else { continue }
+                    guard !restricted.contains(tool.name) else { continue }
 
-                        if MCPPolicyGatedTools.names.contains(tool.name),
-                           !additionalTools.contains(tool.name)
-                        {
-                            continue
-                        }
-
-                        if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                            toolName: tool.name,
-                            taskLabelKind: policy.taskLabelKind,
-                            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) { continue }
-
-                        guard seenNames.insert(tool.name).inserted else { continue }
-                        names.append(tool.name)
+                    if MCPPolicyGatedTools.names.contains(tool.name),
+                       !additionalTools.contains(tool.name)
+                    {
+                        continue
                     }
+
+                    if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                        toolName: tool.name,
+                        taskLabelKind: policy.taskLabelKind,
+                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                    ) { continue }
+
+                    guard seenNames.insert(tool.name).inserted else { continue }
+                    names.append(tool.name)
                 }
             }
 
@@ -6366,7 +6374,7 @@ actor ServerNetworkManager {
         runID: UUID
     ) async {
         let resolved = await MainActor.run { () -> (workspaceID: UUID, snapshot: ComposeTabState)? in
-            guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
+            guard let windowState = runtimeSessionRegistry.window(withID: windowID) else {
                 return nil
             }
             guard let resolved = windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID) else {
@@ -6421,7 +6429,7 @@ actor ServerNetworkManager {
         let resolvedClientName = clientName ?? clientIdentifier(forConnection: connectionID)
         do {
             let bindingResult = try await MainActor.run { () throws -> (didBind: Bool, workspaceID: UUID?) in
-                guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
+                guard let windowState = runtimeSessionRegistry.window(withID: windowID) else {
                     throw MCPError.invalidParams("Window \(windowID) not found")
                 }
                 // Fast path: already bound to this exact tab+run in this window.
@@ -6554,7 +6562,7 @@ actor ServerNetworkManager {
             // Use ensureWindowBindingIfUnambiguous to treat nil as single-window fallback,
             // preventing failures for clients that call tools/list before explicit window selection.
             let windowID = await ensureWindowBindingIfUnambiguous(connectionID: connectionID, reason: "tools/list")
-            let isReady = await MCPToolCatalogReadiness.shared.awaitReady(
+            let isReady = await toolCatalogReadiness.awaitReady(
                 windowID: windowID,
                 timeout: 2.0 // Shorter timeout here since handshake should have waited
             )
@@ -6572,7 +6580,7 @@ actor ServerNetworkManager {
 
             // Warm tool cache if we have a bound window
             if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
+                await toolCatalogReadiness.warmToolCache(windowID: windowID)
             }
 
             // Opportunistic persisted hydration for resumed agent-mode sessions.
@@ -6584,12 +6592,8 @@ actor ServerNetworkManager {
             )
 
             // Get all MainActor-isolated data in one hop
-            let (disabled, registeredServices) = await MainActor.run {
-                (
-                    ToolAvailabilityStore.shared.effectiveDisabledTools,
-                    ServiceRegistry.services
-                )
-            }
+            let disabled = await MainActor.run { ToolAvailabilityStore.shared.effectiveDisabledTools }
+            let indexedToolSnapshot = await serviceRegistry.routeSnapshot()
             let policy = await effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -6608,69 +6612,67 @@ actor ServerNetworkManager {
 
             // Only proceed when the global MCP switch is ON
             if await isEnabledState {
-                // Enumerate every registered Service
-                for service in registeredServices {
-                    // Walk through the service's declared tools
-                    for tool in await service.tools {
-                        if disabled.contains(tool.name) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "disabled")
-                            #endif
-                            continue
-                        }
-                        if restricted.contains(tool.name) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "restricted")
-                            #endif
-                            continue
-                        }
-
-                        // • hide policy-gated tools unless explicitly granted via additionalTools
-                        if MCPPolicyGatedTools.names.contains(tool.name),
-                           !additionalTools.contains(tool.name)
-                        {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "missing_additional_tool_grant")
-                            #endif
-                            continue
-                        }
-
-                        // • role-based advertisement filtering (advertisement-only, not execution-time)
-                        if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                            toolName: tool.name,
-                            taskLabelKind: policy.taskLabelKind,
-                            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "role_advertisement_policy")
-                            #endif
-                            continue
-                        }
-
-                        // • skip duplicates coming from other windows
-                        guard seenNames.insert(tool.name).inserted else { continue }
-
-                        // OK – advertise the tool
-                        let schemaValue = try await cachedSchema(
-                            for: tool.name,
-                            schema: tool.inputSchema,
-                            purpose: policy.purpose
-                        )
-                        let description = advertisedToolDescription(
-                            for: tool.name,
-                            baseDescription: tool.description,
-                            purpose: policy.purpose
-                        )
-
-                        tools.append(
-                            .init(
-                                name: tool.name,
-                                description: description,
-                                inputSchema: schemaValue,
-                                annotations: tool.annotations
-                            )
-                        )
+                // Enumerate one immutable indexed tool snapshot.
+                for route in indexedToolSnapshot.orderedRoutes {
+                    let tool = route.tool
+                    if disabled.contains(tool.name) {
+                        #if DEBUG
+                            recordHiddenTool(tool.name, reason: "disabled")
+                        #endif
+                        continue
                     }
+                    if restricted.contains(tool.name) {
+                        #if DEBUG
+                            recordHiddenTool(tool.name, reason: "restricted")
+                        #endif
+                        continue
+                    }
+
+                    // • hide policy-gated tools unless explicitly granted via additionalTools
+                    if MCPPolicyGatedTools.names.contains(tool.name),
+                       !additionalTools.contains(tool.name)
+                    {
+                        #if DEBUG
+                            recordHiddenTool(tool.name, reason: "missing_additional_tool_grant")
+                        #endif
+                        continue
+                    }
+
+                    // • role-based advertisement filtering (advertisement-only, not execution-time)
+                    if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                        toolName: tool.name,
+                        taskLabelKind: policy.taskLabelKind,
+                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                    ) {
+                        #if DEBUG
+                            recordHiddenTool(tool.name, reason: "role_advertisement_policy")
+                        #endif
+                        continue
+                    }
+
+                    // • skip duplicates coming from other windows
+                    guard seenNames.insert(tool.name).inserted else { continue }
+
+                    // OK – advertise the tool
+                    let schemaValue = try await cachedSchema(
+                        for: tool.name,
+                        schema: tool.inputSchema,
+                        purpose: policy.purpose
+                    )
+                    let description = advertisedToolDescription(
+                        for: tool.name,
+                        baseDescription: tool.description,
+                        purpose: policy.purpose
+                    )
+
+                    tools.append(
+                        .init(
+                            name: tool.name,
+                            description: description,
+                            inputSchema: schemaValue,
+                            annotations: tool.annotations
+                        )
+                    )
                 }
             }
 
@@ -6925,21 +6927,15 @@ actor ServerNetworkManager {
             // mutable cross-connection service state.
             let bypassWindowRoutingForSnapshot = Self.shouldBypassWindowRouting(for: toolName)
             connectionLog("tools/call \(toolName): reading MainActor routing state")
-            let routingSnapshot: (Int, [any Service], Bool) = await EditFlowPerf.measure(
+            let routingSnapshot: (MCPRuntimeSessionRegistry.RoutingSnapshot, MCPServiceRegistry.Snapshot) = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.routingSnapshot,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
-                await MainActor.run {
-                    let services = ServiceRegistry.services
-                    guard !bypassWindowRoutingForSnapshot else {
-                        return (0, services, false)
-                    }
-                    let windows = WindowStatesManager.shared.allWindows
-                    let effectiveMode = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
-                    return (windows.count, services, effectiveMode)
-                }
+                let sessions = await MainActor.run { runtimeSessionRegistry.routingSnapshot() }
+                let tools = await serviceRegistry.routeSnapshot()
+                return (sessions, tools)
             }
-            connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) services=\(routingSnapshot.1.count) multi=\(routingSnapshot.2)")
+            connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0.activeWindowCount) services=\(routingSnapshot.1.orderedRoutes.count) multi=\(routingSnapshot.0.isMultiWindowModeEffectivelyActive) bypass=\(bypassWindowRoutingForSnapshot)")
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted,
                 correlation: lifecycleCorrelation,
@@ -7013,7 +7009,9 @@ actor ServerNetworkManager {
                                 // Hidden params like `_windowID` can explicitly redirect a call even
                                 // when the connection already has a preferred window binding.
 
-                                let (windowCount, allServices, multiWindowModeEffective) = routingSnapshot
+                                let (runtimeSessions, indexedTools) = routingSnapshot
+                                let windowCount = bypassWindowRoutingForSnapshot ? 0 : runtimeSessions.activeWindowCount
+                                let multiWindowModeEffective = bypassWindowRoutingForSnapshot ? false : runtimeSessions.isMultiWindowModeEffectivelyActive
                                 var chosenID: Int?
                                 let windowStr: String
                                 let observerRunIDForCallbacksFinal: UUID?
@@ -7038,7 +7036,7 @@ actor ServerNetworkManager {
                                     // When provided, _windowID always takes precedence, even over
                                     // existing connection mappings. This enables explicit window targeting.
                                     if !bypassWindowRouting, let requestedWindowID = capturedWindowID {
-                                        let windowValid = await WindowStatesManager.shared.hasWindowWithMCPEnabled(requestedWindowID)
+                                        let windowValid = runtimeSessions.hasMCPEnabledWindow(requestedWindowID)
                                         guard windowValid else {
                                             return Self.toolErrorResult(
                                                 rawJSON: capturedRawJSON,
@@ -7065,15 +7063,20 @@ actor ServerNetworkManager {
                                     // PRIORITY 1: Use existing connection mapping (no override requested)
                                     // ═══════════════════════════════════════════════════════════════
                                     if !bypassWindowRouting, chosenID == nil, let mapped = existingMapping {
-                                        chosenID = mapped
-                                        mcpRoutingLog("Tool=\(toolName) using existing mapping conn=\(connectionID) window=\(mapped)")
+                                        if runtimeSessions.hasMCPEnabledWindow(mapped) {
+                                            chosenID = mapped
+                                            mcpRoutingLog("Tool=\(toolName) using existing mapping conn=\(connectionID) window=\(mapped)")
+                                        } else {
+                                            mcpRoutingLog("Tool=\(toolName) ignoring stale existing mapping conn=\(connectionID) window=\(mapped)")
+                                        }
                                     }
 
                                     // PRIORITY 2: Use clientName to find existing window assignment (for same client, new connection)
                                     if !bypassWindowRouting,
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID),
-                                       let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
+                                       let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName),
+                                       runtimeSessions.hasMCPEnabledWindow(windowID)
                                     {
                                         chosenID = windowID
                                         await self.setConnectionWindowMapping(connectionID, windowID: windowID)
@@ -7089,7 +7092,9 @@ actor ServerNetworkManager {
                                         let cachedToken = await self.capabilityTokenByConnection[connectionID]
                                         let sessionKey = managerToken ?? cachedToken
                                         mcpRoutingInternalDebugLog("[PRIORITY 2b] client='\(clientName)' managerToken=\(managerToken?.prefix(8) ?? "nil") cachedToken=\(cachedToken?.prefix(8) ?? "nil") sessionKey=\(sessionKey?.prefix(8) ?? "nil")")
-                                        if let liveAffinity = await self.preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
+                                        if let liveAffinity = await self.preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
+                                           runtimeSessions.hasMCPEnabledWindow(liveAffinity.windowID)
+                                        {
                                             chosenID = liveAffinity.windowID
                                             await self.setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
                                             _ = await self.mapConnectionToRunID(
@@ -7098,7 +7103,9 @@ actor ServerNetworkManager {
                                                 windowID: liveAffinity.windowID
                                             )
                                             connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID)")
-                                        } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey) {
+                                        } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey),
+                                                  runtimeSessions.hasMCPEnabledWindow(preferredWindowID)
+                                        {
                                             chosenID = preferredWindowID
                                             await self.setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
                                             connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
@@ -7119,7 +7126,7 @@ actor ServerNetworkManager {
                                     }
                                     if !bypassWindowRouting && chosenID == nil && (!multiWindowModeEffective || connectedDuringSingleWindow) {
                                         // Find the window with active MCP tools
-                                        let activeWindowID = await WindowStatesManager.shared.firstMCPEnabledWindow()?.windowID
+                                        let activeWindowID = runtimeSessions.firstMCPEnabledWindowID
                                         if let activeID = activeWindowID {
                                             let reason = connectedDuringSingleWindow && multiWindowModeEffective
                                                 ? "single-window-at-connect"
@@ -7268,7 +7275,7 @@ actor ServerNetworkManager {
 
                                         do {
                                             try await MainActor.run {
-                                                guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
+                                                guard let windowState = runtimeSessionRegistry.window(withID: windowID) else {
                                                     throw MCPError.invalidParams("Window \(windowID) not found")
                                                 }
                                                 let resolvedWorkspaceID = capturedTabContextHint?.workspaceID
@@ -7354,43 +7361,47 @@ actor ServerNetworkManager {
                                     EditFlowPerf.Stage.MCPToolCall.serviceToolLookup,
                                     EditFlowPerf.Dimensions(toolName: toolName)
                                 )
-                                for service in allServices {
-                                    // App-wide coordination tools have a single owning service. Avoid probing
-                                    // unrelated window-scoped services for their tool lists during startup,
-                                    // because some of those lists hop through UI/window state.
-                                    if toolName == "bind_context", !(service is WindowRoutingService) { continue }
-                                    if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) { continue }
+                                for indexedRoute in indexedTools.routes(forCanonicalName: toolName) {
+                                    if toolName == "bind_context", indexedRoute.role != .contextRouting { continue }
+                                    if toolName == AppSettingsMCPService.toolName, indexedRoute.role != .appSettings { continue }
 
+                                    let service = indexedRoute.service
+                                    let toolDef = indexedRoute.tool
                                     let wsSvc = service as? WindowScopedService
-
-                                    // Skip window-scoped services that don't match this connection
-                                    if let wsSvc, windowCount > 1 {
-                                        guard let wID = chosenID, wID == wsSvc.windowID else { continue }
+                                    let routeWindowID: Int? = if case let .window(windowID) = indexedRoute.scope {
+                                        windowID
+                                    } else {
+                                        nil
                                     }
 
-                                    // Get the tool definition (need schema for window_id injection)
-                                    connectionLog("tools/call \(toolName): inspecting service \(String(describing: type(of: service)))")
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let serviceToolsAwaitState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait)
-                                    #endif
-                                    let serviceTools = await service.tools
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait, serviceToolsAwaitState)
-                                    #endif
-                                    connectionLog("tools/call \(toolName): service \(String(describing: type(of: service))) exposes \(serviceTools.count) tools")
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let toolDefinitionScanState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan)
-                                    #endif
-                                    guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else {
-                                        #if DEBUG || EDIT_FLOW_PERF
-                                            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
-                                        #endif
-                                        continue
+                                    // A selected window must match exactly. Implicit fallback is allowed only
+                                    // while the captured topology remains unambiguous.
+                                    if let routeWindowID {
+                                        if let chosenID {
+                                            guard chosenID == routeWindowID else { continue }
+                                        } else {
+                                            guard windowCount <= 1 else { continue }
+                                        }
+                                        let invocationAllowed = await MainActor.run {
+                                            runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)
+                                        }
+                                        guard invocationAllowed else { continue }
                                     }
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
-                                    #endif
-                                    connectionLog("tools/call \(toolName): dispatching via service \(String(describing: type(of: service))) windowScoped=\(wsSvc != nil)")
+
+                                    @Sendable func ensureIndexedRouteStillInvocable() async throws {
+                                        let isAllowed = await MainActor.run {
+                                            guard serviceRegistry.isRegistered(serviceIdentity: indexedRoute.serviceIdentity) else {
+                                                return false
+                                            }
+                                            guard let routeWindowID else { return true }
+                                            return runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)
+                                        }
+                                        guard isAllowed else {
+                                            throw MCPError.invalidParams("Selected MCP window is no longer available. Use bind_context op='list' to refresh window_id routing.")
+                                        }
+                                    }
+
+                                    connectionLog("tools/call \(toolName): dispatching indexed service \(String(describing: type(of: service))) windowScoped=\(wsSvc != nil)")
 
                                     // Inject window_id from routing if tool schema declares it and caller didn't provide it.
                                     // bind_context manages its own window_id semantics and must not be auto-injected.
@@ -7446,7 +7457,8 @@ actor ServerNetworkManager {
                                                     EditFlowPerf.Dimensions(toolName: toolName)
                                                 ) {
                                                     try await dispatchResolvedProvider {
-                                                        try await toolDef.callAsFunction(effectiveArgs)
+                                                        try await ensureIndexedRouteStillInvocable()
+                                                        return try await toolDef.callAsFunction(effectiveArgs)
                                                     }
                                                 }
                                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -7559,7 +7571,8 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
                                                 try await dispatchResolvedProvider {
-                                                    try await toolDef.callAsFunction(effectiveArgs)
+                                                    try await ensureIndexedRouteStillInvocable()
+                                                    return try await toolDef.callAsFunction(effectiveArgs)
                                                 }
                                             }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -8011,7 +8024,7 @@ actor ServerNetworkManager {
 
         // Get live windows to also prune records pointing to closed windows
         let liveWindows: Set<Int> = await MainActor.run {
-            Set(WindowStatesManager.shared.allWindows.map(\.windowID))
+            Set(runtimeSessionRegistry.routingSnapshot().orderedActiveWindowIDs)
         }
 
         for clientID in keys {
@@ -8078,7 +8091,7 @@ actor ServerNetworkManager {
         let (workspaceID, instanceNumber): (UUID?, Int?) = await MainActor.run {
             guard
                 let windowID,
-                let win = WindowStatesManager.shared.window(withID: windowID)
+                let win = runtimeSessionRegistry.window(withID: windowID)
             else { return (nil, nil) }
             return (win.workspaceManager.activeWorkspace?.id, win.workspaceInstanceNumber)
         }
@@ -8137,7 +8150,7 @@ actor ServerNetworkManager {
 
         for key in matchingClientKeys(for: clientName, in: Array(lastWindowByClientSession.keys)) {
             if let sessionKey, let win = lastWindowByClientSession[key]?[sessionKey] {
-                let exists = await WindowStatesManager.shared.hasWindow(id: win)
+                let exists = await MainActor.run { runtimeSessionRegistry.hasActiveWindow(id: win) }
                 if exists {
                     mcpRoutingInternalDebugLog("[preferredWindowID] fast path hit: client '\(clientName)' matchedKey '\(key)' window \(win)")
                     return win
@@ -8170,7 +8183,7 @@ actor ServerNetworkManager {
 
         let sortedRecords = freshRecords.sorted { $0.lastSeenAt > $1.lastSeenAt }
         let windowSnapshot: [(workspaceID: UUID?, instanceNumber: Int?, windowID: Int)] = await MainActor.run {
-            WindowStatesManager.shared.allWindows.map {
+            runtimeSessionRegistry.windowStates().map {
                 ($0.workspaceManager.activeWorkspace?.id, $0.workspaceInstanceNumber, $0.windowID)
             }
         }

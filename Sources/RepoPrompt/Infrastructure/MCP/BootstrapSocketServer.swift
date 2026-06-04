@@ -23,7 +23,7 @@ import RepoPromptShared
 #endif
 
 // Note: MCPBootstrapRequest and MCPBootstrapResponse are defined in
-// RepoPrompt/Shared/MCPBootstrapMessages.swift for sharing with the CLI.
+// RepoPromptShared/MCP/MCPBootstrapMessages.swift for sharing with the CLI.
 
 // MARK: - Bootstrap Socket Server
 
@@ -737,14 +737,14 @@ actor BootstrapSocketServer {
         // Validate protocol version
         guard request.protocolVersion == MCPBootstrapProtocol.currentVersion else {
             logger.warning("BootstrapSocketServer: protocol version mismatch (got \(request.protocolVersion), expected \(MCPBootstrapProtocol.currentVersion))")
-            _ = await sendResponseAsync(.rejected(reason: "Protocol version mismatch", errorCode: "protocol_version_mismatch"), to: handshakeSocket)
+            _ = await sendResponseAsync(.rejected(reason: "Protocol version mismatch", errorCode: MCPBootstrapErrorCode.protocolVersionMismatch.rawValue), to: handshakeSocket)
             return
         }
 
         // Invoke callback to let ServerNetworkManager decide
         guard let handler = onNewConnection else {
             logger.error("BootstrapSocketServer: no connection handler registered")
-            _ = await sendResponseAsync(.rejected(reason: "Server not ready", errorCode: "server_not_ready"), to: handshakeSocket)
+            _ = await sendResponseAsync(.rejected(reason: "Server not ready", errorCode: MCPBootstrapErrorCode.serverNotReady.rawValue), to: handshakeSocket)
             return
         }
 
@@ -826,7 +826,7 @@ actor BootstrapSocketServer {
             }
             await postAccept()
         } else {
-            let response = admission.rejection ?? .rejected(reason: "Connection rejected", errorCode: "approval_denied")
+            let response = admission.rejection ?? .rejected(reason: "Connection rejected", errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue)
             _ = await sendResponseAsync(response, to: handshakeSocket)
             bootstrapSocketServerLog("BootstrapSocketServer: rejected connection from '\(request.clientName ?? "unknown")'")
         }

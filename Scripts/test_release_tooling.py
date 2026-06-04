@@ -89,7 +89,22 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("matches the embedded MCP helper layout policy", result.stdout)
 
+    def test_app_packaging_keeps_headless_host_outside_embedded_proxy_layout(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+
+        self.assertIn('for exe in "$APP_NAME" repoprompt-mcp; do', package_script)
+        self.assertNotIn("repoprompt-headless", package_script)
+        self.assertNotIn("rpce-headless", package_script)
+
     def test_embedded_mcp_helper_layout_validator_rejects_invalid_metadata(self) -> None:
+        def missing_helper(app: Path) -> None:
+            (app / "Contents" / "MacOS" / "repoprompt-mcp").unlink()
+
+        def helper_directory(app: Path) -> None:
+            helper = app / "Contents" / "MacOS" / "repoprompt-mcp"
+            helper.unlink()
+            helper.mkdir()
+
         def helper_symlink(app: Path) -> None:
             helper = app / "Contents" / "MacOS" / "repoprompt-mcp"
             helper.unlink()
@@ -104,17 +119,37 @@ class ReleaseToolingTests(unittest.TestCase):
         def missing_bin_link(app: Path) -> None:
             (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").unlink()
 
-        def alternate_in_app_target(app: Path) -> None:
+        def resources_regular_file(app: Path) -> None:
+            link = app / "Contents" / "Resources" / "repoprompt-mcp"
+            link.unlink()
+            link.write_text("not a symlink\n", encoding="utf-8")
+
+        def bin_regular_file(app: Path) -> None:
+            link = app / "Contents" / "Resources" / "bin" / "repoprompt-mcp"
+            link.unlink()
+            link.write_text("not a symlink\n", encoding="utf-8")
+
+        def alternate_resources_target(app: Path) -> None:
             link = app / "Contents" / "Resources" / "repoprompt-mcp"
             link.unlink()
             link.symlink_to("../MacOS/RepoPrompt")
 
+        def alternate_bin_target(app: Path) -> None:
+            link = app / "Contents" / "Resources" / "bin" / "repoprompt-mcp"
+            link.unlink()
+            link.symlink_to("../../MacOS/RepoPrompt")
+
         for label, mutate in (
+            ("missing helper", missing_helper),
+            ("helper directory", helper_directory),
             ("helper symlink", helper_symlink),
             ("non-executable helper", non_executable_helper),
             ("missing resources link", missing_resources_link),
             ("missing bin link", missing_bin_link),
-            ("alternate in-app target", alternate_in_app_target),
+            ("resources regular file", resources_regular_file),
+            ("bin regular file", bin_regular_file),
+            ("alternate resources target", alternate_resources_target),
+            ("alternate bin target", alternate_bin_target),
         ):
             with self.subTest(label=label):
                 app = self.make_embedded_helper_layout()

@@ -614,12 +614,9 @@
 
             var searchStart = lookup.startIndex
             for hook in [
-                "let serviceToolsAwaitState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait)",
-                "let serviceTools = await service.tools",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait, serviceToolsAwaitState)",
-                "let toolDefinitionScanState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan)",
-                "guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else {",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)",
+                "for indexedRoute in indexedTools.routes(forCanonicalName: toolName)",
+                "let toolDef = indexedRoute.tool",
+                "runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)",
                 "let publicWindowIDInjectionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection)",
                 "let routingWindowID: Int? = {",
                 "let selectedSchemaDeclaresWindowID =",
@@ -638,17 +635,16 @@
                 searchStart = match.upperBound
             }
 
-            XCTAssertEqual(manager.components(separatedBy: "let serviceTools = await service.tools").count - 1, 1)
-            XCTAssertEqual(manager.components(separatedBy: "guard let toolDef = serviceTools.first(where: { $0.name == toolName })").count - 1, 1)
+            XCTAssertEqual(manager.components(separatedBy: "let serviceTools = await service.tools").count - 1, 0)
+            XCTAssertEqual(manager.components(separatedBy: "guard let toolDef = serviceTools.first(where: { $0.name == toolName })").count - 1, 0)
             XCTAssertEqual(lookup.components(separatedBy: "self.schemaDeclaresWindowID(schema: toolDef.inputSchema)").count - 1, 1)
             XCTAssertEqual(lookup.components(separatedBy: "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID").count - 1, 2)
             XCTAssertEqual(lookup.components(separatedBy: "args: capturedArguments").count - 1, 1)
             XCTAssertEqual(lookup.components(separatedBy: "args: capturedArgsForFormatter").count - 1, 1)
+            XCTAssertEqual(manager.components(separatedBy: "try await ensureIndexedRouteStillInvocable()").count - 1, 2)
             XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 2)
-            XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupServiceToolsAwait").count - 1, 2)
-            XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupToolDefinitionScan").count - 1, 3)
             XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupPublicWindowIDInjection").count - 1, 2)
-            XCTAssertGreaterThanOrEqual(lookup.components(separatedBy: "#if DEBUG || EDIT_FLOW_PERF").count - 1, 7)
+            XCTAssertGreaterThanOrEqual(lookup.components(separatedBy: "#if DEBUG || EDIT_FLOW_PERF").count - 1, 1)
             XCTAssertFalse(manager.contains("service.call("))
 
             let injectionHelperBegin = try XCTUnwrap(manager.range(of: "    private nonisolated func injectWindowIDIfNeeded("))
@@ -744,8 +740,8 @@
             XCTAssertTrue(viewModel.contains("#else\n                Task { await updateToolRegistration() }"))
             XCTAssertEqual(viewModel.components(separatedBy: "await updateToolRegistration()").count - 1, 2)
             XCTAssertTrue(viewModel.contains("private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {"))
-            XCTAssertTrue(viewModel.contains("let invalidateCatalogBeforeUpdate = !windowToolsEnabled\n            || !ServiceRegistry.services.contains { service in\n                (service as AnyObject) === (windowToolCatalogService as AnyObject)\n            }"))
-            XCTAssertEqual(viewModel.components(separatedBy: "await updateToolRegistration(invalidateCatalogBeforeUpdate:").count - 1, 1)
+            XCTAssertTrue(viewModel.contains("let invalidateCatalogBeforeUpdate = !windowToolsEnabled\n            || !serviceRegistry.contains(windowToolCatalogService)"))
+            XCTAssertEqual(viewModel.components(separatedBy: "await updateToolRegistration(invalidateCatalogBeforeUpdate:").count - 1, 2)
             XCTAssertTrue(viewModel.contains("await updateToolRegistration(invalidateCatalogBeforeUpdate: invalidateCatalogBeforeUpdate)\n        #if DEBUG || EDIT_FLOW_PERF\n            EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap"))
 
             let bootstrapStart = try XCTUnwrap(viewModel.range(of: "func ensureServerReadyForAgentBootstrap() async {"))
@@ -761,11 +757,11 @@
             let helperStart = try XCTUnwrap(viewModel.range(of: "private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {"))
             let policy = try XCTUnwrap(viewModel.range(of: "if invalidateCatalogBeforeUpdate {", range: helperStart.upperBound ..< viewModel.endIndex))
             let invalidate = try XCTUnwrap(viewModel.range(of: "invalidateToolsCache()", range: policy.upperBound ..< viewModel.endIndex))
-            let enabled = try XCTUnwrap(viewModel.range(of: "if windowToolsEnabled {", range: invalidate.upperBound ..< viewModel.endIndex))
-            let register = try XCTUnwrap(viewModel.range(of: "ServiceRegistry.register(windowToolCatalogService)", range: enabled.upperBound ..< viewModel.endIndex))
+            let enabled = try XCTUnwrap(viewModel.range(of: "if windowToolsEnabled, runtimeSessionRegistry.hasActiveWindow(id: windowID) {", range: invalidate.upperBound ..< viewModel.endIndex))
+            let register = try XCTUnwrap(viewModel.range(of: "serviceRegistry.register(windowToolCatalogService)", range: enabled.upperBound ..< viewModel.endIndex))
             let join = try XCTUnwrap(viewModel.range(of: "try await service.join(windowID: windowID)", range: register.upperBound ..< viewModel.endIndex))
             let enabledRefresh = try XCTUnwrap(viewModel.range(of: "await service.refreshState()", range: join.upperBound ..< viewModel.endIndex))
-            let unregister = try XCTUnwrap(viewModel.range(of: "ServiceRegistry.unregister(windowToolCatalogService)", range: enabledRefresh.upperBound ..< viewModel.endIndex))
+            let unregister = try XCTUnwrap(viewModel.range(of: "serviceRegistry.unregister(windowToolCatalogService)", range: enabledRefresh.upperBound ..< viewModel.endIndex))
             let leave = try XCTUnwrap(viewModel.range(of: "await service.leave(windowID: windowID)", range: unregister.upperBound ..< viewModel.endIndex))
             let disabledRefresh = try XCTUnwrap(viewModel.range(of: "await service.refreshState()", range: leave.upperBound ..< viewModel.endIndex))
             XCTAssertLessThan(policy.lowerBound, invalidate.lowerBound)
@@ -780,15 +776,16 @@
             XCTAssertEqual(readiness.components(separatedBy: "MCPWindowToolCatalog.readinessWarmAccess").count - 1, 2)
             XCTAssertTrue(readiness.contains("_ = await mcpServer.windowMCPTools"))
 
-            let dedupe = try XCTUnwrap(registry.range(of: "if _services.contains(where:"))
-            let append = try XCTUnwrap(registry.range(of: "_services.append(service)", range: dedupe.upperBound ..< registry.endIndex))
-            let publication = try XCTUnwrap(registry.range(of: "MCPWindowToolCatalog.serviceRegistryToolsPublication", range: append.upperBound ..< registry.endIndex))
-            let broadcast = try XCTUnwrap(registry.range(of: "await ServerNetworkManager.shared.broadcastToolListChanged()", range: publication.upperBound ..< registry.endIndex))
+            let dedupe = try XCTUnwrap(registry.range(of: "guard !contains(service) else { return }"))
+            let append = try XCTUnwrap(registry.range(of: "registeredServices.append(service)", range: dedupe.upperBound ..< registry.endIndex))
+            let invalidation = try XCTUnwrap(registry.range(of: "invalidateSnapshot()", range: append.upperBound ..< registry.endIndex))
+            let publication = try XCTUnwrap(registry.range(of: "MCPWindowToolCatalog.serviceRegistryToolsPublication", range: invalidation.upperBound ..< registry.endIndex))
             XCTAssertLessThan(dedupe.lowerBound, append.lowerBound)
-            XCTAssertLessThan(append.lowerBound, publication.lowerBound)
-            XCTAssertLessThan(publication.lowerBound, broadcast.lowerBound)
+            XCTAssertLessThan(append.lowerBound, invalidation.lowerBound)
+            XCTAssertLessThan(invalidation.lowerBound, publication.lowerBound)
             XCTAssertEqual(registry.components(separatedBy: "MCPWindowToolCatalog.serviceRegistryToolsPublication").count - 1, 1)
-            XCTAssertTrue(registry.contains("#else\n                await ToolAvailabilityStore.shared.registerTools(service.tools)"))
+            XCTAssertTrue(registry.contains("guard generation == requestedGeneration else { continue }"))
+            XCTAssertTrue(registry.contains("routesByCanonicalName[canonicalName, default: []].append(route)"))
 
             let enable = try XCTUnwrap(codexRunner.range(of: "await mcpServerEnabler()"))
             let send = try XCTUnwrap(codexRunner.range(of: "let outcome = await codexCoordinator.sendCodexNativeMessage(", range: enable.upperBound ..< codexRunner.endIndex))

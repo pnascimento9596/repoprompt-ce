@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 // MARK: - MCP Debug Logging
 
@@ -68,7 +69,7 @@ enum MCPFilesystemConstants {
     /// UNIX domain socket transport.
     /// Current CE bootstrap socket is placed in a per-user /tmp directory.
     /// sun_path limit is 104 bytes - typical path is ~40 bytes, well under limit.
-    static let socketDirName = "repoprompt-ce-mcp"
+    static let socketDirName = MCPBootstrapEndpoint.socketDirectoryName
 
     /// Returns the primary socket directory URL in /tmp.
     /// Uses /tmp/repoprompt-ce-mcp-{uid}/ which:
@@ -76,8 +77,7 @@ enum MCPFilesystemConstants {
     /// - Per-user suffix prevents conflicts between users
     /// - Is a well-known, stable path (not containerized per-app)
     static func socketDirectoryURL() -> URL {
-        let uid = getuid()
-        return URL(fileURLWithPath: "/tmp/\(socketDirName)-\(uid)", isDirectory: true)
+        MCPBootstrapEndpoint.socketDirectoryURL(uid: getuid())
     }
 
     /// Creates the socket directory with secure permissions (0700)
@@ -114,17 +114,17 @@ enum MCPFilesystemConstants {
     /// - `repoprompt-ce-{version}.sock`
     ///
     /// Keep path short due to sun_path 104-byte limit.
-    static let socketVersion = 6
+    static let socketVersion = MCPBootstrapEndpoint.socketVersion
 
     static var bootstrapSocketName: String {
-        "repoprompt-ce-\(socketVersion).sock"
+        MCPBootstrapEndpoint.bootstrapSocketName
     }
 
     /// Returns the bootstrap socket URL.
     /// This is a single well-known socket that the app listens on.
     /// CLI connects to this socket to initiate MCP sessions.
     static func bootstrapSocketURL() -> URL {
-        socketDirectoryURL().appendingPathComponent(bootstrapSocketName, isDirectory: false)
+        MCPBootstrapEndpoint.bootstrapSocketURL(uid: getuid())
     }
 
     // MARK: - External Client Events Directory
