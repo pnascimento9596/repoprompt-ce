@@ -27,7 +27,7 @@ final class HeadlessRootAccessPolicy: WorkspaceAccessPolicy {
             throw HeadlessCommandError("Refusing to add '/' as a headless allowed root.", exitCode: 2)
         }
 
-        let rootName = normalizedName(name) ?? fallbackName(for: displayURL)
+        let rootName = try normalizedName(name) ?? fallbackName(for: displayURL)
         return HeadlessAllowedRoot(
             id: UUID(),
             name: rootName,
@@ -64,7 +64,7 @@ final class HeadlessRootAccessPolicy: WorkspaceAccessPolicy {
         return root.path == tokenURL.path || root.resolvedPath == resolvedToken
     }
 
-    private nonisolated static func resolvedExistingDirectoryURL(for url: URL, fileManager: FileManager) throws -> URL {
+    nonisolated static func resolvedExistingDirectoryURL(for url: URL, fileManager: FileManager) throws -> URL {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             throw HeadlessCommandError("Directory does not exist: \(url.path)", exitCode: 2)
@@ -75,11 +75,11 @@ final class HeadlessRootAccessPolicy: WorkspaceAccessPolicy {
         return url.resolvingSymlinksInPath().standardizedFileURL
     }
 
-    private nonisolated static func resolvedPath(for url: URL) -> String {
+    nonisolated static func resolvedPath(for url: URL) -> String {
         url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
-    private nonisolated static func path(_ candidate: String, isContainedInOrEqualTo root: String) -> Bool {
+    nonisolated static func path(_ candidate: String, isContainedInOrEqualTo root: String) -> Bool {
         let candidateComponents = URL(fileURLWithPath: candidate).standardizedFileURL.pathComponents
         let rootComponents = URL(fileURLWithPath: root).standardizedFileURL.pathComponents
         guard candidateComponents.count >= rootComponents.count else {
@@ -88,12 +88,24 @@ final class HeadlessRootAccessPolicy: WorkspaceAccessPolicy {
         return zip(candidateComponents, rootComponents).allSatisfy(==)
     }
 
-    private nonisolated static func normalizedName(_ name: String?) -> String? {
+    private nonisolated static func normalizedName(_ name: String?) throws -> String? {
         guard let name else {
             return nil
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        guard trimmed != ".", trimmed != ".." else {
+            throw HeadlessCommandError("Allowed root name must not be '.' or '..'.", exitCode: 2)
+        }
+        guard !trimmed.contains("/"), !trimmed.contains("\\") else {
+            throw HeadlessCommandError("Allowed root name must not contain path separators: \(trimmed)", exitCode: 2)
+        }
+        guard trimmed.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 }) else {
+            throw HeadlessCommandError("Allowed root name must not contain control characters.", exitCode: 2)
+        }
+        return trimmed
     }
 
     private nonisolated static func fallbackName(for url: URL) -> String {

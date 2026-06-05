@@ -50,7 +50,7 @@ final class HeadlessCLI {
 
     private func serve(store: HeadlessConfigurationStore) async throws {
         _ = try store.loadOrCreate()
-        HeadlessOutput.stderr("\(HeadlessVersion.displayName) \(HeadlessVersion.versionString) serving direct stdio MCP. No MCP tools are enabled in Slice 5A.")
+        HeadlessOutput.stderr("\(HeadlessVersion.displayName) \(HeadlessVersion.versionString) serving direct stdio MCP with the read-oriented safe tool profile.")
         let server = HeadlessMCPServer(configurationStore: store)
         let transport = HeadlessStdioTransport(server: server, writer: HeadlessStdoutWriter())
         try await transport.run()
@@ -274,7 +274,7 @@ final class HeadlessCLI {
     Usage: repoprompt-headless [--state-dir PATH] [command]
 
     Commands:
-      serve                         Serve direct stdio JSON-RPC MCP (default; no tools enabled in Slice 5A)
+      serve                         Serve direct stdio JSON-RPC MCP (default; safe read-oriented tools)
       doctor                        Validate state paths, config, fail-closed roots, and defaults
       config roots list             List configured allowed roots
       config roots add PATH [--name NAME]

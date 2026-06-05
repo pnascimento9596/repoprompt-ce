@@ -2,15 +2,19 @@ import Foundation
 
 final class HeadlessMCPServer {
     private let configurationStore: HeadlessConfigurationStore
+    private let host: HeadlessHost
+    private let registry: HeadlessToolRegistry
 
     init(configurationStore: HeadlessConfigurationStore) {
         self.configurationStore = configurationStore
+        host = HeadlessHost(configurationStore: configurationStore)
+        registry = HeadlessToolRegistry(host: host)
     }
 
-    func handle(frame: Data) -> HeadlessRPCAction {
+    func handle(frame: Data) async -> HeadlessRPCAction {
         do {
             let object = try HeadlessJSONRPC.requestObject(from: frame)
-            return handle(object: object)
+            return await handle(object: object)
         } catch let error as HeadlessJSONRPCError {
             return HeadlessRPCAction(
                 responseData: HeadlessJSONRPC.errorResponse(id: NSNull(), code: -32600, message: error.localizedDescription),
@@ -24,7 +28,7 @@ final class HeadlessMCPServer {
         }
     }
 
-    private func handle(object: [String: Any]) -> HeadlessRPCAction {
+    private func handle(object: [String: Any]) async -> HeadlessRPCAction {
         let hasID = object.keys.contains("id")
         let id = object["id"] ?? NSNull()
         guard object["jsonrpc"] as? String == "2.0" else {
@@ -42,7 +46,28 @@ final class HeadlessMCPServer {
         case "ping":
             return requestResult(hasID: hasID, id: id, result: [:])
         case "tools/list":
-            return requestResult(hasID: hasID, id: id, result: ["tools": []])
+            return requestResult(hasID: hasID, id: id, result: ["tools": registry.listDescriptors()])
+        case "tools/call":
+            guard let params = object["params"] as? [String: Any] else {
+                return requestError(hasID: hasID, id: id, code: -32602, message: "tools/call requires params.")
+            }
+            guard let name = params["name"] as? String, !name.isEmpty else {
+                return requestError(hasID: hasID, id: id, code: -32602, message: "tools/call requires params.name.")
+            }
+            let arguments: [String: Any]
+            if let rawArguments = params["arguments"] {
+                if rawArguments is NSNull {
+                    arguments = [:]
+                } else if let objectArguments = rawArguments as? [String: Any] {
+                    arguments = objectArguments
+                } else {
+                    return requestError(hasID: hasID, id: id, code: -32602, message: "tools/call params.arguments must be an object when provided.")
+                }
+            } else {
+                arguments = [:]
+            }
+            let result = await registry.call(name: name, arguments: arguments)
+            return requestResult(hasID: hasID, id: id, result: result)
         case "shutdown":
             return requestResult(hasID: hasID, id: id, result: NSNull(), shouldExit: true)
         case "exit":
@@ -66,11 +91,11 @@ final class HeadlessMCPServer {
                 "name": HeadlessVersion.displayName,
                 "version": HeadlessVersion.marketingVersion
             ],
-            "instructions": "RepoPrompt Headless Slice 5A is running fail-closed over direct stdio. Configure allowed roots with `repoprompt-headless config roots add /absolute/path --name NAME`. MCP tools are intentionally not enabled yet.",
+            "instructions": "RepoPrompt Headless is running the standalone read-oriented safe profile over direct stdio. Configure allowed roots with `repoprompt-headless config roots add /absolute/path --name NAME`. Only bind_context, constrained manage_workspaces, manage_selection, workspace_context, get_file_tree, get_code_structure, read_file, file_search, and prompt are enabled.",
             "headless": [
                 "configuredRootCount": configuredRootCount,
                 "stateDirectory": configurationStore.paths.rootDirectory.path,
-                "safeToolsEnabled": false
+                "safeToolsEnabled": true
             ]
         ]
     }

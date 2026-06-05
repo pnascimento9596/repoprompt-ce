@@ -10,10 +10,33 @@ final class HeadlessConfigurationStore {
     }
 
     func loadOrCreate() throws -> HeadlessConfigurationDocument {
+        try HeadlessFileLock.withExclusiveLock(path: paths.configLockFile) {
+            try loadOrCreateUnlocked()
+        }
+    }
+
+    @discardableResult
+    func update(_ body: (inout HeadlessConfigurationDocument) throws -> Void) throws -> HeadlessConfigurationDocument {
+        try HeadlessFileLock.withExclusiveLock(path: paths.configLockFile) {
+            var document = try loadOrCreateUnlocked()
+            try body(&document)
+            document.touch()
+            try saveUnlocked(document)
+            return document
+        }
+    }
+
+    func save(_ document: HeadlessConfigurationDocument) throws {
+        try HeadlessFileLock.withExclusiveLock(path: paths.configLockFile) {
+            try saveUnlocked(document)
+        }
+    }
+
+    private func loadOrCreateUnlocked() throws -> HeadlessConfigurationDocument {
         try paths.ensureBaseDirectories(fileManager: fileManager)
         guard fileManager.fileExists(atPath: paths.configFile.path) else {
             let document = HeadlessConfigurationDocument()
-            try save(document)
+            try saveUnlocked(document)
             return document
         }
 
@@ -28,16 +51,7 @@ final class HeadlessConfigurationStore {
         return document
     }
 
-    @discardableResult
-    func update(_ body: (inout HeadlessConfigurationDocument) throws -> Void) throws -> HeadlessConfigurationDocument {
-        var document = try loadOrCreate()
-        try body(&document)
-        document.touch()
-        try save(document)
-        return document
-    }
-
-    func save(_ document: HeadlessConfigurationDocument) throws {
+    private func saveUnlocked(_ document: HeadlessConfigurationDocument) throws {
         try paths.ensureBaseDirectories(fileManager: fileManager)
         let data = try HeadlessJSONFormatting.encoder(prettyPrinted: true).encode(document)
         try data.write(to: paths.configFile, options: [.atomic])
