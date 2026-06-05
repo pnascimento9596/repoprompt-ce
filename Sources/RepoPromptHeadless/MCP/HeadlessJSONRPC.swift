@@ -2,7 +2,13 @@ import Foundation
 
 struct HeadlessRPCAction {
     let responseData: Data?
+    /// True only after an `exit` notification is received following shutdown.
     let shouldExit: Bool
+}
+
+enum HeadlessJSONRPCMessageKind {
+    case request(id: Any)
+    case notification
 }
 
 enum HeadlessJSONRPC {
@@ -12,6 +18,13 @@ enum HeadlessJSONRPC {
             throw HeadlessJSONRPCError.invalidRequest("JSON-RPC frame must be an object.")
         }
         return object
+    }
+
+    static func messageKind(for object: [String: Any]) -> HeadlessJSONRPCMessageKind {
+        if object.keys.contains("id") {
+            return .request(id: object["id"] ?? NSNull())
+        }
+        return .notification
     }
 
     static func response(id: Any, result: Any) -> Data {

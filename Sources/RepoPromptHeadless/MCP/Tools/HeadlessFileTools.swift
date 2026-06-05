@@ -11,40 +11,42 @@ enum HeadlessFileTools {
         guard !resolved.isDirectory else {
             throw HeadlessCommandError("read_file requires a file, not a directory: \(resolved.displayPath)", exitCode: 2)
         }
-        let data = try Data(contentsOf: resolved.url)
-        guard data.count <= maxReadableBytes else {
-            throw HeadlessCommandError("File is too large to read in headless v1 (\(data.count) bytes > \(maxReadableBytes)): \(resolved.displayPath)", exitCode: 2)
-        }
+        let data = try HeadlessSecureFileAccess()
+            .readRegularFile(root: resolved.root, relativePath: resolved.relativePath, maximumBytes: maxReadableBytes)
+            .data
         guard !data.contains(0), let text = String(data: data, encoding: .utf8) else {
             throw HeadlessCommandError("File is binary or not valid UTF-8: \(resolved.displayPath)", exitCode: 2)
         }
-        let lines = text.components(separatedBy: .newlines)
-        let totalLines = lines.count
-        let range = lineRange(totalLines: totalLines, startLine: HeadlessToolArguments.int(arguments, key: "start_line"), limit: HeadlessToolArguments.int(arguments, key: "limit"))
-        let selectedLines: [String] = if range.isEmpty {
-            []
-        } else {
-            Array(lines[(range.lowerBound - 1) ..< (range.upperBound - 1)])
-        }
-        let content = selectedLines.joined(separator: "\n")
+        let slice = try HeadlessReadFileSlicer.slice(
+            text: text,
+            startLine: HeadlessToolArguments.int(arguments, key: "start_line"),
+            limit: HeadlessToolArguments.int(arguments, key: "limit")
+        )
         let language = resolved.url.pathExtension.isEmpty ? "text" : resolved.url.pathExtension
         let textOutput = """
         ## File Read ✅
         - **Path**: `\(resolved.displayPath)`
-        - **Lines**: \(rangeDescription(range: range, totalLines: totalLines))
+        - **Lines**: \(rangeDescription(firstLine: slice.firstLine, lastLine: slice.lastLine, totalLines: slice.totalLines))
+        \(slice.message.map { "- **Message**: \($0)" } ?? "")
 
         ```\(language)
-        \(content)
+        \(slice.content)
         ```
         """
-        return HeadlessToolResponse.success(text: textOutput, structured: [
-            "content": content,
-            "total_lines": totalLines,
-            "first_line": range.lowerBound,
-            "last_line": max(0, range.upperBound - 1),
+        var structured: HeadlessJSONObject = [
+            "content": slice.content,
+            "total_lines": slice.totalLines,
+            "first_line": slice.firstLine,
+            "last_line": slice.lastLine,
             "display_path": resolved.displayPath,
-            "path": resolved.url.path
-        ])
+            "path": resolved.resolvedURL.path
+        ]
+        if let message = slice.message {
+            structured["message"] = message
+        } else {
+            structured["message"] = NSNull()
+        }
+        return HeadlessToolResponse.success(text: textOutput, structured: structured)
     }
 
     static func fileSearch(host: HeadlessHost, arguments: HeadlessJSONObject) async throws -> HeadlessJSONObject {
@@ -139,16 +141,25 @@ enum HeadlessFileTools {
             let displayPath = entry.relativePath.isEmpty ? root.name : "\(root.name)/\(entry.relativePath)"
             let resolved = try resolver.resolve(displayPath)
             guard !resolved.isDirectory else { continue }
-            let data = try Data(contentsOf: resolved.url)
-            guard data.count <= maxReadableBytes, !data.contains(0), let text = String(data: data, encoding: .utf8) else {
+            guard let snapshot = try? HeadlessSecureFileAccess().readRegularFile(
+                root: resolved.root,
+                relativePath: resolved.relativePath,
+                maximumBytes: maxReadableBytes
+            ) else {
                 continue
             }
-            if entry.mode == .slices, !entry.ranges.isEmpty {
-                let lines = text.components(separatedBy: .newlines)
-                let chunks = entry.ranges.map { range in
-                    let start = max(1, min(range.startLine, lines.count))
-                    let end = max(start, min(range.endLine, lines.count))
-                    return Array(lines[(start - 1) ..< end]).joined(separator: "\n")
+            let data = snapshot.data
+            guard !data.contains(0), let text = String(data: data, encoding: .utf8) else {
+                continue
+            }
+            if entry.mode == .slices {
+                guard !entry.ranges.isEmpty else { continue }
+                let chunks = try entry.ranges.map { range in
+                    try HeadlessReadFileSlicer.slice(
+                        text: text,
+                        startLine: range.startLine,
+                        limit: range.endLine - range.startLine + 1
+                    ).content
                 }
                 output.append((displayPath, chunks.joined(separator: "\n…\n")))
             } else {
@@ -158,24 +169,8 @@ enum HeadlessFileTools {
         return output
     }
 
-    private static func lineRange(totalLines: Int, startLine: Int?, limit: Int?) -> Range<Int> {
-        guard totalLines > 0 else { return 1 ..< 1 }
-        let start: Int = if let startLine, startLine < 0 {
-            max(1, totalLines + startLine + 1)
-        } else {
-            max(1, startLine ?? 1)
-        }
-        let boundedStart = min(start, totalLines)
-        let endInclusive: Int = if let limit, limit > 0 {
-            min(totalLines, boundedStart + limit - 1)
-        } else {
-            totalLines
-        }
-        return boundedStart ..< (endInclusive + 1)
-    }
-
-    private static func rangeDescription(range: Range<Int>, totalLines: Int) -> String {
-        guard !range.isEmpty else { return "0 of \(totalLines)" }
-        return "\(range.lowerBound)–\(range.upperBound - 1) of \(totalLines)"
+    private static func rangeDescription(firstLine: Int, lastLine: Int, totalLines: Int) -> String {
+        guard firstLine > 0, lastLine >= firstLine else { return "0 of \(totalLines)" }
+        return "\(firstLine)–\(lastLine) of \(totalLines)"
     }
 }

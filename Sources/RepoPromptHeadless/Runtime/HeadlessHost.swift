@@ -109,7 +109,17 @@ actor HeadlessHost {
 
     func replaceSelection(_ selection: [HeadlessSelectionEntry]) throws -> HeadlessWorkspaceDocument {
         try updateActiveWorkspace { workspace in
-            workspace.selection = Self.normalizedSelection(selection)
+            workspace.selection = HeadlessSelectionNormalizer.normalized(selection)
+        }
+    }
+
+    func updateSelection(
+        workspaceID: UUID,
+        _ body: (inout [HeadlessSelectionEntry]) throws -> Void
+    ) throws -> HeadlessWorkspaceDocument {
+        try workspaceStore.update(id: workspaceID) { workspace in
+            try body(&workspace.selection)
+            workspace.selection = HeadlessSelectionNormalizer.normalized(workspace.selection)
         }
     }
 
@@ -224,22 +234,5 @@ actor HeadlessHost {
             return workspace
         }
         throw HeadlessCommandError("No headless workspace matches '\(token)'.", exitCode: 2)
-    }
-
-    private static func normalizedSelection(_ selection: [HeadlessSelectionEntry]) -> [HeadlessSelectionEntry] {
-        var result: [HeadlessSelectionEntry] = []
-        for entry in selection {
-            if let index = result.firstIndex(where: { $0.rootID == entry.rootID && $0.relativePath == entry.relativePath }) {
-                result[index] = entry
-            } else {
-                result.append(entry)
-            }
-        }
-        return result.sorted { lhs, rhs in
-            if lhs.rootID == rhs.rootID {
-                return lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
-            }
-            return lhs.rootID.uuidString < rhs.rootID.uuidString
-        }
     }
 }

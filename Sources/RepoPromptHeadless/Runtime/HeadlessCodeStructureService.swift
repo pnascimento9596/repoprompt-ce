@@ -7,9 +7,14 @@ struct HeadlessCodeStructureResult {
 
 final class HeadlessCodeStructureService {
     private let maxReadableBytes = 2 * 1024 * 1024
+    private let secureFileAccess: HeadlessSecureFileAccess
     private let supportedExtensions: Set<String> = [
         "swift", "py", "js", "jsx", "ts", "tsx", "go", "rs", "rb", "java", "c", "h", "cc", "cpp", "hpp", "cs", "php", "m", "mm"
     ]
+
+    init(secureFileAccess: HeadlessSecureFileAccess = HeadlessSecureFileAccess()) {
+        self.secureFileAccess = secureFileAccess
+    }
 
     func structure(paths: [HeadlessResolvedPath], maxResults: Int) throws -> HeadlessCodeStructureResult {
         var fileBlocks: [[String: Any]] = []
@@ -27,12 +32,17 @@ final class HeadlessCodeStructureService {
                 skipped.append("\(path.displayPath) (unsupported type)")
                 continue
             }
-            let values = try path.url.resourceValues(forKeys: [.fileSizeKey])
-            guard (values.fileSize ?? 0) <= maxReadableBytes else {
-                skipped.append("\(path.displayPath) (oversized)")
+            let data: Data
+            do {
+                data = try secureFileAccess.readRegularFile(
+                    root: path.root,
+                    relativePath: path.relativePath,
+                    maximumBytes: maxReadableBytes
+                ).data
+            } catch {
+                skipped.append("\(path.displayPath) (unreadable or oversized)")
                 continue
             }
-            let data = try Data(contentsOf: path.url)
             guard !data.contains(0), let text = String(data: data, encoding: .utf8) else {
                 skipped.append("\(path.displayPath) (binary or non-UTF-8)")
                 continue

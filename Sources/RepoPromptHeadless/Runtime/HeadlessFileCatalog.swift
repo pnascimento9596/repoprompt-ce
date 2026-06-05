@@ -1,34 +1,56 @@
 import Foundation
 
+struct HeadlessCatalogScanResult {
+    var entries: [HeadlessCatalogEntry]
+    var entryLimit: Int
+    var wasTruncated: Bool
+    var skippedEntryCount: Int
+}
+
 final class HeadlessFileCatalog {
     private let fileManager: FileManager
+    private let secureFileAccess: HeadlessSecureFileAccess
     private let skippedDirectoryNames: Set<String> = [".git", ".svn", ".hg", ".build", "node_modules", ".DS_Store"]
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        secureFileAccess: HeadlessSecureFileAccess = HeadlessSecureFileAccess()
+    ) {
         self.fileManager = fileManager
+        self.secureFileAccess = secureFileAccess
     }
 
-    func scan(roots: [HeadlessAllowedRoot], under basePath: HeadlessResolvedPath? = nil, maxEntries: Int = 20000) throws -> [HeadlessCatalogEntry] {
-        let scanRoots: [(root: HeadlessAllowedRoot, url: URL)]
-        if let basePath {
-            guard basePath.isDirectory else {
-                return try [catalogEntry(for: basePath.root, url: basePath.url)]
-            }
-            scanRoots = [(basePath.root, basePath.url)]
+    func scan(roots: [HeadlessAllowedRoot], under basePath: HeadlessResolvedPath? = nil, maxEntries: Int = 20000) throws -> HeadlessCatalogScanResult {
+        let entryLimit = max(0, maxEntries)
+        let scanRoots: [(root: HeadlessAllowedRoot, url: URL)] = if let basePath {
+            [(basePath.root, basePath.url)]
         } else {
-            scanRoots = roots.map { ($0, URL(fileURLWithPath: $0.path, isDirectory: true).standardizedFileURL) }
+            roots.map { ($0, URL(fileURLWithPath: $0.path, isDirectory: true).standardizedFileURL) }
         }
 
         var entries: [HeadlessCatalogEntry] = []
-        for item in scanRoots {
+        var wasTruncated = false
+        var skippedEntryCount = 0
+        rootLoop: for item in scanRoots {
             let rootEntry = try catalogEntry(for: item.root, url: item.url)
+            guard entries.count < entryLimit else {
+                wasTruncated = true
+                break
+            }
             entries.append(rootEntry)
-            guard entries.count < maxEntries else { break }
+            if let basePath, !basePath.isDirectory {
+                continue
+            }
             guard let enumerator = fileManager.enumerator(
                 at: item.url,
                 includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+                options: [.skipsHiddenFiles, .skipsPackageDescendants],
+                errorHandler: { _, _ in
+                    skippedEntryCount += 1
+                    return true
+                }
             ) else {
+                skippedEntryCount += 1
                 continue
             }
             for case let url as URL in enumerator {
@@ -36,24 +58,35 @@ final class HeadlessFileCatalog {
                     enumerator.skipDescendants()
                     continue
                 }
-                guard entries.count < maxEntries else {
-                    enumerator.skipDescendants()
-                    break
+                let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
+                if values?.isSymbolicLink == true {
+                    if values?.isDirectory == true {
+                        enumerator.skipDescendants()
+                    }
+                    continue
+                }
+                if values?.isDirectory == false, values?.isRegularFile == false {
+                    continue
                 }
                 do {
                     let entry = try catalogEntry(for: item.root, url: url)
                     if entry.isDirectory || entry.byteCount != nil {
+                        guard entries.count < entryLimit else {
+                            wasTruncated = true
+                            break rootLoop
+                        }
                         entries.append(entry)
                     }
                 } catch {
-                    if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                    skippedEntryCount += 1
+                    if values?.isDirectory == true {
                         enumerator.skipDescendants()
                     }
                     continue
                 }
             }
         }
-        return entries.sorted { lhs, rhs in
+        let sortedEntries = entries.sorted { lhs, rhs in
             if lhs.root.id == rhs.root.id {
                 if lhs.relativePath.isEmpty { return true }
                 if rhs.relativePath.isEmpty { return false }
@@ -61,16 +94,29 @@ final class HeadlessFileCatalog {
             }
             return lhs.root.name.localizedStandardCompare(rhs.root.name) == .orderedAscending
         }
+        return HeadlessCatalogScanResult(
+            entries: sortedEntries,
+            entryLimit: entryLimit,
+            wasTruncated: wasTruncated,
+            skippedEntryCount: skippedEntryCount
+        )
     }
 
     func catalogEntry(for root: HeadlessAllowedRoot, url: URL) throws -> HeadlessCatalogEntry {
         let standardized = url.standardizedFileURL
-        let resolvedURL = standardized.resolvingSymlinksInPath().standardizedFileURL
-        guard HeadlessRootAccessPolicy.path(resolvedURL.path, isContainedInOrEqualTo: root.resolvedPath) else {
-            throw HeadlessCommandError("Path resolves outside allowed root '\(root.name)': \(url.path)", exitCode: 2)
+        let lexicalRootPath: String
+        if HeadlessRootAccessPolicy.path(standardized.path, isContainedInOrEqualTo: root.path) {
+            lexicalRootPath = root.path
+        } else if HeadlessRootAccessPolicy.path(standardized.path, isContainedInOrEqualTo: root.resolvedPath) {
+            lexicalRootPath = root.resolvedPath
+        } else {
+            throw HeadlessCommandError("Path is outside allowed root '\(root.name)': \(url.path)", exitCode: 2)
         }
-        let values = try standardized.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
-        let relativePath = HeadlessPathResolver.relativePath(forResolvedPath: resolvedURL.path, rootResolvedPath: root.resolvedPath)
+        let relativePath = HeadlessPathResolver.relativePath(forResolvedPath: standardized.path, rootResolvedPath: lexicalRootPath)
+        let metadata = try secureFileAccess.inspect(root: root, relativePath: relativePath)
+        let resolvedURL = relativePath.isEmpty
+            ? URL(fileURLWithPath: root.resolvedPath, isDirectory: true)
+            : URL(fileURLWithPath: root.resolvedPath, isDirectory: true).appendingPathComponent(relativePath)
         let displayPath = relativePath.isEmpty ? root.name : "\(root.name)/\(relativePath)"
         return HeadlessCatalogEntry(
             root: root,
@@ -78,8 +124,8 @@ final class HeadlessFileCatalog {
             resolvedURL: resolvedURL,
             relativePath: relativePath,
             displayPath: displayPath,
-            isDirectory: values.isDirectory ?? false,
-            byteCount: (values.isRegularFile ?? false) ? Int64(values.fileSize ?? 0) : nil
+            isDirectory: metadata.kind == .directory,
+            byteCount: metadata.kind == .regularFile ? metadata.byteCount : nil
         )
     }
 
@@ -87,8 +133,14 @@ final class HeadlessFileCatalog {
         guard path.isDirectory else {
             return [path]
         }
-        let entries = try scan(roots: [path.root], under: path, maxEntries: maxFiles + 1)
-        return entries
+        let scanResult = try scan(roots: [path.root], under: path, maxEntries: maxFiles + 1)
+        guard !scanResult.wasTruncated else {
+            throw HeadlessCommandError(
+                "Directory expansion exceeded the headless limit of \(maxFiles) files or entries at \(path.displayPath). Narrow the path and retry.",
+                exitCode: 2
+            )
+        }
+        return scanResult.entries
             .filter { !$0.isDirectory && !$0.relativePath.isEmpty }
             .prefix(maxFiles)
             .map { entry in

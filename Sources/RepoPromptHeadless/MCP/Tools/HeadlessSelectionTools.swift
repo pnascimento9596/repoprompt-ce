@@ -14,21 +14,23 @@ enum HeadlessSelectionTools {
         case "get":
             return try selectionResponse(selection: current, roots: snapshot.roots, title: "## Selection ✅", note: nil)
         case "clear":
-            let updated = try await host.replaceSelection([])
+            let updated = try await host.updateSelection(workspaceID: workspace.id) { selection in
+                selection = []
+            }
             return try selectionResponse(selection: updated.selection, roots: snapshot.roots, title: "## Selection Cleared ✅", note: nil)
         case "preview":
-            let preview = try applySelectionMutation(arguments: arguments, current: current, roots: snapshot.roots, resolver: resolver, persist: false)
+            let preview = try applySelectionMutation(arguments: arguments, current: current, resolver: resolver)
             return try selectionResponse(selection: preview, roots: snapshot.roots, title: "## Selection Preview ✅", note: "Preview only; active workspace selection was not changed.")
         case "add", "set":
-            let base = op == "set" ? [] : current
-            let next = try applySelectionMutation(arguments: arguments, current: base, roots: snapshot.roots, resolver: resolver, persist: true)
-            let updated = try await host.replaceSelection(next)
+            let updated = try await host.updateSelection(workspaceID: workspace.id) { selection in
+                let base = op == "set" ? [] : selection
+                selection = try applySelectionMutation(arguments: arguments, current: base, resolver: resolver)
+            }
             return try selectionResponse(selection: updated.selection, roots: snapshot.roots, title: "## Selection Updated ✅", note: nil)
         case "remove":
-            let removals = try entries(from: arguments, roots: snapshot.roots, resolver: resolver, defaultMode: .full)
-            let removalKeys = Set(removals.map { "\($0.rootID.uuidString):\($0.relativePath)" })
-            let next = current.filter { !removalKeys.contains("\($0.rootID.uuidString):\($0.relativePath)") }
-            let updated = try await host.replaceSelection(next)
+            let updated = try await host.updateSelection(workspaceID: workspace.id) { selection in
+                selection = try applyingRemovals(arguments: arguments, current: selection, resolver: resolver)
+            }
             return try selectionResponse(selection: updated.selection, roots: snapshot.roots, title: "## Selection Updated ✅", note: nil)
         case "promote", "demote":
             throw HeadlessCommandError("manage_selection op '\(op)' is not supported in headless v1; use add/set with mode full or codemap_only.", exitCode: 2)
@@ -37,9 +39,9 @@ enum HeadlessSelectionTools {
         }
     }
 
-    private static func applySelectionMutation(arguments: HeadlessJSONObject, current: [HeadlessSelectionEntry], roots: [HeadlessAllowedRoot], resolver: HeadlessPathResolver, persist: Bool) throws -> [HeadlessSelectionEntry] {
+    private static func applySelectionMutation(arguments: HeadlessJSONObject, current: [HeadlessSelectionEntry], resolver: HeadlessPathResolver) throws -> [HeadlessSelectionEntry] {
         let mode = try parseMode(HeadlessToolArguments.string(arguments, key: "mode") ?? "full")
-        let additions = try entries(from: arguments, roots: roots, resolver: resolver, defaultMode: mode)
+        let additions = try entries(from: arguments, resolver: resolver, defaultMode: mode)
         guard !additions.isEmpty || !(HeadlessToolArguments.stringArray(arguments, key: "paths") ?? []).isEmpty || HeadlessToolArguments.string(arguments, key: "path") != nil || HeadlessToolArguments.objectArray(arguments, key: "slices") != nil else {
             return current
         }
@@ -51,13 +53,16 @@ enum HeadlessSelectionTools {
                 result.append(addition)
             }
         }
-        return normalized(result)
+        return HeadlessSelectionNormalizer.normalized(result)
     }
 
-    private static func entries(from arguments: HeadlessJSONObject, roots: [HeadlessAllowedRoot], resolver: HeadlessPathResolver, defaultMode: HeadlessSelectionMode) throws -> [HeadlessSelectionEntry] {
+    private static func entries(from arguments: HeadlessJSONObject, resolver: HeadlessPathResolver, defaultMode: HeadlessSelectionMode) throws -> [HeadlessSelectionEntry] {
         var entries: [HeadlessSelectionEntry] = []
         let catalog = HeadlessFileCatalog()
         let paths = (HeadlessToolArguments.stringArray(arguments, key: "paths") ?? []) + (HeadlessToolArguments.string(arguments, key: "path").map { [$0] } ?? [])
+        if defaultMode == .slices, !paths.isEmpty {
+            throw HeadlessCommandError("Selection mode slices requires slice objects with non-empty ranges; path/paths cannot create an empty slice selection.", exitCode: 2)
+        }
         for path in paths {
             let resolved = try resolver.resolve(path)
             let files = try catalog.filesUnder(resolved)
@@ -66,7 +71,7 @@ enum HeadlessSelectionTools {
             }
         }
 
-        for slice in HeadlessToolArguments.objectArray(arguments, key: "slices") ?? [] {
+        for slice in try sliceObjects(from: arguments) {
             let path = try HeadlessToolArguments.requiredString(slice, key: "path")
             let resolved = try resolver.resolve(path)
             guard !resolved.isDirectory else {
@@ -75,7 +80,68 @@ enum HeadlessSelectionTools {
             let ranges = try parseRanges(slice)
             entries.append(HeadlessSelectionEntry(rootID: resolved.root.id, relativePath: resolved.relativePath, mode: .slices, ranges: ranges))
         }
-        return normalized(entries)
+        return HeadlessSelectionNormalizer.normalized(entries)
+    }
+
+    private static func applyingRemovals(
+        arguments: HeadlessJSONObject,
+        current: [HeadlessSelectionEntry],
+        resolver: HeadlessPathResolver
+    ) throws -> [HeadlessSelectionEntry] {
+        let catalog = HeadlessFileCatalog()
+        let paths = (HeadlessToolArguments.stringArray(arguments, key: "paths") ?? [])
+            + (HeadlessToolArguments.string(arguments, key: "path").map { [$0] } ?? [])
+        if HeadlessToolArguments.string(arguments, key: "mode") == HeadlessSelectionMode.slices.rawValue,
+           !paths.isEmpty
+        {
+            throw HeadlessCommandError("Selection mode slices requires slice objects with non-empty ranges; path/paths cannot create an empty slice selection.", exitCode: 2)
+        }
+        var wholeFileKeys: Set<String> = []
+        for path in paths {
+            let resolved = try resolver.resolve(path)
+            for file in try catalog.filesUnder(resolved) {
+                wholeFileKeys.insert(selectionKey(rootID: file.root.id, relativePath: file.relativePath))
+            }
+        }
+
+        var sliceRemovals: [String: [HeadlessLineRange]] = [:]
+        for slice in try sliceObjects(from: arguments) {
+            let path = try HeadlessToolArguments.requiredString(slice, key: "path")
+            let resolved = try resolver.resolve(path)
+            guard !resolved.isDirectory else {
+                throw HeadlessCommandError("Slice removal requires a file path, not a directory: \(resolved.displayPath)", exitCode: 2)
+            }
+            let key = selectionKey(rootID: resolved.root.id, relativePath: resolved.relativePath)
+            try sliceRemovals[key, default: []].append(contentsOf: parseRanges(slice))
+        }
+
+        var result = HeadlessSelectionNormalizer.normalized(current)
+            .filter { !wholeFileKeys.contains(selectionKey(for: $0)) }
+        for (key, removals) in sliceRemovals where !wholeFileKeys.contains(key) {
+            guard let index = result.firstIndex(where: { selectionKey(for: $0) == key }),
+                  result[index].mode == .slices
+            else {
+                continue
+            }
+            result[index].ranges = HeadlessSelectionNormalizer.subtracting(removals, from: result[index].ranges)
+            if result[index].ranges.isEmpty {
+                result.remove(at: index)
+            }
+        }
+        return HeadlessSelectionNormalizer.normalized(result)
+    }
+
+    private static func sliceObjects(from arguments: HeadlessJSONObject) throws -> [HeadlessJSONObject] {
+        guard let rawValue = arguments["slices"], !(rawValue is NSNull) else {
+            return []
+        }
+        guard let slices = HeadlessToolArguments.objectArray(arguments, key: "slices") else {
+            throw HeadlessCommandError("Selection slices must be an array of slice objects.", exitCode: 2)
+        }
+        guard !slices.isEmpty else {
+            throw HeadlessCommandError("Selection slices must not be empty.", exitCode: 2)
+        }
+        return slices
     }
 
     private static func parseMode(_ value: String) throws -> HeadlessSelectionMode {
@@ -114,11 +180,19 @@ enum HeadlessSelectionTools {
             throw HeadlessCommandError("Slice lines spec is empty.", exitCode: 2)
         }
         return try pieces.map { piece in
-            let bounds = piece.split(separator: "-", maxSplits: 1).map(String.init)
+            let bounds = piece.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             guard let start = Int(bounds[0]), start > 0 else {
                 throw HeadlessCommandError("Invalid slice line spec: \(piece)", exitCode: 2)
             }
-            let end = bounds.count == 2 ? (Int(bounds[1]) ?? start) : start
+            let end: Int
+            if bounds.count == 2 {
+                guard let parsedEnd = Int(bounds[1]) else {
+                    throw HeadlessCommandError("Invalid slice line range: \(piece)", exitCode: 2)
+                }
+                end = parsedEnd
+            } else {
+                end = start
+            }
             guard end >= start else {
                 throw HeadlessCommandError("Invalid slice line range: \(piece)", exitCode: 2)
             }
@@ -127,16 +201,17 @@ enum HeadlessSelectionTools {
     }
 
     private static func selectionResponse(selection: [HeadlessSelectionEntry], roots: [HeadlessAllowedRoot], title: String, note: String?) throws -> HeadlessJSONObject {
-        var lines = [title, "- **Files**: \(selection.count)", "- **Auto-codemap**: disabled in headless v1"]
+        let normalizedSelection = HeadlessSelectionNormalizer.normalized(selection)
+        var lines = [title, "- **Files**: \(normalizedSelection.count)", "- **Auto-codemap**: disabled in headless v1"]
         if let note { lines.append("- **Note**: \(note)") }
-        for entry in normalized(selection) {
+        for entry in normalizedSelection {
             lines.append("- `\(displayPath(for: entry, roots: roots))` (\(entry.mode.rawValue)\(rangeSuffix(entry.ranges)))")
         }
         return try HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
-            "files": HeadlessJSONValue.value(normalized(selection)),
+            "files": HeadlessJSONValue.value(normalizedSelection),
             "codemap_auto_enabled": false,
             "total_tokens": 0,
-            "summary": "\(selection.count) selected entr\(selection.count == 1 ? "y" : "ies")"
+            "summary": "\(normalizedSelection.count) selected entr\(normalizedSelection.count == 1 ? "y" : "ies")"
         ])
     }
 
@@ -153,20 +228,11 @@ enum HeadlessSelectionTools {
         return ", lines \(spec)"
     }
 
-    private static func normalized(_ selection: [HeadlessSelectionEntry]) -> [HeadlessSelectionEntry] {
-        var result: [HeadlessSelectionEntry] = []
-        for entry in selection {
-            if let index = result.firstIndex(where: { $0.rootID == entry.rootID && $0.relativePath == entry.relativePath }) {
-                result[index] = entry
-            } else {
-                result.append(entry)
-            }
-        }
-        return result.sorted { lhs, rhs in
-            if lhs.rootID == rhs.rootID {
-                return lhs.relativePath.localizedStandardCompare(rhs.relativePath) == .orderedAscending
-            }
-            return lhs.rootID.uuidString < rhs.rootID.uuidString
-        }
+    private static func selectionKey(for entry: HeadlessSelectionEntry) -> String {
+        selectionKey(rootID: entry.rootID, relativePath: entry.relativePath)
+    }
+
+    private static func selectionKey(rootID: UUID, relativePath: String) -> String {
+        "\(rootID.uuidString):\(relativePath)"
     }
 }

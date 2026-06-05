@@ -21,6 +21,10 @@ struct HeadlessStatePaths: Equatable {
         rootDirectory.appendingPathComponent("config.lock", isDirectory: false)
     }
 
+    func workspaceLockFile(for id: UUID) -> URL {
+        workspacesDirectory.appendingPathComponent("\(id.uuidString).lock", isDirectory: false)
+    }
+
     static func resolve(
         cliOverride: String?,
         environment: [String: String] = ProcessInfo.processInfo.environment,

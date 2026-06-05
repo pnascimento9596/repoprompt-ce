@@ -3,10 +3,16 @@ import Foundation
 struct HeadlessPathResolver {
     let roots: [HeadlessAllowedRoot]
     let fileManager: FileManager
+    let secureFileAccess: HeadlessSecureFileAccess
 
-    init(roots: [HeadlessAllowedRoot], fileManager: FileManager = .default) {
+    init(
+        roots: [HeadlessAllowedRoot],
+        fileManager: FileManager = .default,
+        secureFileAccess: HeadlessSecureFileAccess = HeadlessSecureFileAccess()
+    ) {
         self.roots = roots
         self.fileManager = fileManager
+        self.secureFileAccess = secureFileAccess
     }
 
     func resolve(_ input: String, requireExists: Bool = true) throws -> HeadlessResolvedPath {
@@ -32,9 +38,7 @@ struct HeadlessPathResolver {
                 .appendingPathComponent(trimmed, isDirectory: false)
             do {
                 let resolved = try resolvedCandidate(candidate, root: root, requireExists: requireExists)
-                if !requireExists || fileManager.fileExists(atPath: resolved.url.path) {
-                    matches.append(resolved)
-                }
+                matches.append(resolved)
             } catch let error as HeadlessCommandError {
                 if requireExists, error.exitCode == 2 {
                     continue
@@ -72,43 +76,59 @@ struct HeadlessPathResolver {
         let rest = parts.dropFirst().map(String.init).joined(separator: "/")
         let base = URL(fileURLWithPath: root.path, isDirectory: true)
         let candidate = rest.isEmpty ? base : base.appendingPathComponent(rest, isDirectory: false)
-        return try resolvedCandidate(candidate, root: root, requireExists: requireExists)
+        return try resolvedCandidate(candidate, root: root, lexicalRootPath: root.path, requireExists: requireExists)
     }
 
     private func resolvedAbsolute(_ url: URL, requireExists: Bool) throws -> HeadlessResolvedPath {
         let standardized = url.standardizedFileURL
-        let resolvedPath = HeadlessRootAccessPolicy.resolvedPath(for: standardized)
-        let containingRoots = roots.filter { root in
-            HeadlessRootAccessPolicy.path(resolvedPath, isContainedInOrEqualTo: root.resolvedPath)
+        let containingRoots = roots.compactMap { root -> (root: HeadlessAllowedRoot, lexicalRootPath: String)? in
+            if HeadlessRootAccessPolicy.path(standardized.path, isContainedInOrEqualTo: root.path) {
+                return (root, root.path)
+            }
+            if HeadlessRootAccessPolicy.path(standardized.path, isContainedInOrEqualTo: root.resolvedPath) {
+                return (root, root.resolvedPath)
+            }
+            return nil
         }
-        guard let root = containingRoots.sorted(by: { $0.resolvedPath.count > $1.resolvedPath.count }).first else {
+        guard let match = containingRoots.sorted(by: { $0.lexicalRootPath.count > $1.lexicalRootPath.count }).first else {
             throw HeadlessCommandError("Path is outside the active headless allowed roots: \(url.path)", exitCode: 2)
         }
-        return try resolvedCandidate(standardized, root: root, requireExists: requireExists)
+        return try resolvedCandidate(standardized, root: match.root, lexicalRootPath: match.lexicalRootPath, requireExists: requireExists)
     }
 
-    private func resolvedCandidate(_ candidate: URL, root: HeadlessAllowedRoot, requireExists: Bool) throws -> HeadlessResolvedPath {
+    private func resolvedCandidate(
+        _ candidate: URL,
+        root: HeadlessAllowedRoot,
+        lexicalRootPath: String? = nil,
+        requireExists: Bool
+    ) throws -> HeadlessResolvedPath {
         let standardized = candidate.standardizedFileURL
+        let lexicalRootPath = lexicalRootPath ?? root.path
+        guard HeadlessRootAccessPolicy.path(standardized.path, isContainedInOrEqualTo: lexicalRootPath) else {
+            throw HeadlessCommandError("Path is outside allowed root '\(root.name)': \(candidate.path)", exitCode: 2)
+        }
         let resolvedURL = standardized.resolvingSymlinksInPath().standardizedFileURL
         guard HeadlessRootAccessPolicy.path(resolvedURL.path, isContainedInOrEqualTo: root.resolvedPath) else {
             throw HeadlessCommandError("Path resolves outside allowed root '\(root.name)': \(candidate.path)", exitCode: 2)
         }
-        var isDirectory: ObjCBool = false
-        let exists = fileManager.fileExists(atPath: standardized.path, isDirectory: &isDirectory)
-        guard exists || !requireExists else {
-            throw HeadlessCommandError("Path does not exist: \(candidate.path)", exitCode: 2)
+        let relativePath = Self.relativePath(forResolvedPath: standardized.path, rootResolvedPath: lexicalRootPath)
+        let metadata: HeadlessSecureFileMetadata? = if requireExists {
+            try secureFileAccess.inspect(root: root, relativePath: relativePath)
+        } else {
+            nil
         }
-        let resourceValues = try? standardized.resourceValues(forKeys: [.isRegularFileKey])
-        let relativePath = Self.relativePath(forResolvedPath: resolvedURL.path, rootResolvedPath: root.resolvedPath)
+        let descriptorResolvedURL = relativePath.isEmpty
+            ? URL(fileURLWithPath: root.resolvedPath, isDirectory: true)
+            : URL(fileURLWithPath: root.resolvedPath, isDirectory: true).appendingPathComponent(relativePath)
         let displayPath = relativePath.isEmpty ? root.name : "\(root.name)/\(relativePath)"
         return HeadlessResolvedPath(
             root: root,
             url: standardized,
-            resolvedURL: resolvedURL,
+            resolvedURL: descriptorResolvedURL.standardizedFileURL,
             relativePath: relativePath,
             displayPath: displayPath,
-            isDirectory: exists ? isDirectory.boolValue : false,
-            isRegularFile: resourceValues?.isRegularFile ?? false
+            isDirectory: metadata?.kind == .directory,
+            isRegularFile: metadata?.kind == .regularFile
         )
     }
 

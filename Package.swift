@@ -135,6 +135,11 @@ let package = Package(
                 .copy("CodeMap/Fixtures"),
                 .copy("CodeMap/Goldens")
             ]
+        ),
+        .testTarget(
+            name: "RepoPromptHeadlessTests",
+            dependencies: ["RepoPromptHeadless"],
+            path: "Tests/RepoPromptHeadlessTests"
         )
     ],
     swiftLanguageModes: [.v5]

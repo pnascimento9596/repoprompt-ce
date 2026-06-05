@@ -7,12 +7,18 @@ struct HeadlessSearchResult {
 
 final class HeadlessSearchService {
     private let catalog: HeadlessFileCatalog
-    private let fileManager: FileManager
+    private let secureFileAccess: HeadlessSecureFileAccess
+    private let maxCatalogEntries: Int
     private let maxReadableBytes = 2 * 1024 * 1024
 
-    init(catalog: HeadlessFileCatalog = HeadlessFileCatalog(), fileManager: FileManager = .default) {
+    init(
+        catalog: HeadlessFileCatalog = HeadlessFileCatalog(),
+        secureFileAccess: HeadlessSecureFileAccess = HeadlessSecureFileAccess(),
+        maxCatalogEntries: Int = 20000
+    ) {
         self.catalog = catalog
-        self.fileManager = fileManager
+        self.secureFileAccess = secureFileAccess
+        self.maxCatalogEntries = max(0, maxCatalogEntries)
     }
 
     func search(roots: [HeadlessAllowedRoot], resolver: HeadlessPathResolver, arguments: [String: Any]) throws -> HeadlessSearchResult {
@@ -31,16 +37,39 @@ final class HeadlessSearchService {
         let exclude = HeadlessToolArguments.stringArray(filter, key: "exclude") ?? []
         let filterPaths = (HeadlessToolArguments.stringArray(filter, key: "paths") ?? []) + (HeadlessToolArguments.string(arguments, key: "path").map { [$0] } ?? [])
 
-        let searchRoots: [HeadlessCatalogEntry]
+        var searchEntries: [HeadlessCatalogEntry] = []
+        let catalogEntryLimit = maxCatalogEntries
+        var catalogScanCount = 0
+        var catalogWasTruncated = false
+        var catalogSkippedEntries = 0
         if filterPaths.isEmpty {
-            searchRoots = try catalog.scan(roots: roots)
+            let scanResult = try catalog.scan(roots: roots, maxEntries: maxCatalogEntries)
+            searchEntries = scanResult.entries
+            catalogScanCount = 1
+            catalogWasTruncated = scanResult.wasTruncated
+            catalogSkippedEntries = scanResult.skippedEntryCount
         } else {
-            var entries: [HeadlessCatalogEntry] = []
+            var seenEntries: Set<String> = []
             for filterPath in filterPaths {
+                guard searchEntries.count < maxCatalogEntries else {
+                    catalogWasTruncated = true
+                    break
+                }
                 let resolved = try resolver.resolve(filterPath)
-                try entries.append(contentsOf: catalog.scan(roots: [resolved.root], under: resolved))
+                let scanResult = try catalog.scan(roots: [resolved.root], under: resolved, maxEntries: maxCatalogEntries)
+                catalogScanCount += 1
+                catalogWasTruncated = catalogWasTruncated || scanResult.wasTruncated
+                catalogSkippedEntries += scanResult.skippedEntryCount
+                for entry in scanResult.entries {
+                    let key = "\(entry.root.id.uuidString):\(entry.relativePath)"
+                    guard seenEntries.insert(key).inserted else { continue }
+                    guard searchEntries.count < maxCatalogEntries else {
+                        catalogWasTruncated = true
+                        break
+                    }
+                    searchEntries.append(entry)
+                }
             }
-            searchRoots = entries
         }
 
         let matcher = try Matcher(pattern: pattern, regex: useRegex, wholeWord: wholeWord)
@@ -51,15 +80,21 @@ final class HeadlessSearchService {
 
         var pathMatches: [[String: Any]] = []
         var contentMatches: [[String: Any]] = []
+        var totalPathMatches = 0
         var totalContentMatches = 0
-        for entry in searchRoots where !entry.relativePath.isEmpty {
+        var returnedMatches = 0
+        var contentFilesScanned = 0
+        var contentFilesSkipped = 0
+        for entry in searchEntries where !entry.relativePath.isEmpty {
             if shouldSkip(entry: entry, extensions: extensions, exclude: exclude) {
                 continue
             }
             if effectiveMode == "path" || effectiveMode == "both" {
                 if matcher.matches(entry.displayPath) || matcher.matches(entry.relativePath) {
-                    if pathMatches.count < maxResults {
+                    totalPathMatches += 1
+                    if !countOnly, returnedMatches < maxResults {
                         pathMatches.append(["path": entry.displayPath, "relative_path": entry.relativePath, "root": entry.root.name])
+                        returnedMatches += 1
                     }
                 }
             }
@@ -67,15 +102,18 @@ final class HeadlessSearchService {
                 continue
             }
             guard let byteCount = entry.byteCount, byteCount <= maxReadableBytes else {
+                contentFilesSkipped += 1
                 continue
             }
-            guard let text = try? readTextFile(entry.url) else {
+            guard let text = try? readTextFile(entry) else {
+                contentFilesSkipped += 1
                 continue
             }
+            contentFilesScanned += 1
             let lines = text.components(separatedBy: .newlines)
             for (index, line) in lines.enumerated() where matcher.matches(line) {
                 totalContentMatches += 1
-                if contentMatches.count < maxResults {
+                if !countOnly, returnedMatches < maxResults {
                     let start = max(0, index - contextLines)
                     let end = min(lines.count - 1, index + contextLines)
                     let context = (start ... end).map { lineIndex in
@@ -89,33 +127,62 @@ final class HeadlessSearchService {
                         "text": line,
                         "context": context
                     ])
+                    returnedMatches += 1
                 }
             }
         }
 
-        let totalMatches = pathMatches.count + totalContentMatches
-        var lines: [String] = ["## Search Results ✅", "- **Pattern**: `\(pattern)`", "- **Mode**: `\(mode)`", "- **Total matches**: \(totalMatches)"]
+        let totalMatches = totalPathMatches + totalContentMatches
+        let omitted = max(0, totalMatches - maxResults)
+        let includesPathSearch = effectiveMode == "path" || effectiveMode == "both"
+        let includesContentSearch = effectiveMode == "content" || effectiveMode == "both"
+        let catalogComplete = !catalogWasTruncated && catalogSkippedEntries == 0
+        let pathTotalsComplete = !includesPathSearch || catalogComplete
+        let contentTotalsComplete = !includesContentSearch || (catalogComplete && contentFilesSkipped == 0)
+        let totalsComplete = pathTotalsComplete && contentTotalsComplete
+        let totalDisplay = totalsComplete ? "\(totalMatches)" : "\(totalMatches) (lower bound)"
+        var lines: [String] = [
+            "## Search Results ✅",
+            "- **Pattern**: `\(pattern)`",
+            "- **Mode**: `\(mode)`",
+            "- **Total matches**: \(totalDisplay)",
+            "- **Path matches**: \(totalPathMatches)",
+            "- **Content matches**: \(totalContentMatches)",
+            "- **Returned matches**: \(returnedMatches)",
+            "- **Omitted by max_results**: \(omitted)",
+            "- **Catalog entries scanned**: \(searchEntries.count)",
+            "- **Catalog entry limit**: \(catalogEntryLimit) across \(catalogScanCount) scan(s)"
+        ]
         if countOnly {
             lines.append("- **Count only**: true")
         } else {
             if !pathMatches.isEmpty {
                 lines.append("\n### Path Matches")
-                for match in pathMatches.prefix(maxResults) {
+                for match in pathMatches {
                     lines.append("- `\(match["path"] as? String ?? "")`")
                 }
             }
             if !contentMatches.isEmpty {
                 lines.append("\n### Content Matches")
-                for match in contentMatches.prefix(maxResults) {
+                for match in contentMatches {
                     let path = match["path"] as? String ?? ""
                     let line = match["line"] as? Int ?? 0
                     let text = match["text"] as? String ?? ""
                     lines.append("- `\(path):\(line)` \(text)")
                 }
             }
-            if totalMatches > maxResults {
-                lines.append("\n_Omitted matches after max_results=\(maxResults)._")
+            if omitted > 0 {
+                lines.append("\n_Omitted \(omitted) match(es) after max_results=\(maxResults)._")
             }
+        }
+        if catalogWasTruncated {
+            lines.append("\n⚠️ Catalog entry limit reached; eligible entries remain unscanned, so totals are lower bounds.")
+        }
+        if catalogSkippedEntries > 0 {
+            lines.append("\n⚠️ Skipped \(catalogSkippedEntries) catalog entry or traversal error(s); totals are lower bounds.")
+        }
+        if includesContentSearch, contentFilesSkipped > 0 {
+            lines.append("\n⚠️ Skipped \(contentFilesSkipped) unreadable, non-UTF-8, binary, or oversized content file(s); content totals are lower bounds.")
         }
 
         return HeadlessSearchResult(summary: lines.joined(separator: "\n"), structured: [
@@ -124,9 +191,27 @@ final class HeadlessSearchService {
             "regex": useRegex,
             "whole_word": wholeWord,
             "total_matches": totalMatches,
+            "total_path_matches": totalPathMatches,
+            "total_content_matches": totalContentMatches,
+            "returned_matches": returnedMatches,
+            "count_only": countOnly,
             "path_matches": pathMatches,
             "content_matches": contentMatches,
-            "omitted": max(0, totalMatches - maxResults)
+            "omitted": omitted,
+            "catalog_entries_scanned": searchEntries.count,
+            "catalog_entries_considered": searchEntries.count,
+            "catalog_entry_limit": catalogEntryLimit,
+            "catalog_scan_count": catalogScanCount,
+            "catalog_truncated": catalogWasTruncated,
+            "catalog_skipped_entries": catalogSkippedEntries,
+            "content_files_scanned": contentFilesScanned,
+            "content_files_skipped": contentFilesSkipped,
+            "path_totals_complete": pathTotalsComplete,
+            "content_totals_complete": contentTotalsComplete,
+            "totals_complete": totalsComplete,
+            "totals_are_lower_bounds": !totalsComplete,
+            "total_matches_is_lower_bound": !totalsComplete,
+            "omitted_is_lower_bound": !totalsComplete
         ])
     }
 
@@ -142,13 +227,17 @@ final class HeadlessSearchService {
         }
     }
 
-    private func readTextFile(_ url: URL) throws -> String {
-        let data = try Data(contentsOf: url)
+    private func readTextFile(_ entry: HeadlessCatalogEntry) throws -> String {
+        let data = try secureFileAccess.readRegularFile(
+            root: entry.root,
+            relativePath: entry.relativePath,
+            maximumBytes: maxReadableBytes
+        ).data
         guard !data.contains(0) else {
-            throw HeadlessCommandError("Binary file skipped: \(url.path)", exitCode: 2)
+            throw HeadlessCommandError("Binary file skipped: \(entry.displayPath)", exitCode: 2)
         }
         guard let text = String(data: data, encoding: .utf8) else {
-            throw HeadlessCommandError("File is not valid UTF-8: \(url.path)", exitCode: 2)
+            throw HeadlessCommandError("File is not valid UTF-8: \(entry.displayPath)", exitCode: 2)
         }
         return text
     }
