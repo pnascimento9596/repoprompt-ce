@@ -63,8 +63,8 @@ run mkdir -p "$TARGET_DIR"
 tmp_binary="$TARGET_DIR/.${BINARY_NAME}.tmp.$$"
 run cp "$BUILT_BINARY" "$tmp_binary"
 run chmod +x "$tmp_binary"
+run "$tmp_binary" --version
 run mv -f "$tmp_binary" "$TARGET_BINARY"
 tmp_binary=""
 
-run "$TARGET_BINARY" --version
 printf 'Created: %s\n' "$TARGET_BINARY"

@@ -104,7 +104,9 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn('BINARY_NAME="repoprompt-headless"', package_script)
         self.assertIn("HeadlessTools", package_script)
         self.assertIn('swift build -c "$CONF" --product "$BINARY_NAME"', package_script)
-        self.assertIn('"$TARGET_BINARY" --version', package_script)
+        candidate_validation = package_script.index('"$tmp_binary" --version')
+        candidate_install = package_script.index('mv -f "$tmp_binary" "$TARGET_BINARY"')
+        self.assertLess(candidate_validation, candidate_install)
         self.assertIn('Created: %s\\n', package_script)
         self.assertNotIn("RepoPrompt.app", package_script)
         self.assertNotIn("repoprompt-mcp", package_script)
@@ -126,6 +128,58 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("shutdown", smoke_script)
         self.assertNotIn("rpce-cli-debug", smoke_script)
         self.assertNotIn("repoprompt-mcp", smoke_script)
+
+    def test_headless_package_preserves_staged_binary_when_candidate_validation_fails(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        source_root = temp_dir / "source"
+        tools_root = temp_dir / "tools"
+        build_dir = temp_dir / "build"
+        fake_bin = temp_dir / "fake-bin"
+        source_root.mkdir()
+        build_dir.mkdir()
+        fake_bin.mkdir()
+
+        staged_binary = tools_root / "Debug" / "repoprompt-headless"
+        staged_binary.parent.mkdir(parents=True)
+        known_good = "#!/usr/bin/env bash\necho 'known-good 1.0.0'\n"
+        staged_binary.write_text(known_good, encoding="utf-8")
+        staged_binary.chmod(0o755)
+
+        candidate = build_dir / "repoprompt-headless"
+        candidate.write_text("#!/usr/bin/env bash\nexit 42\n", encoding="utf-8")
+        candidate.chmod(0o755)
+        fake_swift = fake_bin / "swift"
+        fake_swift.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \" $* \" == *\" --show-bin-path \"* ]]; then\n"
+            "  printf '%s\\n' \"$FAKE_SWIFT_BUILD_DIR\"\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        fake_swift.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "FAKE_SWIFT_BUILD_DIR": str(build_dir),
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(source_root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
+                "REPOPROMPT_HEADLESS_TOOLS_ROOT": str(tools_root),
+            }
+        )
+
+        result = subprocess.run(
+            [str(SCRIPT_DIR / "package_headless.sh"), "debug"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(staged_binary.read_text(encoding="utf-8"), known_good)
+        self.assertEqual(list(staged_binary.parent.glob(".repoprompt-headless.tmp.*")), [])
 
     def test_headless_install_script_manages_debug_link_without_app_bundle(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -177,8 +231,109 @@ class ReleaseToolingTests(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(uninstalled.returncode, 0, uninstalled.stderr)
-        self.assertFalse(path_link.exists())
+        self.assertFalse(os.path.lexists(path_link))
+        self.assertFalse(os.path.lexists(user_link))
         self.assertNotIn("RepoPrompt.app", installed.stdout + status.stdout + uninstalled.stdout)
+
+    def test_headless_uninstall_removes_release_links_without_touching_debug_links(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        home = temp_dir / "home"
+        tools_root = temp_dir / "tools"
+        bin_dir = temp_dir / "bin"
+        support_root = home / "Library" / "Application Support" / "RepoPrompt CE"
+        bin_dir.mkdir(parents=True)
+        support_root.mkdir(parents=True)
+
+        debug_binary = tools_root / "Debug" / "repoprompt-headless"
+        release_binary = tools_root / "Release" / "repoprompt-headless"
+        for binary in (debug_binary, release_binary):
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/usr/bin/env bash\necho fixture\n", encoding="utf-8")
+            binary.chmod(0o755)
+
+        debug_user_link = support_root / "repoprompt_headless_debug"
+        release_user_link = support_root / "repoprompt_headless"
+        debug_path_link = bin_dir / "rpce-headless-debug"
+        release_path_link = bin_dir / "rpce-headless"
+        debug_user_link.symlink_to(debug_binary)
+        release_user_link.symlink_to(release_binary)
+        debug_path_link.symlink_to(debug_user_link)
+        release_path_link.symlink_to(release_user_link)
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "REPOPROMPT_HEADLESS_TOOLS_ROOT": str(tools_root),
+                "REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH": str(debug_path_link),
+                "REPOPROMPT_HEADLESS_INSTALL_PATH": str(release_path_link),
+            }
+        )
+
+        result = subprocess.run(
+            [str(SCRIPT_DIR / "install_headless_cli.sh"), "uninstall", "--configuration", "release"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.lexists(release_path_link))
+        self.assertFalse(os.path.lexists(release_user_link))
+        self.assertEqual(os.readlink(debug_path_link), str(debug_user_link))
+        self.assertEqual(os.readlink(debug_user_link), str(debug_binary))
+
+    def test_headless_uninstall_preserves_unmanaged_paths_while_removing_managed_links(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        home = temp_dir / "home"
+        tools_root = temp_dir / "tools"
+        bin_dir = temp_dir / "bin"
+        support_root = home / "Library" / "Application Support" / "RepoPrompt CE"
+        bin_dir.mkdir(parents=True)
+        support_root.mkdir(parents=True)
+        binary = tools_root / "Debug" / "repoprompt-headless"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/usr/bin/env bash\necho fixture\n", encoding="utf-8")
+        binary.chmod(0o755)
+        path_link = bin_dir / "rpce-headless-debug"
+        user_link = support_root / "repoprompt_headless_debug"
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "REPOPROMPT_HEADLESS_TOOLS_ROOT": str(tools_root),
+                "REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH": str(path_link),
+            }
+        )
+
+        path_link.write_text("unmanaged path file\n", encoding="utf-8")
+        user_link.symlink_to(binary)
+        unmanaged_path_result = subprocess.run(
+            [str(SCRIPT_DIR / "install_headless_cli.sh"), "uninstall", "--configuration", "debug"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(unmanaged_path_result.returncode, 0)
+        self.assertEqual(path_link.read_text(encoding="utf-8"), "unmanaged path file\n")
+        self.assertFalse(os.path.lexists(user_link))
+
+        path_link.unlink()
+        unrelated_target = temp_dir / "unrelated"
+        unrelated_target.write_text("#!/usr/bin/env bash\necho unrelated\n", encoding="utf-8")
+        unrelated_target.chmod(0o755)
+        user_link.symlink_to(unrelated_target)
+        path_link.symlink_to(user_link)
+        unmanaged_user_result = subprocess.run(
+            [str(SCRIPT_DIR / "install_headless_cli.sh"), "uninstall", "--configuration", "debug"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(unmanaged_user_result.returncode, 0)
+        self.assertFalse(os.path.lexists(path_link))
+        self.assertEqual(os.readlink(user_link), str(unrelated_target))
 
     def test_embedded_mcp_helper_layout_validator_rejects_invalid_metadata(self) -> None:
         def missing_helper(app: Path) -> None:

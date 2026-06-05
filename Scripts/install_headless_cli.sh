@@ -109,13 +109,19 @@ is_managed_path_link() {
 	[[ "$target" == "$user_link" || "$target" == "$binary" ]]
 }
 
-is_current_user_link() {
+is_managed_user_link() {
 	local config="$1" user_link binary target
 	user_link="$(user_link_for "$config")"
 	binary="$(binary_for "$config")"
 	[[ -L "$user_link" ]] || return 1
 	target="$(readlink "$user_link" 2>/dev/null || true)"
-	[[ "$target" == "$binary" && -x "$user_link" ]]
+	[[ "$target" == "$binary" ]]
+}
+
+is_current_user_link() {
+	local config="$1" user_link
+	user_link="$(user_link_for "$config")"
+	is_managed_user_link "$config" && [[ -x "$user_link" ]]
 }
 
 is_current_path_link() {
@@ -196,7 +202,8 @@ uninstall_path_link() {
 		return
 	fi
 	if ! is_managed_path_link "$config"; then
-		fail "Refusing to remove unmanaged file at $path_link"
+		echo "ERROR: Refusing to remove unmanaged file at $path_link" >&2
+		return 1
 	fi
 	if [[ -w "$install_dir" ]]; then
 		rm -f "$path_link"
@@ -208,6 +215,28 @@ uninstall_path_link() {
 		sudo rm -f "$path_link"
 	fi
 	echo "Removed: $path_link"
+}
+
+uninstall_user_link() {
+	local config="$1" user_link
+	user_link="$(user_link_for "$config")"
+	if [[ ! -e "$user_link" && ! -L "$user_link" ]]; then
+		echo "User-space headless command is not installed at $user_link"
+		return
+	fi
+	if ! is_managed_user_link "$config"; then
+		echo "ERROR: Refusing to remove unmanaged file at $user_link" >&2
+		return 1
+	fi
+	rm -f "$user_link"
+	echo "Removed: $user_link"
+}
+
+uninstall_configuration() {
+	local config="$1" status=0
+	uninstall_path_link "$config" || status=$?
+	uninstall_user_link "$config" || status=$?
+	return "$status"
 }
 
 print_one_status() {
@@ -278,5 +307,5 @@ case "$ACTION" in
 		fi
 		;;
 	install) install_path_link "$CONFIGURATION" ;;
-	uninstall) uninstall_path_link "$CONFIGURATION" ;;
+	uninstall) uninstall_configuration "$CONFIGURATION" ;;
 esac
