@@ -92,8 +92,8 @@ struct AppCommand {
 class WindowState: ObservableObject {
     // MARK: - Shared Services
 
-    /// Single shared MCP service instance across all windows
-    private static let sharedMCPService = MCPService()
+    let coreContainer: RepoPromptAppCoreContainer
+    let coreSessionHandle: RepoPromptCoreSessionHandle
 
     // MARK: - Window identification
 
@@ -108,6 +108,8 @@ class WindowState: ObservableObject {
 
     /// Per-window teardown guard. Not @Published (we don't want SwiftUI updates during teardown).
     private(set) var isClosing: Bool = false
+    private var tearDownTask: Task<Void, Never>?
+    private var didCompleteTearDown = false
 
     private var focusCancellables = Set<AnyCancellable>()
     private weak var focusObservedWindow: NSWindow?
@@ -285,7 +287,12 @@ class WindowState: ObservableObject {
 
     // MARK: - Initialization
 
-    init() {
+    convenience init() {
+        self.init(coreContainer: .shared)
+    }
+
+    init(coreContainer: RepoPromptAppCoreContainer) {
+        self.coreContainer = coreContainer
         // Assign a unique window ID
         WindowState.windowCounter += 1
         windowID = WindowState.windowCounter
@@ -302,9 +309,10 @@ class WindowState: ObservableObject {
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
-            sharedMCPService: Self.sharedMCPService
+            coreContainer: coreContainer
         )
 
+        coreSessionHandle = composition.coreSessionHandle
         workspaceFileContextStore = composition.workspaceFileContextStore
         workspaceSearchService = composition.workspaceSearchService
         selectionCoordinator = composition.selectionCoordinator
@@ -324,6 +332,7 @@ class WindowState: ObservableObject {
         aiQueriesService = composition.aiQueriesService
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
+        closeCoordinator.windowState = self
 
         // Set up additional actions
         setupSendPromptAction()
@@ -712,11 +721,11 @@ class WindowState: ObservableObject {
 
     /// ------------------------------------------------------------------
     func startMCPServer() {
-        Task { try? await WindowState.sharedMCPService.join(windowID: windowID) }
+        Task { try? await coreContainer.mcpService.join(windowID: windowID) }
     }
 
     func stopMCPServer() {
-        Task { await WindowState.sharedMCPService.leave(windowID: windowID) }
+        Task { await coreContainer.mcpService.leave(windowID: windowID) }
     }
 
     // MARK: - Command handling
@@ -1209,6 +1218,22 @@ class WindowState: ObservableObject {
     // MARK: - Teardown
 
     func tearDown() async {
+        if didCompleteTearDown { return }
+        if let tearDownTask {
+            await tearDownTask.value
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await performTearDown()
+        }
+        tearDownTask = task
+        await task.value
+        tearDownTask = nil
+        didCompleteTearDown = true
+    }
+
+    private func performTearDown() async {
         let isAppTermination = WindowStatesManager.shared.isTerminating
         #if DEBUG
             agentChatStressHarness?.pause()
@@ -1221,13 +1246,8 @@ class WindowState: ObservableObject {
             }
         }
 
-        // App-level termination already coordinates agent/session and MCP shutdown.
-        // Skip duplicate per-window teardown work on quit so close latency stays bounded.
-        if isAppTermination {
-            aiQueriesService.cancelQuery()
-            return
-        }
-
+        // Safety-critical cancellation always runs, including when a normal close
+        // overlaps app termination. UI-observed mutations remain suppressed below.
         await workspaceManager.cancelActiveSessions()
         await agentModeViewModel.prepareForWindowClose()
         WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)

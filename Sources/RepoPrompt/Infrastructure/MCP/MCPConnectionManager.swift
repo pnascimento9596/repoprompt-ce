@@ -298,18 +298,22 @@ actor ServerNetworkManager {
     static let shared = ServerNetworkManager()
     nonisolated let runtimeSessionRegistry: MCPRuntimeSessionRegistry
     nonisolated let serviceRegistry: MCPServiceRegistry
+    nonisolated let appSessionAdapters: RepoPromptAppSessionAdapterRegistry
     nonisolated let toolCatalogReadiness: MCPToolCatalogReadiness
     private static let repoCLIPrefix = "RepoPrompt CLI"
 
     init(
         runtimeSessionRegistry: MCPRuntimeSessionRegistry = MCPRuntimeSessionRegistry(),
-        serviceRegistry: MCPServiceRegistry = MCPServiceRegistry()
+        serviceRegistry: MCPServiceRegistry = MCPServiceRegistry(),
+        appSessionAdapters: RepoPromptAppSessionAdapterRegistry = .shared
     ) {
         self.runtimeSessionRegistry = runtimeSessionRegistry
         self.serviceRegistry = serviceRegistry
+        self.appSessionAdapters = appSessionAdapters
         toolCatalogReadiness = MCPToolCatalogReadiness(
             runtimeSessionRegistry: runtimeSessionRegistry,
-            serviceRegistry: serviceRegistry
+            serviceRegistry: serviceRegistry,
+            appSessionAdapters: appSessionAdapters
         )
         Task { @MainActor [weak self] in
             serviceRegistry.setSnapshotDidChangeSink { [weak self] in
@@ -364,7 +368,7 @@ actor ServerNetworkManager {
             return policyWindowID
         }
         let resolvedWindowID = await MainActor.run {
-            runtimeSessionRegistry.windowStates().first { $0.mcpServer.hasLiveRunID(runID) }?.windowID
+            appSessionAdapters.windowStates().first { $0.mcpServer.hasLiveRunID(runID) }?.windowID
         }
         if let resolvedWindowID {
             windowIDByRunID[runID] = resolvedWindowID
@@ -1168,7 +1172,7 @@ actor ServerNetworkManager {
             // The VM API is identity-bound, so it is safe to scan all windows. This avoids
             // missing tools routed via a per-call _windowID override that differs from the
             // connection's sticky/default assigned window.
-            runtimeSessionRegistry.windowStates(includeDraining: true).reduce(into: 0) { partialResult, window in
+            appSessionAdapters.windowStates(includeDraining: true).reduce(into: 0) { partialResult, window in
                 partialResult += window.mcpServer.cancelActiveToolsForConnection(
                     connectionID: connectionID,
                     reason: reason
@@ -1553,7 +1557,7 @@ actor ServerNetworkManager {
         }
 
         let resolved = await MainActor.run { () -> (runID: UUID, windowID: Int)? in
-            for window in runtimeSessionRegistry.windowStates() {
+            for window in appSessionAdapters.windowStates() {
                 guard let candidateRunID = window.mcpServer.connectionIDToRunID[connectionID],
                       let runID = Self.validatedLiveRunID(
                           candidateRunID: candidateRunID,
@@ -1645,7 +1649,7 @@ actor ServerNetworkManager {
         // Fast path: if this connection is already mapped to this run in this window,
         // avoid re-registering and re-binding on every tool call.
         let alreadyMapped = await MainActor.run { () -> Bool in
-            guard let window = runtimeSessionRegistry.window(withID: windowID) else {
+            guard let window = appSessionAdapters.window(withID: windowID) else {
                 return false
             }
             let mappedRun = window.mcpServer.connectionIDToRunID[connectionID]
@@ -1664,7 +1668,7 @@ actor ServerNetworkManager {
         }
 
         let registrationSucceeded = await MainActor.run { () -> Bool in
-            guard let window = runtimeSessionRegistry.window(withID: windowID) else {
+            guard let window = appSessionAdapters.window(withID: windowID) else {
                 log.warning("mapConnectionToRunID: window \(windowID) not found for connection \(connectionID)")
                 return false
             }
@@ -2098,7 +2102,7 @@ actor ServerNetworkManager {
         }
 
         await MainActor.run {
-            let windows = runtimeSessionRegistry.windowStates(includeDraining: true).filter { window in
+            let windows = appSessionAdapters.windowStates(includeDraining: true).filter { window in
                 guard let windowID else { return true }
                 return window.windowID == windowID
             }
@@ -3896,7 +3900,7 @@ actor ServerNetworkManager {
         }
 
         await MainActor.run {
-            let windows = runtimeSessionRegistry.windowStates(includeDraining: true)
+            let windows = appSessionAdapters.windowStates(includeDraining: true)
             let nameForCleanup = cleanupClientName
             if let windowID = assignedWindowID,
                let windowState = windows.first(where: { $0.windowID == windowID })
@@ -4007,12 +4011,12 @@ actor ServerNetworkManager {
         MCPBindingResolver(
             collectMatchesForContextID: { contextID in
                 await MainActor.run {
-                    self.runtimeSessionRegistry.windowStates().compactMap { windowState in
-                        guard let candidate = windowState.workspaceManager.bindingCandidate(forContextID: contextID) else {
+                    self.runtimeSessionRegistry.sessions().compactMap { session in
+                        guard let candidate = session.workspaceSessionController.bindingCandidate(forContextID: contextID) else {
                             return nil
                         }
                         return MCPContextBindingMatch(
-                            windowID: windowState.windowID,
+                            windowID: session.routingSessionID.rawValue,
                             tabID: candidate.tabID,
                             workspaceID: candidate.workspaceID,
                             workspaceName: candidate.workspaceName,
@@ -4023,10 +4027,10 @@ actor ServerNetworkManager {
             },
             collectMatchesForWorkingDirs: { workingDirs in
                 await MainActor.run {
-                    self.runtimeSessionRegistry.windowStates().flatMap { windowState in
-                        windowState.workspaceManager.bindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
+                    self.runtimeSessionRegistry.sessions().flatMap { session in
+                        session.workspaceSessionController.bindingCandidates(matchingWorkingDirs: workingDirs, includeHidden: false).map { candidate in
                             MCPContextBindingMatch(
-                                windowID: windowState.windowID,
+                                windowID: session.routingSessionID.rawValue,
                                 tabID: candidate.tabID,
                                 workspaceID: candidate.workspaceID,
                                 workspaceName: candidate.workspaceName,
@@ -4935,7 +4939,7 @@ actor ServerNetworkManager {
 
             private func debugBindingSnapshot(for connectionID: UUID, selectedWindowID: Int?) async -> MCPServerViewModel.ConnectionBindingSnapshot {
                 await MainActor.run {
-                    let windows = runtimeSessionRegistry.windowStates()
+                    let windows = appSessionAdapters.windowStates()
                     let snapshots = windows.map { $0.mcpServer.connectionBindingSnapshot(forConnection: connectionID) }
                     if let explicit = snapshots.first(where: { $0.bindingKind == .tabContext && $0.explicitlyBound && $0.runID == nil }) {
                         return explicit
@@ -4991,7 +4995,7 @@ actor ServerNetworkManager {
 
             private func debugWindowObjects() async -> [[String: Any]] {
                 await MainActor.run {
-                    runtimeSessionRegistry.windowStates().map { window in
+                    appSessionAdapters.windowStates().map { window in
                         let workspace = window.workspaceManager.activeWorkspace
                         let activeTabID = window.promptManager.activeComposeTabID
                         let workspaceID: Any = workspace?.id.uuidString ?? NSNull()
@@ -6374,7 +6378,7 @@ actor ServerNetworkManager {
         runID: UUID
     ) async {
         let resolved = await MainActor.run { () -> (workspaceID: UUID, snapshot: ComposeTabState)? in
-            guard let windowState = runtimeSessionRegistry.window(withID: windowID) else {
+            guard let windowState = appSessionAdapters.window(withID: windowID) else {
                 return nil
             }
             guard let resolved = windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID) else {
@@ -6429,7 +6433,7 @@ actor ServerNetworkManager {
         let resolvedClientName = clientName ?? clientIdentifier(forConnection: connectionID)
         do {
             let bindingResult = try await MainActor.run { () throws -> (didBind: Bool, workspaceID: UUID?) in
-                guard let windowState = runtimeSessionRegistry.window(withID: windowID) else {
+                guard let windowState = appSessionAdapters.window(withID: windowID) else {
                     throw MCPError.invalidParams("Window \(windowID) not found")
                 }
                 // Fast path: already bound to this exact tab+run in this window.
@@ -7275,7 +7279,7 @@ actor ServerNetworkManager {
 
                                         do {
                                             try await MainActor.run {
-                                                guard let windowState = self.runtimeSessionRegistry.window(withID: windowID) else {
+                                                guard let windowState = self.appSessionAdapters.window(withID: windowID) else {
                                                     throw MCPError.invalidParams("Window \(windowID) not found")
                                                 }
                                                 let resolvedWorkspaceID = capturedTabContextHint?.workspaceID
@@ -8091,7 +8095,7 @@ actor ServerNetworkManager {
         let (workspaceID, instanceNumber): (UUID?, Int?) = await MainActor.run {
             guard
                 let windowID,
-                let win = runtimeSessionRegistry.window(withID: windowID)
+                let win = appSessionAdapters.window(withID: windowID)
             else { return (nil, nil) }
             return (win.workspaceManager.activeWorkspace?.id, win.workspaceInstanceNumber)
         }
@@ -8183,7 +8187,7 @@ actor ServerNetworkManager {
 
         let sortedRecords = freshRecords.sorted { $0.lastSeenAt > $1.lastSeenAt }
         let windowSnapshot: [(workspaceID: UUID?, instanceNumber: Int?, windowID: Int)] = await MainActor.run {
-            runtimeSessionRegistry.windowStates().map {
+            appSessionAdapters.windowStates().map {
                 ($0.workspaceManager.activeWorkspace?.id, $0.workspaceInstanceNumber, $0.windowID)
             }
         }

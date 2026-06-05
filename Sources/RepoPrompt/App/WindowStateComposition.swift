@@ -2,6 +2,7 @@ import Foundation
 
 @MainActor
 struct WindowStateComposition {
+    let coreSessionHandle: RepoPromptCoreSessionHandle
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -28,11 +29,15 @@ enum WindowStateCompositionFactory {
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
-        sharedMCPService: MCPService
+        coreContainer: RepoPromptAppCoreContainer
     ) -> WindowStateComposition {
-        // 1) Workspace file context store + visible file-tree UI adapter
-        let workspaceFileContextStore = WorkspaceFileContextStore()
-        let workspaceSearchService = WorkspaceSearchService()
+        // 1) Reusable session graph + visible file-tree UI adapter
+        let coreSessionHandle = coreContainer.coreHost.makeEmbeddedSession(
+            routingSessionID: MCPRoutingSessionID(rawValue: windowID)
+        )
+        let coreSession = coreSessionHandle.session
+        let workspaceFileContextStore = coreSession.workspaceFileContextStore
+        let workspaceSearchService = coreSession.workspaceSearchService
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
         // 2) AI queries
@@ -58,12 +63,11 @@ enum WindowStateCompositionFactory {
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
-            workspaceSearchService: workspaceSearchService
+            workspaceSearchService: workspaceSearchService,
+            workspaceRepository: coreContainer.workspaceRepository
         )
-        let selectionCoordinator = WorkspaceSelectionCoordinator(
-            workspaceManager: workspaceManager,
-            store: workspaceFileContextStore
-        )
+        coreSession.workspaceSessionController.attach(backing: workspaceManager)
+        let selectionCoordinator = coreSession.selectionCoordinator
         workspaceFilesViewModel.attachSelectionCoordinator(selectionCoordinator)
         workspaceManager.attachSelectionCoordinator(selectionCoordinator)
         promptManager.attachSelectionCoordinator(selectionCoordinator)
@@ -80,11 +84,13 @@ enum WindowStateCompositionFactory {
         // 11) MCP server (one listener app-wide, this window may be owner)
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
         let mcpServer = MCPServerViewModel(
-            service: sharedMCPService,
+            service: coreContainer.mcpService,
             promptVM: promptManager,
             oracleVM: oracleViewModel,
             workspaceManager: workspaceManager,
             selectionCoordinator: selectionCoordinator,
+            coreSessionHandle: coreSessionHandle,
+            appSessionAdapters: coreContainer.appSessionAdapters,
             windowID: windowID,
             workspaceSearch: { [store = workspaceFileContextStore, searchService = workspaceSearchService, workspaceManager] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
                 try await StoreBackedWorkspaceSearch.search(
@@ -170,6 +176,7 @@ enum WindowStateCompositionFactory {
 
         #if DEBUG
             return WindowStateComposition(
+                coreSessionHandle: coreSessionHandle,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -190,6 +197,7 @@ enum WindowStateCompositionFactory {
             )
         #else
             return WindowStateComposition(
+                coreSessionHandle: coreSessionHandle,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,

@@ -1,7 +1,10 @@
 import Foundation
 
-/// Transitional MCP routing projection for the app's window-backed runtime sessions.
-/// Window IDs remain the compatibility routing IDs until the reusable core session graph lands.
+/// MCP routing projection for reusable runtime sessions.
+///
+/// Compatibility snapshots retain `windowID` terminology while existing MCP
+/// schemas continue to expose `window_id`. Internally these values are routing
+/// session IDs and no longer retain app windows.
 @MainActor
 final class MCPRuntimeSessionRegistry {
     enum Lifecycle {
@@ -9,7 +12,7 @@ final class MCPRuntimeSessionRegistry {
         case draining
     }
 
-    struct RoutingSnapshot: Sendable {
+    struct RoutingSnapshot {
         let generation: UInt64
         let orderedActiveWindowIDs: [Int]
         let mcpEnabledWindowIDs: Set<Int>
@@ -37,13 +40,13 @@ final class MCPRuntimeSessionRegistry {
 
     private final class Entry {
         let windowID: Int
-        weak var windowState: WindowState?
+        weak var session: RepoPromptCoreSession?
         var lifecycle: Lifecycle
         var isMCPEnabled: Bool
 
-        init(windowState: WindowState, isMCPEnabled: Bool) {
-            windowID = windowState.windowID
-            self.windowState = windowState
+        init(session: RepoPromptCoreSession, isMCPEnabled: Bool) {
+            windowID = session.routingSessionID.rawValue
+            self.session = session
             lifecycle = .active
             self.isMCPEnabled = isMCPEnabled
         }
@@ -57,21 +60,20 @@ final class MCPRuntimeSessionRegistry {
 
     nonisolated init() {}
 
-    func register(windowState: WindowState) {
-        let windowID = windowState.windowID
+    func register(session: RepoPromptCoreSession) {
+        let windowID = session.routingSessionID.rawValue
         guard !retiredIDs.contains(windowID) else { return }
         if let existing = entriesByID[windowID] {
-            existing.windowState = windowState
-            existing.lifecycle = .active
+            guard existing.lifecycle == .active else { return }
+            existing.session = session
             existing.isMCPEnabled = pendingEnabledByUnknownID.removeValue(forKey: windowID)
-                ?? windowState.mcpServer.windowToolsEnabled
+                ?? existing.isMCPEnabled
             generation &+= 1
             return
         }
 
-        let isEnabled = pendingEnabledByUnknownID.removeValue(forKey: windowID)
-            ?? windowState.mcpServer.windowToolsEnabled
-        entriesByID[windowID] = Entry(windowState: windowState, isMCPEnabled: isEnabled)
+        let isEnabled = pendingEnabledByUnknownID.removeValue(forKey: windowID) ?? false
+        entriesByID[windowID] = Entry(session: session, isMCPEnabled: isEnabled)
         orderedIDs.append(windowID)
         generation &+= 1
     }
@@ -112,7 +114,7 @@ final class MCPRuntimeSessionRegistry {
         let activeIDs = orderedIDs.filter { windowID in
             guard let entry = entriesByID[windowID],
                   entry.lifecycle == .active,
-                  entry.windowState != nil
+                  entry.session != nil
             else {
                 return false
             }
@@ -126,28 +128,28 @@ final class MCPRuntimeSessionRegistry {
         )
     }
 
-    func window(withID windowID: Int, includeDraining: Bool = false) -> WindowState? {
+    func session(withRoutingID windowID: Int, includeDraining: Bool = false) -> RepoPromptCoreSession? {
         guard let entry = entriesByID[windowID],
               includeDraining || entry.lifecycle == .active
         else {
             return nil
         }
-        return entry.windowState
+        return entry.session
     }
 
-    func windowStates(includeDraining: Bool = false) -> [WindowState] {
-        orderedIDs.compactMap { window(withID: $0, includeDraining: includeDraining) }
+    func sessions(includeDraining: Bool = false) -> [RepoPromptCoreSession] {
+        orderedIDs.compactMap { session(withRoutingID: $0, includeDraining: includeDraining) }
     }
 
     func hasActiveWindow(id windowID: Int) -> Bool {
-        window(withID: windowID) != nil
+        session(withRoutingID: windowID) != nil
     }
 
     func hasMCPEnabledWindow(id windowID: Int) -> Bool {
         guard let entry = entriesByID[windowID],
               entry.lifecycle == .active,
               entry.isMCPEnabled,
-              entry.windowState != nil
+              entry.session != nil
         else {
             return false
         }

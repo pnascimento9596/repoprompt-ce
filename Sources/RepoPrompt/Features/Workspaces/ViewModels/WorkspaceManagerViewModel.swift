@@ -435,6 +435,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     let fileManager: WorkspaceFilesViewModel
     let promptViewModel: PromptViewModel
     let workspaceSearchService: WorkspaceSearchService
+    let workspaceRepository: WorkspaceRepository
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
 
     @Published var isChatBusy: Bool = false
@@ -1172,7 +1173,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     init(
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
-        workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService()
+        workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
+        workspaceRepository: WorkspaceRepository = WorkspaceRepository()
     ) {
         #if DEBUG
             let initStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -1180,6 +1182,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.fileManager = fileManager
         self.promptViewModel = promptViewModel
         self.workspaceSearchService = workspaceSearchService
+        self.workspaceRepository = workspaceRepository
         self.promptViewModel.attachWorkspaceManager(self)
         self.fileManager.setWorkspaceManager(self)
 
@@ -1599,37 +1602,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// decode cache when the on-disk file metadata is unchanged.
     /// Use this when you need guaranteed accurate workspace data (e.g., for MCP tool responses).
     func loadWorkspaceSnapshotFromDisk() async -> [WorkspaceModel] {
-        let base = currentBaseRoot
-        let indexURL = workspaceIndexFileURL
-
-        return await Task.detached(priority: .utility) {
-            let indexEntries = Self.loadWorkspaceIndex(from: indexURL)
-            var loaded: [WorkspaceModel] = []
-
-            for entry in indexEntries {
-                let wURL: URL
-                if let customURL = entry.customStoragePath {
-                    wURL = customURL.appendingPathComponent("workspace.json")
-                } else {
-                    let folder = base.appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
-                    wURL = folder.appendingPathComponent("workspace.json")
-                }
-
-                if FileManager.default.fileExists(atPath: wURL.path) {
-                    do {
-                        let ws = try Self.loadWorkspaceFromFile(at: wURL)
-                        print("[WorkspaceSnapshot] Loaded \(ws.name): \(ws.repoPaths.count) repoPaths")
-                        loaded.append(ws)
-                    } catch {
-                        print("[WorkspaceSnapshot] Failed to load from \(wURL.path): \(error)")
-                    }
-                } else {
-                    print("[WorkspaceSnapshot] File not found: \(wURL.path)")
-                }
-            }
-
-            return loaded
-        }.value
+        await workspaceRepository.loadWorkspaceSnapshotFromDisk(baseRoot: currentBaseRoot)
     }
 
     /// Reloads only the presets for all workspaces from disk

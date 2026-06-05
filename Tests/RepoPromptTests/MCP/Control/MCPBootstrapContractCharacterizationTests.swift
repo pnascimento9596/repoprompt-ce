@@ -107,7 +107,7 @@ final class MCPBootstrapContractCharacterizationTests: XCTestCase {
         XCTAssertTrue(interactive.contains("payload.append(UInt8(ascii: \"\\n\"))"))
     }
 
-    private func jsonObject<T: Encodable>(_ value: T) throws -> NSDictionary {
+    private func jsonObject(_ value: some Encodable) throws -> NSDictionary {
         let data = try JSONEncoder().encode(value)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? NSDictionary)
     }

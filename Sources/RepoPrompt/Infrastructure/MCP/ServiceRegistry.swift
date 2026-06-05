@@ -9,12 +9,12 @@
 /// consumers receive immutable snapshots so request hot paths never scan service catalogs.
 @MainActor
 final class MCPServiceRegistry {
-    enum Scope: Equatable, Sendable {
+    enum Scope: Equatable {
         case host
         case window(Int)
     }
 
-    enum Role: Sendable {
+    enum Role {
         case ordinary
         case contextRouting
         case appSettings
@@ -80,9 +80,9 @@ final class MCPServiceRegistry {
             #else
                 let serviceTools = await service.tools
             #endif
-            guard let self, self.contains(service) else { return }
+            guard let self, contains(service) else { return }
             await ToolAvailabilityStore.shared.registerTools(serviceTools)
-            await self.publishSnapshotChangeIfCurrent(expectedGeneration: registrationGeneration)
+            await publishSnapshotChangeIfCurrent(expectedGeneration: registrationGeneration)
         }
     }
 

@@ -152,9 +152,11 @@ final class MCPServerViewModel: ObservableObject {
 
     // ---------------------------------------------------------------------
     let windowID: Int
+    let coreSessionHandle: RepoPromptCoreSessionHandle
     private(set) var service: MCPService
     private let runtimeSessionRegistry: MCPRuntimeSessionRegistry
     private let serviceRegistry: MCPServiceRegistry
+    private let appSessionAdapters: RepoPromptAppSessionAdapterRegistry
     private let logger = Logger(label: "com.repoprompt.mcp")
 
     private var oracleToolService: MCPOracleToolService {
@@ -1566,6 +1568,8 @@ final class MCPServerViewModel: ObservableObject {
         oracleVM: OracleViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         selectionCoordinator: WorkspaceSelectionCoordinator? = nil,
+        coreSessionHandle: RepoPromptCoreSessionHandle,
+        appSessionAdapters: RepoPromptAppSessionAdapterRegistry = .shared,
         windowID: Int,
         workspaceSearch: @escaping WorkspaceSearchHandler,
         ensureGitDataRootLoaded: @escaping (WorkspaceModel?, WorkspaceManagerViewModel?) async -> Void,
@@ -1574,6 +1578,8 @@ final class MCPServerViewModel: ObservableObject {
         self.service = service
         runtimeSessionRegistry = service.runtimeSessionRegistry
         serviceRegistry = service.serviceRegistry
+        self.coreSessionHandle = coreSessionHandle
+        self.appSessionAdapters = appSessionAdapters
         self.windowID = windowID
         self.promptVM = promptVM
         self.oracleVM = oracleVM
@@ -1689,7 +1695,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Brings this window to front to show the approval overlay
     @MainActor
     private func bringWindowToFront() {
-        guard let windowState = runtimeSessionRegistry.window(withID: windowID),
+        guard let windowState = appSessionAdapters.window(withID: windowID),
               let nsWindow = windowState.nsWindow
         else {
             return
@@ -1779,7 +1785,14 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     func windowDidRegister() {
         runtimeSessionRegistry.setMCPEnabled(windowID: windowID, enabled: windowToolsEnabled)
-        Task { await updateToolRegistration(invalidateCatalogBeforeUpdate: false) }
+        if windowToolsEnabled {
+            Task { await updateToolRegistration(invalidateCatalogBeforeUpdate: false) }
+        } else {
+            // Keep the disabled path synchronous so an older registration task cannot
+            // unregister a newer explicit catalog installation.
+            serviceRegistry.unregister(windowToolCatalogService)
+            Task { await service.leave(windowID: windowID) }
+        }
     }
 
     /// Remove routing eligibility before asynchronous listener and catalog cleanup completes.
@@ -2503,7 +2516,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func requireTargetWindow() throws -> WindowState {
-        guard let targetWindow = runtimeSessionRegistry.window(withID: windowID) else {
+        guard let targetWindow = appSessionAdapters.window(withID: windowID) else {
             throw MCPError.invalidParams("No valid target window found")
         }
         return targetWindow
@@ -2572,7 +2585,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private func existingTabContextBindingAcrossWindows(for connectionID: UUID) -> ConnectionBindingSnapshot? {
-        let snapshots = runtimeSessionRegistry.windowStates().map {
+        let snapshots = appSessionAdapters.windowStates().map {
             $0.mcpServer.connectionBindingSnapshot(forConnection: connectionID)
         }
         if let explicit = snapshots.first(where: { $0.bindingKind == .tabContext && $0.explicitlyBound && $0.runID == nil }) {

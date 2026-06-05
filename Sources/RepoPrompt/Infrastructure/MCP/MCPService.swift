@@ -150,6 +150,13 @@ actor MCPService: Sendable {
     }
 
     func leave(windowID: Int) async {
+        let isStillEligible = await MainActor.run {
+            runtimeSessionRegistry.hasMCPEnabledWindow(id: windowID)
+        }
+        guard !isStillEligible else {
+            mcpServiceLog("Ignoring stale MCP leave for re-enabled window \(windowID)")
+            return
+        }
         let removed = participatingWindows.remove(windowID) != nil
         mcpServiceLog("Window \(windowID) leaving MCP (removed: \(removed), remaining: \(participatingWindows.count))")
 

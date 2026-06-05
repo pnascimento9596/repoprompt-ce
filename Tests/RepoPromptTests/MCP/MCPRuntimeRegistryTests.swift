@@ -7,45 +7,42 @@ import XCTest
 final class MCPRuntimeSessionRegistryTests: XCTestCase {
     func testPendingEnableInsertionOrderDrainingAndRetirement() {
         let registry = MCPRuntimeSessionRegistry()
-        let first = Self.makeWindowWithoutAutoStart()
-        let second = Self.makeWindowWithoutAutoStart()
-        defer {
-            let sharedRegistry = ServerNetworkManager.shared.runtimeSessionRegistry
-            sharedRegistry.remove(windowID: first.windowID)
-            sharedRegistry.remove(windowID: second.windowID)
-        }
+        let repository = WorkspaceRepository()
+        let policy = UnrestrictedWorkspaceAccessPolicy()
+        let first = RepoPromptCoreSession(
+            routingSessionID: MCPRoutingSessionID(rawValue: 1),
+            workspaceRepository: repository,
+            workspaceAccessPolicy: policy
+        )
+        let second = RepoPromptCoreSession(
+            routingSessionID: MCPRoutingSessionID(rawValue: 2),
+            workspaceRepository: repository,
+            workspaceAccessPolicy: policy
+        )
 
-        registry.setMCPEnabled(windowID: first.windowID, enabled: true)
-        registry.register(windowState: first)
-        registry.register(windowState: second)
-        registry.setMCPEnabled(windowID: second.windowID, enabled: true)
+        registry.setMCPEnabled(windowID: first.routingSessionID.rawValue, enabled: true)
+        registry.register(session: first)
+        registry.register(session: second)
+        registry.setMCPEnabled(windowID: second.routingSessionID.rawValue, enabled: true)
 
         var snapshot = registry.routingSnapshot()
-        XCTAssertEqual(snapshot.orderedActiveWindowIDs, [first.windowID, second.windowID])
-        XCTAssertEqual(snapshot.firstMCPEnabledWindowID, first.windowID)
+        XCTAssertEqual(snapshot.orderedActiveWindowIDs, [1, 2])
+        XCTAssertEqual(snapshot.firstMCPEnabledWindowID, 1)
         XCTAssertTrue(snapshot.isMultiWindowModeEffectivelyActive)
 
-        registry.beginDraining(windowID: first.windowID)
+        registry.beginDraining(windowID: 1)
         snapshot = registry.routingSnapshot()
-        XCTAssertEqual(snapshot.orderedActiveWindowIDs, [second.windowID])
-        XCTAssertEqual(snapshot.firstMCPEnabledWindowID, second.windowID)
-        XCTAssertFalse(registry.isInvocationAllowed(windowID: first.windowID))
+        XCTAssertEqual(snapshot.orderedActiveWindowIDs, [2])
+        XCTAssertEqual(snapshot.firstMCPEnabledWindowID, 2)
+        XCTAssertFalse(registry.isInvocationAllowed(windowID: 1))
 
-        registry.remove(windowID: first.windowID)
-        registry.setMCPEnabled(windowID: first.windowID, enabled: true)
-        registry.register(windowState: first)
-        XCTAssertFalse(registry.hasActiveWindow(id: first.windowID))
+        registry.remove(windowID: 1)
+        registry.setMCPEnabled(windowID: 1, enabled: true)
+        registry.register(session: first)
+        XCTAssertFalse(registry.hasActiveWindow(id: 1))
         #if DEBUG
-            XCTAssertTrue(registry.debugIsRetired(windowID: first.windowID))
+            XCTAssertTrue(registry.debugIsRetired(windowID: 1))
         #endif
-    }
-
-    private static func makeWindowWithoutAutoStart() -> WindowState {
-        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
-        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        return window
     }
 }
 

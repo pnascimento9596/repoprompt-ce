@@ -27,10 +27,16 @@ private let log = Logger(label: "com.repoprompt.mcp.readiness")
 actor MCPToolCatalogReadiness {
     private let runtimeSessionRegistry: MCPRuntimeSessionRegistry
     private let serviceRegistry: MCPServiceRegistry
+    private let appSessionAdapters: RepoPromptAppSessionAdapterRegistry
 
-    init(runtimeSessionRegistry: MCPRuntimeSessionRegistry, serviceRegistry: MCPServiceRegistry) {
+    init(
+        runtimeSessionRegistry: MCPRuntimeSessionRegistry,
+        serviceRegistry: MCPServiceRegistry,
+        appSessionAdapters: RepoPromptAppSessionAdapterRegistry
+    ) {
         self.runtimeSessionRegistry = runtimeSessionRegistry
         self.serviceRegistry = serviceRegistry
+        self.appSessionAdapters = appSessionAdapters
     }
 
     /// Default timeout for readiness wait
@@ -75,7 +81,7 @@ actor MCPToolCatalogReadiness {
     func warmToolCache(windowID: Int) async {
         // Get the MCPServerViewModel on MainActor
         let mcpServer: MCPServerViewModel? = await MainActor.run {
-            runtimeSessionRegistry.window(withID: windowID)?.mcpServer
+            appSessionAdapters.window(withID: windowID)?.mcpServer
         }
 
         guard let mcpServer else {
@@ -100,7 +106,9 @@ actor MCPToolCatalogReadiness {
     private func checkServicesReady(windowID: Int?) -> Bool {
         if let windowID {
             // Check if the window exists
-            guard let window = runtimeSessionRegistry.window(withID: windowID) else {
+            guard runtimeSessionRegistry.hasActiveWindow(id: windowID),
+                  let window = appSessionAdapters.window(withID: windowID)
+            else {
                 mcpToolCatalogReadinessLog("Window \(windowID) not found during readiness check")
                 return false
             }
@@ -130,12 +138,11 @@ actor MCPToolCatalogReadiness {
         }
 
         // Check if the window's catalog service is committed in the indexed catalog.
-        let catalogService = runtimeSessionRegistry.window(withID: windowID)?.mcpServer.windowMCPToolCatalogService
-        let isWindowServiceCommitted: Bool
-        if let catalogService {
-            isWindowServiceCommitted = serviceRegistry.committedSnapshotContains(catalogService)
+        let catalogService = appSessionAdapters.window(withID: windowID)?.mcpServer.windowMCPToolCatalogService
+        let isWindowServiceCommitted: Bool = if let catalogService {
+            serviceRegistry.committedSnapshotContains(catalogService)
         } else {
-            isWindowServiceCommitted = false
+            false
         }
 
         if !isWindowServiceCommitted {
