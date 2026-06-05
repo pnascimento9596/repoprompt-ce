@@ -4,47 +4,39 @@ import Dispatch
 import Foundation
 import RepoPromptCore
 
-/// macOS adapter for CoreServices FSEvents lifecycle and raw-flag translation.
-///
-/// Reusable filesystem policy receives only deep-copied, semantic `FileSystemWatchEvent` values.
-/// Stream references, callback context retention, and native bit mapping remain adapter-owned.
-package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendable {
-    private let path: String
-    private let callbackQueue: DispatchQueue
-    private let lock = NSLock()
-    private var streamRef: FSEventStreamRef?
-    private var retainedSelfPointer: UnsafeMutableRawPointer?
-    private var eventHandler: (@Sendable (FileSystemWatchEventPayload) -> Void)?
+package protocol MacOSFSEventStreamToken: AnyObject, Sendable {}
 
-    package init(path: String) {
-        self.path = path
-        callbackQueue = DispatchQueue(
-            label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
-            qos: .utility
-        )
+package protocol MacOSFSEventStreamBackend: Sendable {
+    func createStream(
+        path: String,
+        callback: FSEventStreamCallback,
+        contextInfo: UnsafeMutableRawPointer,
+        callbackQueue: DispatchQueue
+    ) -> (any MacOSFSEventStreamToken)?
+
+    func startStream(_ stream: any MacOSFSEventStreamToken) -> Bool
+
+    func disposeStream(_ stream: any MacOSFSEventStreamToken, wasStarted: Bool)
+}
+
+private final class CoreServicesFSEventStreamToken: MacOSFSEventStreamToken, @unchecked Sendable {
+    let stream: FSEventStreamRef
+
+    init(stream: FSEventStreamRef) {
+        self.stream = stream
     }
+}
 
-    package var isWatching: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return streamRef != nil
-    }
-
-    @discardableResult
-    package func start(eventHandler: @escaping @Sendable (FileSystemWatchEventPayload) -> Void) -> Bool {
-        lock.lock()
-        guard streamRef == nil else {
-            lock.unlock()
-            return true
-        }
-        self.eventHandler = eventHandler
-        let retainedSelfPointer = Unmanaged.passRetained(self).toOpaque()
-        self.retainedSelfPointer = retainedSelfPointer
-        lock.unlock()
-
+private struct CoreServicesFSEventStreamBackend: MacOSFSEventStreamBackend {
+    func createStream(
+        path: String,
+        callback: FSEventStreamCallback,
+        contextInfo: UnsafeMutableRawPointer,
+        callbackQueue: DispatchQueue
+    ) -> (any MacOSFSEventStreamToken)? {
         var streamContext = FSEventStreamContext(
             version: 0,
-            info: retainedSelfPointer,
+            info: contextInfo,
             retain: nil,
             release: nil,
             copyDescription: nil
@@ -54,84 +46,277 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
                 | kFSEventStreamCreateFlagFileEvents
                 | kFSEventStreamCreateFlagNoDefer
         )
-        let createdStream = FSEventStreamCreate(
+        guard let stream = FSEventStreamCreate(
             kCFAllocatorDefault,
-            Self.callback,
+            callback,
             &streamContext,
             [path] as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
             0,
             createFlags
+        ) else { return nil }
+
+        FSEventStreamSetDispatchQueue(stream, callbackQueue)
+        return CoreServicesFSEventStreamToken(stream: stream)
+    }
+
+    func startStream(_ stream: any MacOSFSEventStreamToken) -> Bool {
+        guard let token = stream as? CoreServicesFSEventStreamToken else {
+            assertionFailure("Unexpected FSEvents stream token type")
+            return false
+        }
+        return FSEventStreamStart(token.stream)
+    }
+
+    func disposeStream(_ stream: any MacOSFSEventStreamToken, wasStarted: Bool) {
+        guard let token = stream as? CoreServicesFSEventStreamToken else {
+            assertionFailure("Unexpected FSEvents stream token type")
+            return
+        }
+        if wasStarted {
+            FSEventStreamStop(token.stream)
+            FSEventStreamFlushSync(token.stream)
+        }
+        FSEventStreamInvalidate(token.stream)
+        FSEventStreamRelease(token.stream)
+    }
+}
+
+/// macOS adapter for CoreServices FSEvents lifecycle and raw-flag translation.
+///
+/// Reusable filesystem policy receives only deep-copied, semantic `FileSystemWatchEvent` values.
+/// Stream references, callback context retention, and native bit mapping remain adapter-owned.
+package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendable {
+    private let path: String
+    private let callbackQueue: DispatchQueue
+    private let disposalQueue: DispatchQueue
+    private let streamBackend: any MacOSFSEventStreamBackend
+    private let callbackQueueToken = CallbackQueueToken()
+    private let condition = NSCondition()
+    private var lifecycleState: LifecycleState = .idle
+    private var nextGeneration: UInt64 = 0
+
+    package convenience init(path: String) {
+        self.init(path: path, streamBackend: CoreServicesFSEventStreamBackend())
+    }
+
+    package init(path: String, streamBackend: any MacOSFSEventStreamBackend) {
+        self.path = path
+        self.streamBackend = streamBackend
+        callbackQueue = DispatchQueue(
+            label: "com.repoprompt.filesystem.fsevents.\(UUID().uuidString)",
+            qos: .utility
         )
-        guard let createdStream else {
-            releaseRetainedSelfPointerIfNeeded()
-            print("Failed to create FSEventStream for \(path)")
-            return false
-        }
+        disposalQueue = DispatchQueue(
+            label: "com.repoprompt.filesystem.fsevents.dispose.\(UUID().uuidString)",
+            qos: .utility
+        )
+        callbackQueue.setSpecific(key: Self.callbackQueueKey, value: callbackQueueToken)
+    }
 
-        FSEventStreamSetDispatchQueue(createdStream, callbackQueue)
-        guard FSEventStreamStart(createdStream) else {
-            FSEventStreamInvalidate(createdStream)
-            FSEventStreamRelease(createdStream)
-            releaseRetainedSelfPointerIfNeeded()
-            print("Failed to start FSEventStream for \(path)")
-            return false
+    package var isWatching: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        if case .watching = lifecycleState {
+            return true
         }
+        return false
+    }
 
-        lock.lock()
-        streamRef = createdStream
-        lock.unlock()
-        return true
+    @discardableResult
+    package func start(eventHandler: @escaping @Sendable (FileSystemWatchEventPayload) -> Void) -> Bool {
+        while true {
+            condition.lock()
+            switch lifecycleState {
+            case .idle:
+                let generation = nextGenerationLocked()
+                let context = CallbackContext(watcher: self, generation: generation)
+                let attempt = StartAttempt(
+                    generation: generation,
+                    handler: eventHandler,
+                    context: context
+                )
+                lifecycleState = .starting(attempt)
+                condition.unlock()
+                return runStartAttempt(attempt)
+            case .watching:
+                condition.unlock()
+                return true
+            case .starting:
+                condition.wait()
+                condition.unlock()
+            }
+        }
     }
 
     package func stop() {
-        lock.lock()
-        let stream = streamRef
-        streamRef = nil
-        eventHandler = nil
-        lock.unlock()
-
-        if let stream {
-            FSEventStreamStop(stream)
-            FSEventStreamFlushSync(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
+        let disposal: StreamDisposal?
+        condition.lock()
+        switch lifecycleState {
+        case .idle:
+            condition.unlock()
+            return
+        case .starting:
+            lifecycleState = .idle
+            condition.broadcast()
+            condition.unlock()
+            return
+        case .watching(let activeStream):
+            lifecycleState = .idle
+            condition.broadcast()
+            disposal = StreamDisposal(
+                stream: activeStream.stream,
+                wasStarted: true,
+                context: activeStream.context
+            )
+            condition.unlock()
         }
-        releaseRetainedSelfPointerIfNeeded()
+
+        if let disposal {
+            disposeStream(disposal)
+        }
     }
 
     deinit {
         stop()
     }
 
-    private func accept(_ payload: FileSystemWatchEventPayload) {
-        lock.lock()
-        let eventHandler = eventHandler
-        lock.unlock()
-        eventHandler?(payload)
+    private func runStartAttempt(_ attempt: StartAttempt) -> Bool {
+        guard let stream = streamBackend.createStream(
+            path: path,
+            callback: Self.callback,
+            contextInfo: Unmanaged.passUnretained(attempt.context).toOpaque(),
+            callbackQueue: callbackQueue
+        ) else {
+            clearStartingAttemptIfCurrent(attempt)
+            print("Failed to create FSEventStream for \(path)")
+            return false
+        }
+
+        guard isStartingAttemptCurrent(attempt) else {
+            disposeStream(StreamDisposal(
+                stream: stream,
+                wasStarted: false,
+                context: attempt.context
+            ))
+            return false
+        }
+
+        guard streamBackend.startStream(stream) else {
+            clearStartingAttemptIfCurrent(attempt)
+            disposeStream(StreamDisposal(
+                stream: stream,
+                wasStarted: false,
+                context: attempt.context
+            ))
+            print("Failed to start FSEventStream for \(path)")
+            return false
+        }
+
+        condition.lock()
+        let shouldCommit: Bool
+        if case .starting(let currentAttempt) = lifecycleState,
+           currentAttempt.generation == attempt.generation
+        {
+            lifecycleState = .watching(ActiveStream(
+                generation: attempt.generation,
+                handler: attempt.handler,
+                stream: stream,
+                context: attempt.context
+            ))
+            condition.broadcast()
+            shouldCommit = true
+        } else {
+            shouldCommit = false
+        }
+        condition.unlock()
+
+        if shouldCommit {
+            return true
+        }
+
+        disposeStream(StreamDisposal(
+            stream: stream,
+            wasStarted: true,
+            context: attempt.context
+        ))
+        return false
     }
 
-    private func releaseRetainedSelfPointerIfNeeded() {
-        lock.lock()
-        let pointer = retainedSelfPointer
-        retainedSelfPointer = nil
-        lock.unlock()
-        if let pointer {
-            Unmanaged<MacOSFSEventsWatcher>.fromOpaque(pointer).release()
+    @discardableResult
+    private func clearStartingAttemptIfCurrent(_ attempt: StartAttempt) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard case .starting(let currentAttempt) = lifecycleState,
+              currentAttempt.generation == attempt.generation
+        else { return false }
+        lifecycleState = .idle
+        condition.broadcast()
+        return true
+    }
+
+    private func isStartingAttemptCurrent(_ attempt: StartAttempt) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard case .starting(let currentAttempt) = lifecycleState else {
+            return false
+        }
+        return currentAttempt.generation == attempt.generation
+    }
+
+    private func accept(_ payload: FileSystemWatchEventPayload, generation: UInt64) {
+        let handler: (@Sendable (FileSystemWatchEventPayload) -> Void)?
+        condition.lock()
+        switch lifecycleState {
+        case .starting(let attempt) where attempt.generation == generation:
+            handler = attempt.handler
+        case .watching(let activeStream) where activeStream.generation == generation:
+            handler = activeStream.handler
+        case .idle, .starting, .watching:
+            handler = nil
+        }
+        condition.unlock()
+
+        handler?(payload)
+    }
+
+    private func disposeStream(_ disposal: StreamDisposal) {
+        let streamBackend = streamBackend
+        let disposalQueue = disposalQueue
+        let dispose: @Sendable () -> Void = {
+            withExtendedLifetime(disposal.context) {
+                streamBackend.disposeStream(disposal.stream, wasStarted: disposal.wasStarted)
+            }
+        }
+
+        if DispatchQueue.getSpecific(key: Self.callbackQueueKey) === callbackQueueToken {
+            disposalQueue.async(execute: dispose)
+        } else {
+            dispose()
         }
     }
+
+    private func nextGenerationLocked() -> UInt64 {
+        nextGeneration &+= 1
+        if nextGeneration == 0 {
+            nextGeneration = 1
+        }
+        return nextGeneration
+    }
+
+    private static let callbackQueueKey = DispatchSpecificKey<CallbackQueueToken>()
 
     private static let callback: FSEventStreamCallback = {
         _, context, numEvents, eventPaths, eventFlags, eventIDs in
         guard let context else { return }
-        let watcher = Unmanaged<MacOSFSEventsWatcher>.fromOpaque(context).takeUnretainedValue()
+        let callbackContext = Unmanaged<CallbackContext>.fromOpaque(context).takeUnretainedValue()
         guard let payload = buildOwnedPayload(
             numEvents: Int(numEvents),
             eventPaths: eventPaths,
             eventFlags: eventFlags,
             eventIDs: eventIDs
         ) else { return }
-        watcher.accept(payload)
+        callbackContext.watcher?.accept(payload, generation: callbackContext.generation)
     }
 
     package nonisolated static func buildOwnedPayload(
@@ -218,6 +403,43 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
         CFStringGetCharacters(source, CFRange(location: 0, length: length), &utf16Buffer)
         return String(utf16CodeUnits: utf16Buffer, count: utf16Buffer.count)
     }
+
+    private enum LifecycleState {
+        case idle
+        case starting(StartAttempt)
+        case watching(ActiveStream)
+    }
+
+    private struct StartAttempt {
+        let generation: UInt64
+        let handler: @Sendable (FileSystemWatchEventPayload) -> Void
+        let context: CallbackContext
+    }
+
+    private struct ActiveStream {
+        let generation: UInt64
+        let handler: @Sendable (FileSystemWatchEventPayload) -> Void
+        let stream: any MacOSFSEventStreamToken
+        let context: CallbackContext
+    }
+
+    private struct StreamDisposal: @unchecked Sendable {
+        let stream: any MacOSFSEventStreamToken
+        let wasStarted: Bool
+        let context: CallbackContext
+    }
+
+    private final class CallbackContext: @unchecked Sendable {
+        weak var watcher: MacOSFSEventsWatcher?
+        let generation: UInt64
+
+        init(watcher: MacOSFSEventsWatcher, generation: UInt64) {
+            self.watcher = watcher
+            self.generation = generation
+        }
+    }
+
+    private final class CallbackQueueToken: @unchecked Sendable {}
 }
 
 package struct MacOSFSEventsWatcherFactory: FileSystemWatcherCreating {
