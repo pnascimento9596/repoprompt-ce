@@ -14,6 +14,16 @@ import Foundation
 /// - dimensions are coarse counts/status labels only;
 /// - never pass raw paths, patterns, replacement text, file content, or diffs.
 enum EditFlowPerf {
+    struct LifecycleCorrelation {
+        let id: UUID
+        let captureEpoch: UInt64?
+    }
+
+    @TaskLocal
+    static var currentLifecycleCorrelation: LifecycleCorrelation?
+    @TaskLocal
+    static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
+
     #if DEBUG || EDIT_FLOW_PERF
         struct IntervalState {
             let signpostState: OSSignpostIntervalState?
@@ -42,11 +52,30 @@ enum EditFlowPerf {
         var chunkCount: Int?
         var taskCount: Int?
         var activeCount: Int?
+        var storeCapacity: Int?
+        var globalCapacity: Int?
+        var storeActiveCount: Int?
+        var globalActiveCount: Int?
+        var storeQueueDepth: Int?
+        var globalQueueDepth: Int?
+        var admittedFileCount: Int?
+        var scannedFileCount: Int?
+        var matchedFileCount: Int?
+        var contentMatchCount: Int?
+        var pathMatchCount: Int?
+        var errorCount: Int?
         var isError: Bool?
         var isForced: Bool?
         var isAgentMode: Bool?
         var includesToolCardDiff: Bool?
+        var limitHit: Bool?
+        var usesWorktreeProjection: Bool?
         var searchMode: String?
+        var workloadClass: String?
+        var admissionClass: String?
+        var queueAgeBucket: String?
+        var contentSource: String?
+        var freshnessPolicy: String?
         var scanKind: String?
         var fileCount: Int?
         var batchSize: Int?
@@ -82,6 +111,11 @@ enum EditFlowPerf {
         var folderCount: Int?
         var pendingRootCount: Int?
         var pendingRawEventCount: Int?
+        var rootToken: String?
+        var queueDepth: Int?
+        var waiterCount: Int?
+        var ingressSequence: UInt64?
+        var barrierSequence: UInt64?
 
         init(
             toolName: String? = nil,
@@ -97,11 +131,30 @@ enum EditFlowPerf {
             chunkCount: Int? = nil,
             taskCount: Int? = nil,
             activeCount: Int? = nil,
+            storeCapacity: Int? = nil,
+            globalCapacity: Int? = nil,
+            storeActiveCount: Int? = nil,
+            globalActiveCount: Int? = nil,
+            storeQueueDepth: Int? = nil,
+            globalQueueDepth: Int? = nil,
+            admittedFileCount: Int? = nil,
+            scannedFileCount: Int? = nil,
+            matchedFileCount: Int? = nil,
+            contentMatchCount: Int? = nil,
+            pathMatchCount: Int? = nil,
+            errorCount: Int? = nil,
             isError: Bool? = nil,
             isForced: Bool? = nil,
             isAgentMode: Bool? = nil,
             includesToolCardDiff: Bool? = nil,
+            limitHit: Bool? = nil,
+            usesWorktreeProjection: Bool? = nil,
             searchMode: String? = nil,
+            workloadClass: String? = nil,
+            admissionClass: String? = nil,
+            queueAgeBucket: String? = nil,
+            contentSource: String? = nil,
+            freshnessPolicy: String? = nil,
             scanKind: String? = nil,
             fileCount: Int? = nil,
             batchSize: Int? = nil,
@@ -136,7 +189,12 @@ enum EditFlowPerf {
             rootCount: Int? = nil,
             folderCount: Int? = nil,
             pendingRootCount: Int? = nil,
-            pendingRawEventCount: Int? = nil
+            pendingRawEventCount: Int? = nil,
+            rootToken: String? = nil,
+            queueDepth: Int? = nil,
+            waiterCount: Int? = nil,
+            ingressSequence: UInt64? = nil,
+            barrierSequence: UInt64? = nil
         ) {
             self.toolName = Self.sanitizedLabel(toolName)
             self.runPurpose = Self.sanitizedLabel(runPurpose)
@@ -151,11 +209,30 @@ enum EditFlowPerf {
             self.chunkCount = Self.nonNegative(chunkCount)
             self.taskCount = Self.nonNegative(taskCount)
             self.activeCount = Self.nonNegative(activeCount)
+            self.storeCapacity = Self.nonNegative(storeCapacity)
+            self.globalCapacity = Self.nonNegative(globalCapacity)
+            self.storeActiveCount = Self.nonNegative(storeActiveCount)
+            self.globalActiveCount = Self.nonNegative(globalActiveCount)
+            self.storeQueueDepth = Self.nonNegative(storeQueueDepth)
+            self.globalQueueDepth = Self.nonNegative(globalQueueDepth)
+            self.admittedFileCount = Self.nonNegative(admittedFileCount)
+            self.scannedFileCount = Self.nonNegative(scannedFileCount)
+            self.matchedFileCount = Self.nonNegative(matchedFileCount)
+            self.contentMatchCount = Self.nonNegative(contentMatchCount)
+            self.pathMatchCount = Self.nonNegative(pathMatchCount)
+            self.errorCount = Self.nonNegative(errorCount)
             self.isError = isError
             self.isForced = isForced
             self.isAgentMode = isAgentMode
             self.includesToolCardDiff = includesToolCardDiff
+            self.limitHit = limitHit
+            self.usesWorktreeProjection = usesWorktreeProjection
             self.searchMode = Self.sanitizedLabel(searchMode)
+            self.workloadClass = Self.sanitizedLabel(workloadClass)
+            self.admissionClass = Self.sanitizedLabel(admissionClass)
+            self.queueAgeBucket = Self.sanitizedLabel(queueAgeBucket)
+            self.contentSource = Self.sanitizedLabel(contentSource)
+            self.freshnessPolicy = Self.sanitizedLabel(freshnessPolicy)
             self.scanKind = Self.sanitizedLabel(scanKind)
             self.fileCount = Self.nonNegative(fileCount)
             self.batchSize = Self.nonNegative(batchSize)
@@ -191,6 +268,11 @@ enum EditFlowPerf {
             self.folderCount = Self.nonNegative(folderCount)
             self.pendingRootCount = Self.nonNegative(pendingRootCount)
             self.pendingRawEventCount = Self.nonNegative(pendingRawEventCount)
+            self.rootToken = Self.sanitizedLabel(rootToken)
+            self.queueDepth = Self.nonNegative(queueDepth)
+            self.waiterCount = Self.nonNegative(waiterCount)
+            self.ingressSequence = ingressSequence
+            self.barrierSequence = barrierSequence
         }
 
         fileprivate var logDescription: String {
@@ -208,11 +290,30 @@ enum EditFlowPerf {
             append("chunkCount", chunkCount, to: &parts)
             append("taskCount", taskCount, to: &parts)
             append("activeCount", activeCount, to: &parts)
+            append("storeCapacity", storeCapacity, to: &parts)
+            append("globalCapacity", globalCapacity, to: &parts)
+            append("storeActiveCount", storeActiveCount, to: &parts)
+            append("globalActiveCount", globalActiveCount, to: &parts)
+            append("storeQueueDepth", storeQueueDepth, to: &parts)
+            append("globalQueueDepth", globalQueueDepth, to: &parts)
+            append("admittedFileCount", admittedFileCount, to: &parts)
+            append("scannedFileCount", scannedFileCount, to: &parts)
+            append("matchedFileCount", matchedFileCount, to: &parts)
+            append("contentMatchCount", contentMatchCount, to: &parts)
+            append("pathMatchCount", pathMatchCount, to: &parts)
+            append("errorCount", errorCount, to: &parts)
             append("isError", isError, to: &parts)
             append("isForced", isForced, to: &parts)
             append("isAgentMode", isAgentMode, to: &parts)
             append("includesToolCardDiff", includesToolCardDiff, to: &parts)
+            append("limitHit", limitHit, to: &parts)
+            append("usesWorktreeProjection", usesWorktreeProjection, to: &parts)
             append("searchMode", searchMode, to: &parts)
+            append("workloadClass", workloadClass, to: &parts)
+            append("admissionClass", admissionClass, to: &parts)
+            append("queueAgeBucket", queueAgeBucket, to: &parts)
+            append("contentSource", contentSource, to: &parts)
+            append("freshnessPolicy", freshnessPolicy, to: &parts)
             append("scanKind", scanKind, to: &parts)
             append("fileCount", fileCount, to: &parts)
             append("batchSize", batchSize, to: &parts)
@@ -248,6 +349,11 @@ enum EditFlowPerf {
             append("folderCount", folderCount, to: &parts)
             append("pendingRootCount", pendingRootCount, to: &parts)
             append("pendingRawEventCount", pendingRawEventCount, to: &parts)
+            append("rootToken", rootToken, to: &parts)
+            append("queueDepth", queueDepth, to: &parts)
+            append("waiterCount", waiterCount, to: &parts)
+            append("ingressSequence", ingressSequence, to: &parts)
+            append("barrierSequence", barrierSequence, to: &parts)
             return parts.joined(separator: " ")
         }
 
@@ -277,6 +383,11 @@ enum EditFlowPerf {
         }
 
         private func append(_ key: String, _ value: Int?, to parts: inout [String]) {
+            guard let value else { return }
+            parts.append("\(key)=\(value)")
+        }
+
+        private func append(_ key: String, _ value: UInt64?, to parts: inout [String]) {
             guard let value else { return }
             parts.append("\(key)=\(value)")
         }
@@ -317,8 +428,12 @@ enum EditFlowPerf {
             static let serviceToolLookupWindowCatalogToolsActorBodyTotal: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsActorBodyTotal"
             static let serviceToolLookupWindowCatalogToolsMaterialization: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsMaterialization"
             static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
+            static let resolvedProviderDispatch: StaticString = "EditFlow.MCPToolCall.ResolvedProviderDispatch"
+            static let handlerResultHandoff: StaticString = "EditFlow.MCPToolCall.HandlerResultHandoff"
             static let permitPostDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPostDispatchEnvelope"
             static let completionObservers: StaticString = "EditFlow.MCPToolCall.CompletionObservers"
+            static let completionObserverResultEncoding: StaticString = "EditFlow.MCPToolCall.CompletionObserverResultEncoding"
+            static let completionObserverCallbacks: StaticString = "EditFlow.MCPToolCall.CompletionObserverCallbacks"
             static let preToolFilesystemFlush: StaticString = "EditFlow.MCPToolCall.PreToolFilesystemFlush"
             static let runToolSetup: StaticString = "EditFlow.MCPToolCall.RunToolSetup"
             static let runToolRegistration: StaticString = "EditFlow.MCPToolCall.RunToolRegistration"
@@ -359,6 +474,16 @@ enum EditFlowPerf {
         }
 
         enum Search {
+            static let broadAdmissionWait: StaticString = "EditFlow.Search.BroadAdmissionWait"
+            static let broadAdmissionLeaseHold: StaticString = "EditFlow.Search.BroadAdmissionLeaseHold"
+            static let contentFetchAdmissionWait: StaticString = "EditFlow.Search.ContentFetchAdmissionWait"
+            static let contentFetchLeaseHold: StaticString = "EditFlow.Search.ContentFetchLeaseHold"
+            static let ingressFreshnessWait: StaticString = "EditFlow.Search.IngressFreshnessWait"
+            static let contentFreshnessValidation: StaticString = "EditFlow.Search.ContentFreshnessValidation"
+            static let contentFreshnessValidationStoreActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.StoreActorBody"
+            static let contentFreshnessValidationRootActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.RootActorBody"
+            static let contentScanTotal: StaticString = "EditFlow.Search.ContentScanTotal"
+            static let resultConstruction: StaticString = "EditFlow.Search.ResultConstruction"
             static let entrypoint: StaticString = "EditFlow.Search.Entrypoint"
             static let scopeFiltering: StaticString = "EditFlow.Search.ScopeFiltering"
             static let actorSearchCall: StaticString = "EditFlow.Search.ActorSearchCall"
@@ -376,6 +501,21 @@ enum EditFlowPerf {
             static let materializeMatches: StaticString = "EditFlow.Search.MaterializeMatches"
             static let catalogSnapshot: StaticString = "EditFlow.Search.CatalogSnapshot"
             static let dtoBuild: StaticString = "EditFlow.Search.DTOBuild"
+            static let dtoRootRefSnapshotLookup: StaticString = "EditFlow.Search.DTOBuild.RootRefSnapshotLookup"
+            static let dtoDisplayResolverPreparation: StaticString = "EditFlow.Search.DTOBuild.DisplayResolverPreparation"
+            static let dtoPathDisplayProjection: StaticString = "EditFlow.Search.DTOBuild.PathDisplayProjection"
+            static let dtoCapAccounting: StaticString = "EditFlow.Search.DTOBuild.CapAccounting"
+            static let dtoAssembly: StaticString = "EditFlow.Search.DTOBuild.Assembly"
+            static let providerTotal: StaticString = "EditFlow.Search.ProviderTotal"
+            static let providerWorkspaceSearchAwait: StaticString = "EditFlow.Search.ProviderWorkspaceSearchAwait"
+            static let providerAutoSelection: StaticString = "EditFlow.Search.ProviderAutoSelection"
+            static let providerValueEncoding: StaticString = "EditFlow.Search.ProviderValueEncoding"
+
+            enum AutoSelect {
+                static let shapeEligibility: StaticString = "EditFlow.Search.AutoSelect.ShapeEligibility"
+                static let agentEligibility: StaticString = "EditFlow.Search.AutoSelect.AgentEligibility"
+                static let mutation: StaticString = "EditFlow.Search.AutoSelect.Mutation"
+            }
         }
 
         enum ReadFile {
@@ -388,6 +528,11 @@ enum EditFlowPerf {
             static let providerReplyProjection: StaticString = "EditFlow.ReadFile.ProviderReplyProjection"
             static let providerAutoSelect: StaticString = "EditFlow.ReadFile.ProviderAutoSelect"
             static let providerValueEncoding: StaticString = "EditFlow.ReadFile.ProviderValueEncoding"
+            static let explicitIngressFreshnessWait: StaticString = "EditFlow.ReadFile.ExplicitIngressFreshnessWait"
+            static let exactCatalogShortcut: StaticString = "EditFlow.ReadFile.ExactCatalogShortcut"
+            static let storeReadContentForwardAwait: StaticString = "EditFlow.ReadFile.StoreReadContentForwardAwait"
+            static let folderResolutionGeneralLookupFallback: StaticString = "EditFlow.ReadFile.FolderResolutionGeneralLookupFallback"
+            static let pathLookupStaticSnapshotBuild: StaticString = "EditFlow.ReadFile.PathLookupStaticSnapshotBuild"
             static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
             static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
             static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
@@ -436,12 +581,38 @@ enum EditFlowPerf {
                 static let fullSliceClearing: StaticString = "EditFlow.ReadFile.AutoSelect.FullSliceClearing"
                 static let finalSelectionEquality: StaticString = "EditFlow.ReadFile.AutoSelect.FinalSelectionEquality"
                 static let persistence: StaticString = "EditFlow.ReadFile.AutoSelect.Persistence"
+                static let responseEnqueue: StaticString = "EditFlow.ReadFile.AutoSelect.ResponseEnqueue"
+                static let canonicalQueueWait: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalQueueWait"
+                static let canonicalMutation: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalMutation"
+                static let canonicalStoredCommit: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalStoredCommit"
+                static let mirrorEnqueue: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorEnqueue"
+                static let mirrorQueueWait: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorQueueWait"
+                static let mirrorApply: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorApply"
+                static let drainWait: StaticString = "EditFlow.ReadFile.AutoSelect.DrainWait"
                 static let sliceFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.SliceFlowTotal"
             }
         }
 
         enum FileSystem {
+            static let contentLoadTotal: StaticString = "EditFlow.FileSystem.ContentLoadTotal"
             static let contentLoadActorBody: StaticString = "EditFlow.FileSystem.ContentLoadActorBody"
+            static let contentReadRequestPreparation: StaticString = "EditFlow.FileSystem.ContentReadRequestPreparation"
+            static let contentReadOffActorAwait: StaticString = "EditFlow.FileSystem.ContentReadOffActorAwait"
+            static let contentModificationDateLookup: StaticString = "EditFlow.FileSystem.ContentModificationDateLookup"
+            static let contentReadWorkerPermitWait: StaticString = "EditFlow.FileSystem.ContentReadWorkerPermitWait"
+            static let contentReadWorkerBody: StaticString = "EditFlow.FileSystem.ContentReadWorkerBody"
+        }
+
+        enum Bootstrap {
+            static let handshakeIOQueueEnvelope: StaticString = "EditFlow.Bootstrap.HandshakeIOQueueEnvelope"
+            static let handshakeIOBlockingRead: StaticString = "EditFlow.Bootstrap.HandshakeIOBlockingRead"
+            static let admission: StaticString = "EditFlow.Bootstrap.Admission"
+            static let postAcceptStartup: StaticString = "EditFlow.Bootstrap.PostAcceptStartup"
+        }
+
+        enum WorkspaceDurability {
+            static let flushWait: StaticString = "EditFlow.WorkspaceDurability.FlushWait"
+            static let atomicWrite: StaticString = "EditFlow.WorkspaceDurability.AtomicWrite"
         }
 
         enum Transcript {
@@ -479,6 +650,128 @@ enum EditFlowPerf {
         }
     }
 
+    enum Lifecycle {
+        enum MCPToolCall {
+            static let received: StaticString = "MCP.ToolCall.Received"
+            static let routingSnapshotCompleted: StaticString = "MCP.ToolCall.RoutingSnapshotCompleted"
+            static let limiterWaitBegan: StaticString = "MCP.ToolCall.LimiterWaitBegan"
+            static let limiterAcquired: StaticString = "MCP.ToolCall.LimiterAcquired"
+            static let completionObserverReturned: StaticString = "MCP.ToolCall.CompletionObserverReturned"
+            static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
+            static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
+            static let resolvedProviderEnded: StaticString = "MCP.ToolCall.ResolvedProviderEnded"
+            static let handlerResultReady: StaticString = "MCP.ToolCall.HandlerResultReady"
+        }
+
+        enum MCPRunTool {
+            static let preflushBegan: StaticString = "MCP.RunTool.PreflushBegan"
+            static let preflushEnded: StaticString = "MCP.RunTool.PreflushEnded"
+            static let registrationScheduled: StaticString = "MCP.RunTool.RegistrationScheduled"
+            static let registrationMainActorEntered: StaticString = "MCP.RunTool.RegistrationMainActorEntered"
+            static let registrationEnded: StaticString = "MCP.RunTool.RegistrationEnded"
+            static let providerBegan: StaticString = "MCP.RunTool.ProviderBegan"
+            static let providerEnded: StaticString = "MCP.RunTool.ProviderEnded"
+            static let cleanupScheduled: StaticString = "MCP.RunTool.CleanupScheduled"
+            static let cleanupMainActorEntered: StaticString = "MCP.RunTool.CleanupMainActorEntered"
+            static let unregister: StaticString = "MCP.RunTool.Unregister"
+            static let idleWaitersResumed: StaticString = "MCP.RunTool.IdleWaitersResumed"
+            static let cleanupEnded: StaticString = "MCP.RunTool.CleanupEnded"
+            static let returned: StaticString = "MCP.RunTool.Return"
+        }
+
+        enum FileSystem {
+            static let callbackAccepted: StaticString = "FileSystem.CallbackAccepted"
+            static let serviceEnqueueEntered: StaticString = "FileSystem.ServiceEnqueueEntered"
+            static let servicePublish: StaticString = "FileSystem.ServicePublish"
+            static let contentLoadEntered: StaticString = "FileSystem.ContentLoadEntered"
+            static let contentReadRequestPrepared: StaticString = "FileSystem.ContentReadRequestPrepared"
+            static let contentReadOffActorScheduled: StaticString = "FileSystem.ContentReadOffActorScheduled"
+            static let contentReadWorkerReturned: StaticString = "FileSystem.ContentReadWorkerReturned"
+            static let contentLoadReturned: StaticString = "FileSystem.ContentLoadReturned"
+            static let contentReadWorkerPermitWaitBegan: StaticString = "FileSystem.ContentReadWorkerPermitWaitBegan"
+            static let contentReadWorkerPermitAcquired: StaticString = "FileSystem.ContentReadWorkerPermitAcquired"
+            static let contentReadWorkerPermitCancelled: StaticString = "FileSystem.ContentReadWorkerPermitCancelled"
+        }
+
+        enum Search {
+            static let contentFreshnessStoreEntered: StaticString = "Search.ContentFreshnessStoreEntered"
+            static let contentFreshnessStoreReturned: StaticString = "Search.ContentFreshnessStoreReturned"
+            static let contentFreshnessRootEntered: StaticString = "Search.ContentFreshnessRootEntered"
+            static let contentFreshnessRootReturned: StaticString = "Search.ContentFreshnessRootReturned"
+            static let broadAdmissionWaitBegan: StaticString = "Search.BroadAdmissionWaitBegan"
+            static let broadAdmissionPermitAcquired: StaticString = "Search.BroadAdmissionPermitAcquired"
+            static let broadAdmissionPermitCancelled: StaticString = "Search.BroadAdmissionPermitCancelled"
+            static let broadAdmissionPermitReleased: StaticString = "Search.BroadAdmissionPermitReleased"
+            static let broadAdmissionOverloaded: StaticString = "Search.BroadAdmissionOverloaded"
+            static let broadAdmissionWaitExpired: StaticString = "Search.BroadAdmissionWaitExpired"
+            static let contentFetchWaitBegan: StaticString = "Search.ContentFetchWaitBegan"
+            static let contentFetchPermitAcquired: StaticString = "Search.ContentFetchPermitAcquired"
+            static let contentFetchPermitCancelled: StaticString = "Search.ContentFetchPermitCancelled"
+            static let contentFetchPermitReleased: StaticString = "Search.ContentFetchPermitReleased"
+            static let contentFetchOverloaded: StaticString = "Search.ContentFetchOverloaded"
+            static let contentFetchWaitExpired: StaticString = "Search.ContentFetchWaitExpired"
+            static let providerEntered: StaticString = "Search.ProviderEntered"
+            static let providerWorkspaceSearchReturned: StaticString = "Search.ProviderWorkspaceSearchReturned"
+            static let providerDTOReady: StaticString = "Search.ProviderDTOReady"
+            static let providerAutoSelectionReturned: StaticString = "Search.ProviderAutoSelectionReturned"
+            static let providerResultReady: StaticString = "Search.ProviderResultReady"
+        }
+
+        enum ReadFile {
+            static let providerEntered: StaticString = "ReadFile.ProviderEntered"
+            static let explicitFreshnessBegan: StaticString = "ReadFile.ExplicitFreshnessBegan"
+            static let explicitFreshnessEnded: StaticString = "ReadFile.ExplicitFreshnessEnded"
+            static let exactCatalogLookupResolved: StaticString = "ReadFile.ExactCatalogLookupResolved"
+            static let exactCatalogShortcutResolved: StaticString = "ReadFile.ExactCatalogShortcutResolved"
+            static let folderResolutionReturned: StaticString = "ReadFile.FolderResolutionReturned"
+            static let readableServiceResolutionReturned: StaticString = "ReadFile.ReadableServiceResolutionReturned"
+            static let storeReadContentEntered: StaticString = "ReadFile.StoreReadContentEntered"
+            static let storeReadContentReturned: StaticString = "ReadFile.StoreReadContentReturned"
+            static let providerResultReady: StaticString = "ReadFile.ProviderResultReady"
+        }
+
+        enum Bootstrap {
+            static let socketAccepted: StaticString = "Bootstrap.SocketAccepted"
+            static let handshakeIOQueued: StaticString = "Bootstrap.HandshakeIOQueued"
+            static let handshakeIOBegan: StaticString = "Bootstrap.HandshakeIOBegan"
+            static let handshakeIOEnded: StaticString = "Bootstrap.HandshakeIOEnded"
+            static let admissionBegan: StaticString = "Bootstrap.AdmissionBegan"
+            static let admissionEnded: StaticString = "Bootstrap.AdmissionEnded"
+            static let acceptedResponseSent: StaticString = "Bootstrap.AcceptedResponseSent"
+            static let ownershipTransferred: StaticString = "Bootstrap.OwnershipTransferred"
+            static let postAcceptStartupBegan: StaticString = "Bootstrap.PostAcceptStartupBegan"
+            static let postAcceptStartupEnded: StaticString = "Bootstrap.PostAcceptStartupEnded"
+        }
+
+        enum WorkspaceIngress {
+            static let storeSinkScheduled: StaticString = "WorkspaceIngress.StoreSinkScheduled"
+            static let storeSinkBegan: StaticString = "WorkspaceIngress.StoreSinkBegan"
+            static let storeCanonicalApplyCompleted: StaticString = "WorkspaceIngress.StoreCanonicalApplyCompleted"
+            static let rootFlushBegan: StaticString = "WorkspaceIngress.RootFlushBegan"
+            static let rootFlushEnded: StaticString = "WorkspaceIngress.RootFlushEnded"
+        }
+
+        enum ReadFileAutoSelect {
+            static let enqueueAccepted: StaticString = "ReadFile.AutoSelect.EnqueueAccepted"
+            static let enqueueCoalesced: StaticString = "ReadFile.AutoSelect.EnqueueCoalesced"
+            static let canonicalApplyBegan: StaticString = "ReadFile.AutoSelect.CanonicalApplyBegan"
+            static let canonicalApplyEnded: StaticString = "ReadFile.AutoSelect.CanonicalApplyEnded"
+            static let mirrorScheduled: StaticString = "ReadFile.AutoSelect.MirrorScheduled"
+            static let mirrorCoalesced: StaticString = "ReadFile.AutoSelect.MirrorCoalesced"
+            static let mirrorApplyBegan: StaticString = "ReadFile.AutoSelect.MirrorApplyBegan"
+            static let mirrorApplyEnded: StaticString = "ReadFile.AutoSelect.MirrorApplyEnded"
+            static let drainBegan: StaticString = "ReadFile.AutoSelect.DrainBegan"
+            static let drainEnded: StaticString = "ReadFile.AutoSelect.DrainEnded"
+        }
+
+        enum WorkspaceDurability {
+            static let flushBegan: StaticString = "WorkspaceDurability.FlushBegan"
+            static let flushEnded: StaticString = "WorkspaceDurability.FlushEnded"
+            static let writeBegan: StaticString = "WorkspaceDurability.WriteBegan"
+            static let writeEnded: StaticString = "WorkspaceDurability.WriteEnded"
+        }
+    }
+
     #if DEBUG
         struct DebugCaptureStageAggregate {
             let stageName: String
@@ -506,6 +799,28 @@ enum EditFlowPerf {
             }
         }
 
+        struct DebugCaptureLifecycleEvent {
+            let ordinal: UInt64
+            let offsetMS: Double
+            let eventName: String
+            let correlationID: String
+            let sanitizedDimensions: String
+
+            var payload: [String: Any] {
+                [
+                    "ordinal": ordinal,
+                    "offset_ms": Self.roundedMS(offsetMS),
+                    "event_name": eventName,
+                    "correlation_id": correlationID,
+                    "sanitized_dimensions": sanitizedDimensions
+                ]
+            }
+
+            private static func roundedMS(_ value: Double) -> Double {
+                (value * 1000).rounded() / 1000
+            }
+        }
+
         struct DebugCaptureSnapshot {
             let label: String
             let active: Bool
@@ -515,9 +830,13 @@ enum EditFlowPerf {
             let retainedSampleCount: Int
             let droppedSampleCount: Int
             let stages: [DebugCaptureStageAggregate]
+            let maxLifecycleEvents: Int
+            let retainedLifecycleEventCount: Int
+            let droppedLifecycleEventCount: Int
+            let lifecycleEvents: [DebugCaptureLifecycleEvent]
 
-            var payload: [String: Any] {
-                [
+            func payload(includeTimeline: Bool = true) -> [String: Any] {
+                var result: [String: Any] = [
                     "label": label,
                     "active": active,
                     "started_at": startedAt?.timeIntervalSince1970 ?? NSNull(),
@@ -525,8 +844,16 @@ enum EditFlowPerf {
                     "max_samples": maxSamples,
                     "retained_sample_count": retainedSampleCount,
                     "dropped_sample_count": droppedSampleCount,
-                    "stages": stages.map(\.payload)
+                    "stages": stages.map(\.payload),
+                    "max_lifecycle_events": maxLifecycleEvents,
+                    "retained_lifecycle_event_count": retainedLifecycleEventCount,
+                    "dropped_lifecycle_event_count": droppedLifecycleEventCount,
+                    "timeline_included": includeTimeline
                 ]
+                if includeTimeline {
+                    result["lifecycle_events"] = lifecycleEvents.map(\.payload)
+                }
+                return result
             }
         }
 
@@ -577,6 +904,7 @@ enum EditFlowPerf {
 
         private final class DebugCaptureRecorder {
             private static let sampleLimitRange = 100 ... 100_000
+            private static let lifecycleEventLimit = 20000
 
             private let lock = NSLock()
             private let activeHint = DebugCaptureActiveHint()
@@ -585,10 +913,15 @@ enum EditFlowPerf {
             private var label = ""
             private var startedAt: Date?
             private var finishedAt: Date?
+            private var captureStartNanoseconds: UInt64?
             private var maxSamples = 20000
             private var retainedSampleCount = 0
             private var droppedSampleCount = 0
             private var samplesByKey: [DebugCaptureKey: [Double]] = [:]
+            private var nextLifecycleOrdinal: UInt64 = 1
+            private var retainedLifecycleEventCount = 0
+            private var droppedLifecycleEventCount = 0
+            private var lifecycleEvents: [DebugCaptureLifecycleEvent] = []
 
             var isActive: Bool {
                 if let active = activeHint.loadIfAvailable() {
@@ -610,9 +943,14 @@ enum EditFlowPerf {
                 active = true
                 startedAt = Date()
                 finishedAt = nil
+                captureStartNanoseconds = DispatchTime.now().uptimeNanoseconds
                 retainedSampleCount = 0
                 droppedSampleCount = 0
                 samplesByKey.removeAll(keepingCapacity: true)
+                nextLifecycleOrdinal = 1
+                retainedLifecycleEventCount = 0
+                droppedLifecycleEventCount = 0
+                lifecycleEvents.removeAll(keepingCapacity: true)
                 activeHint.store(true)
                 return .started(snapshotLocked())
             }
@@ -635,10 +973,15 @@ enum EditFlowPerf {
                 label = ""
                 startedAt = nil
                 finishedAt = nil
+                captureStartNanoseconds = nil
                 maxSamples = 20000
                 retainedSampleCount = 0
                 droppedSampleCount = 0
                 samplesByKey.removeAll(keepingCapacity: false)
+                nextLifecycleOrdinal = 1
+                retainedLifecycleEventCount = 0
+                droppedLifecycleEventCount = 0
+                lifecycleEvents.removeAll(keepingCapacity: false)
                 lock.unlock()
             }
 
@@ -648,6 +991,53 @@ enum EditFlowPerf {
                 defer { lock.unlock() }
                 guard active else { return nil }
                 return DebugCaptureStart(epoch: captureEpoch, startNanoseconds: DispatchTime.now().uptimeNanoseconds)
+            }
+
+            func activeEpochIfActive() -> UInt64? {
+                if let active = activeHint.loadIfAvailable(), !active { return nil }
+                lock.lock()
+                defer { lock.unlock() }
+                return active ? captureEpoch : nil
+            }
+
+            func shouldRecordLifecycleEvent(_ correlation: LifecycleCorrelation) -> Bool {
+                guard let correlationEpoch = correlation.captureEpoch else { return false }
+                if let active = activeHint.loadIfAvailable(), !active { return false }
+                lock.lock()
+                defer { lock.unlock() }
+                return active && correlationEpoch == captureEpoch
+            }
+
+            func recordLifecycleEvent(
+                eventName: String,
+                correlation: LifecycleCorrelation,
+                sanitizedDimensions: String
+            ) {
+                guard let correlationEpoch = correlation.captureEpoch else { return }
+                let nowNanoseconds = DispatchTime.now().uptimeNanoseconds
+                lock.lock()
+                defer { lock.unlock() }
+                guard active,
+                      correlationEpoch == captureEpoch,
+                      let captureStartNanoseconds
+                else { return }
+                let ordinal = nextLifecycleOrdinal
+                nextLifecycleOrdinal &+= 1
+                guard retainedLifecycleEventCount < min(maxSamples, Self.lifecycleEventLimit) else {
+                    droppedLifecycleEventCount += 1
+                    return
+                }
+                let elapsedNanoseconds = nowNanoseconds >= captureStartNanoseconds
+                    ? nowNanoseconds - captureStartNanoseconds
+                    : 0
+                lifecycleEvents.append(DebugCaptureLifecycleEvent(
+                    ordinal: ordinal,
+                    offsetMS: Double(elapsedNanoseconds) / 1_000_000.0,
+                    eventName: eventName,
+                    correlationID: correlation.id.uuidString,
+                    sanitizedDimensions: sanitizedDimensions
+                ))
+                retainedLifecycleEventCount += 1
             }
 
             func record(stageName: String, sanitizedDimensions: String, captureEpoch: UInt64, startNanoseconds: UInt64) {
@@ -706,7 +1096,11 @@ enum EditFlowPerf {
                     maxSamples: maxSamples,
                     retainedSampleCount: retainedSampleCount,
                     droppedSampleCount: droppedSampleCount,
-                    stages: stages
+                    stages: stages,
+                    maxLifecycleEvents: min(maxSamples, Self.lifecycleEventLimit),
+                    retainedLifecycleEventCount: retainedLifecycleEventCount,
+                    droppedLifecycleEventCount: droppedLifecycleEventCount,
+                    lifecycleEvents: lifecycleEvents
                 )
             }
 
@@ -846,6 +1240,45 @@ enum EditFlowPerf {
             signposter.emitEvent(name)
         }
 
+        static func makeLifecycleCorrelationIfActive() -> LifecycleCorrelation? {
+            #if DEBUG
+                let captureEpoch = debugCaptureRecorder.activeEpochIfActive()
+                guard isEnabled || captureEpoch != nil else { return nil }
+                return LifecycleCorrelation(id: UUID(), captureEpoch: captureEpoch)
+            #else
+                guard isEnabled else { return nil }
+                return LifecycleCorrelation(id: UUID(), captureEpoch: nil)
+            #endif
+        }
+
+        static func lifecycleEvent(
+            _ name: StaticString,
+            correlation: LifecycleCorrelation? = currentLifecycleCorrelation,
+            _ dimensions: @autoclosure () -> Dimensions = Dimensions()
+        ) {
+            guard let correlation else { return }
+            #if DEBUG
+                let shouldRecord = debugCaptureRecorder.shouldRecordLifecycleEvent(correlation)
+                guard isEnabled || shouldRecord else { return }
+            #else
+                guard isEnabled else { return }
+            #endif
+            let renderedDimensions = dimensions()
+            if isEnabled {
+                logDimensions(renderedDimensions)
+                signposter.emitEvent(name)
+            }
+            #if DEBUG
+                if shouldRecord {
+                    debugCaptureRecorder.recordLifecycleEvent(
+                        eventName: String(describing: name),
+                        correlation: correlation,
+                        sanitizedDimensions: renderedDimensions.logDescription
+                    )
+                }
+            #endif
+        }
+
         static func measure<T>(
             _ name: StaticString,
             operation: () throws -> T
@@ -916,6 +1349,18 @@ enum EditFlowPerf {
 
         @inline(__always)
         static func event(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) {}
+
+        @inline(__always)
+        static func makeLifecycleCorrelationIfActive() -> LifecycleCorrelation? {
+            nil
+        }
+
+        @inline(__always)
+        static func lifecycleEvent(
+            _ name: StaticString,
+            correlation: LifecycleCorrelation? = currentLifecycleCorrelation,
+            _ dimensions: @autoclosure () -> Dimensions = Dimensions()
+        ) {}
 
         @inline(__always)
         static func measure<T>(

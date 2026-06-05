@@ -13,6 +13,7 @@ load_release_metadata "$ROOT_DIR"
 
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
+DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 ARCHIVE_BASENAME="${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}"
 UPDATE_ZIP="$DIST_DIR/$ARCHIVE_BASENAME.zip"
 DMG="$DIST_DIR/$ARCHIVE_BASENAME.dmg"
@@ -140,7 +141,9 @@ package_release_candidate() {
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
     run_preflight
     validate_packaged_legal "$APP_BUNDLE"
-    ditto -c -k --norsrc --keepParent "$APP_BUNDLE" "$UPDATE_ZIP"
+    TMP_DIR="$(mktemp -d)"
+    ditto "$APP_BUNDLE" "$TMP_DIR/$DISTRIBUTION_APP_BUNDLE_NAME"
+    ditto -c -k --norsrc --keepParent "$TMP_DIR/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
     (
         cd "$DIST_DIR"
         shasum -a 256 "$(basename "$UPDATE_ZIP")" > "$(basename "$CHECKSUMS")"
@@ -340,12 +343,12 @@ publish_staged_release() {
     xcrun stapler staple "$APP_BUNDLE"
     xcrun stapler validate "$APP_BUNDLE"
 
-    ditto -c -k --norsrc --keepParent "$APP_BUNDLE" "$UPDATE_ZIP"
+    local distribution_dir="$TMP_DIR/distribution"
+    mkdir -p "$distribution_dir"
+    ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
+    ditto -c -k --norsrc --keepParent "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
 
-    local dmg_staging="$TMP_DIR/dmg"
-    mkdir -p "$dmg_staging"
-    ditto "$APP_BUNDLE" "$dmg_staging/$APP_NAME.app"
-    hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$dmg_staging" -ov -format UDZO "$DMG"
+    hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
     submit_notarization "$DMG"
     xcrun stapler staple "$DMG"
     xcrun stapler validate "$DMG"
@@ -409,12 +412,12 @@ publish_signed_test_build() {
     xcrun stapler staple "$APP_BUNDLE"
     xcrun stapler validate "$APP_BUNDLE"
 
-    ditto -c -k --norsrc --keepParent "$APP_BUNDLE" "$UPDATE_ZIP"
+    local distribution_dir="$TMP_DIR/distribution"
+    mkdir -p "$distribution_dir"
+    ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"
+    ditto -c -k --norsrc --keepParent "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME" "$UPDATE_ZIP"
 
-    local dmg_staging="$TMP_DIR/dmg"
-    mkdir -p "$dmg_staging"
-    ditto "$APP_BUNDLE" "$dmg_staging/$APP_NAME.app"
-    hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$dmg_staging" -ov -format UDZO "$DMG"
+    hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$distribution_dir" -ov -format UDZO "$DMG"
     submit_notarization "$DMG"
     xcrun stapler staple "$DMG"
     xcrun stapler validate "$DMG"

@@ -18,6 +18,7 @@ SOURCE_GH_TOKEN="${SOURCE_GH_TOKEN:-${GH_TOKEN:-}}"
 PUBLIC_UPDATE_GH_TOKEN="${PUBLIC_UPDATE_GH_TOKEN:-}"
 REVIEWED_CHECKSUMS_SHA256="${REVIEWED_CHECKSUMS_SHA256:-}"
 ARCHIVE_BASENAME="${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}"
+DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"
 UPDATE_ZIP_NAME="$ARCHIVE_BASENAME.zip"
 DMG_NAME="$ARCHIVE_BASENAME.dmg"
 APPCAST_NAME="appcast.xml"
@@ -161,8 +162,8 @@ validate_dmg_matches_zip_app() {
     mkdir -p "$DMG_MOUNT_POINT"
     hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$DMG_MOUNT_POINT" >/dev/null
 
-    local dmg_app="$DMG_MOUNT_POINT/$APP_NAME.app"
-    [[ -d "$dmg_app" ]] || fail "DMG does not contain $APP_NAME.app at its root"
+    local dmg_app="$DMG_MOUNT_POINT/$DISTRIBUTION_APP_BUNDLE_NAME"
+    [[ -d "$dmg_app" ]] || fail "DMG does not contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
@@ -288,8 +289,9 @@ verify_source_release() {
     validate_checksum_manifest
 
     ditto -x -k "$UPDATE_ZIP" "$EXTRACT_DIR"
-    [[ -d "$EXTRACT_DIR/$APP_NAME.app" ]] || fail "Update ZIP must contain $APP_NAME.app at its root"
-    APP_BUNDLE="$EXTRACT_DIR/$APP_NAME.app"
+    [[ -d "$EXTRACT_DIR/$DISTRIBUTION_APP_BUNDLE_NAME" ]] ||
+        fail "Update ZIP must contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
+    APP_BUNDLE="$EXTRACT_DIR/$DISTRIBUTION_APP_BUNDLE_NAME"
     validate_app_bundle "$APP_BUNDLE"
     xcrun stapler validate "$DMG"
     validate_dmg_matches_zip_app

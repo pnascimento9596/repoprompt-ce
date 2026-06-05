@@ -92,7 +92,7 @@ jobs:
           mkdir extracted
           ditto -x -k "${archives[0]}" extracted
           ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
-            extracted/RepoPrompt.app \
+            "extracted/RepoPrompt CE.app" \
             "Reviewed ZIP MCP helper layout"
 
       - name: Execute reviewed helper without inherited secrets
@@ -102,7 +102,7 @@ jobs:
             HOME="$HOME" \
             TMPDIR="$RUNNER_TEMP" \
             ./trusted-control-plane/Scripts/smoke_embedded_mcp_helper.sh \
-            extracted/RepoPrompt.app \
+            "extracted/RepoPrompt CE.app" \
             "Reviewed ZIP MCP helper"
 
   promote:

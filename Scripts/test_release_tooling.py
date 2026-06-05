@@ -59,6 +59,10 @@ class ReleaseToolingTests(unittest.TestCase):
             self.assertIn("validate_embedded_mcp_helper_layout.sh", privileged_script)
             self.assertNotIn("smoke_embedded_mcp_helper.sh", privileged_script)
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"', release_script)
+        self.assertIn('DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"', release_script)
+        self.assertIn('ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"', release_script)
+        self.assertIn('DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"', promote_script)
+        self.assertIn('APP_BUNDLE="$EXTRACT_DIR/$DISPLAY_NAME.app"', public_update_script)
 
     def test_embedded_mcp_helper_smoke_rejects_exit_137(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -147,6 +151,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("shasum -a 256 -c", signed_smoke)
         self.assertLess(signed_smoke.index("shasum -a 256 -c"), signed_smoke.index("ditto -x -k"))
         self.assertIn("validate_embedded_mcp_helper_layout.sh", signed_smoke)
+        self.assertIn('"extracted/RepoPrompt CE.app"', signed_smoke)
         self.assertIn("env -i", signed_smoke)
         self.assertIn("PATH=/usr/bin:/bin:/usr/sbin:/sbin", signed_smoke)
         self.assertIn('HOME="$HOME"', signed_smoke)
@@ -158,6 +163,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", reviewed_smoke)
         self.assertIn("reviewed_checksums_sha256", reviewed_smoke)
         self.assertIn("validate_embedded_mcp_helper_layout.sh", reviewed_smoke)
+        self.assertIn('"extracted/RepoPrompt CE.app"', reviewed_smoke)
         self.assertIn("env -i", reviewed_smoke)
         promote_job = promote_workflow.split("\n  promote:", 1)[1]
         self.assertIn("- smoke-reviewed-helper", promote_job)
@@ -229,6 +235,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("Provenance reachable refs must be a non-empty list", signed_test_smoke)
         self.assertIn("developer-id-signed-test-build", signed_test_smoke)
         self.assertIn("validate_embedded_mcp_helper_layout.sh", signed_test_smoke)
+        self.assertIn('"extracted/RepoPrompt CE.app"', signed_test_smoke)
         self.assertIn("env -i", signed_test_smoke)
 
         stage_test = release_script.split("stage_signed_test_build() {", 1)[1].split("\n}", 1)[0]

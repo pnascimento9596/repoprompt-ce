@@ -57,8 +57,8 @@ CHECKSUMS="$TMP_DIR/SHA256SUMS"
 mkdir -p "$EXTRACT_DIR" "$APPCAST_DIR"
 
 ditto -x -k "$UPDATE_ZIP" "$EXTRACT_DIR"
-APP_BUNDLE="$(find "$EXTRACT_DIR" -type d -name "$APP_NAME.app" -print -quit)"
-[[ -n "$APP_BUNDLE" ]] || fail "Update ZIP does not contain $APP_NAME.app"
+APP_BUNDLE="$EXTRACT_DIR/$DISPLAY_NAME.app"
+[[ -d "$APP_BUNDLE" ]] || fail "Update ZIP does not contain $DISPLAY_NAME.app at its root"
 
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 signature_details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1)"

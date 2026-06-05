@@ -26,7 +26,9 @@ enum StoreBackedWorkspaceSearch {
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         store: WorkspaceFileContextStore,
         searchService _: WorkspaceSearchService,
-        workspaceManager: WorkspaceManagerViewModel?
+        workspaceManager: WorkspaceManagerViewModel?,
+        admissionCoordinator: StoreBackedWorkspaceSearchAdmissionCoordinator = .shared,
+        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared
     ) async throws -> SearchResults {
         try await search(
             pattern: pattern,
@@ -45,7 +47,9 @@ enum StoreBackedWorkspaceSearch {
             allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
             rootScope: rootScope,
             store: store,
-            workspaceManager: workspaceManager
+            workspaceManager: workspaceManager,
+            admissionCoordinator: admissionCoordinator,
+            contentFetchCoordinator: contentFetchCoordinator
         )
     }
 
@@ -66,9 +70,96 @@ enum StoreBackedWorkspaceSearch {
         allowLiteralUnescapeFallback: Bool = true,
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         store: WorkspaceFileContextStore,
-        workspaceManager: WorkspaceManagerViewModel?
+        workspaceManager: WorkspaceManagerViewModel?,
+        admissionCoordinator: StoreBackedWorkspaceSearchAdmissionCoordinator = .shared,
+        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared
     ) async throws -> SearchResults {
         try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
+        let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
+        let operation = {
+            try await performSearch(
+                pattern: pattern,
+                mode: mode,
+                effectiveMode: effectiveMode,
+                isRegex: isRegex,
+                caseInsensitive: caseInsensitive,
+                maxPaths: maxPaths,
+                maxMatches: maxMatches,
+                paths: paths,
+                includeExtensions: includeExtensions,
+                excludePatterns: excludePatterns,
+                contextLines: contextLines,
+                wholeWord: wholeWord,
+                countOnly: countOnly,
+                fuzzySpaceMatching: fuzzySpaceMatching,
+                allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
+                rootScope: rootScope,
+                store: store,
+                contentFetchCoordinator: contentFetchCoordinator
+            )
+        }
+        if let admissionClass = broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths) {
+            return try await admissionCoordinator.withBroadSearchPermit(
+                for: store,
+                searchMode: effectiveMode,
+                admissionClass: admissionClass,
+                operation: operation
+            )
+        }
+        return try await operation()
+    }
+
+    static func requiresBroadSearchAdmission(
+        pattern: String,
+        mode: SearchMode,
+        paths: [String]?
+    ) -> Bool {
+        broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths) != nil
+    }
+
+    static func broadSearchAdmissionClass(
+        pattern: String,
+        mode: SearchMode,
+        paths: [String]?
+    ) -> BroadSearchAdmissionClass? {
+        let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
+        let hasExplicitScope = paths?.contains {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } == true
+        guard !hasExplicitScope else { return nil }
+        switch effectiveMode {
+        case .content:
+            return .unscopedContent
+        case .both:
+            return .unscopedBoth
+        case .auto, .path:
+            return nil
+        }
+    }
+
+    private static func performSearch(
+        pattern: String,
+        mode: SearchMode,
+        effectiveMode: SearchMode,
+        isRegex: Bool,
+        caseInsensitive: Bool,
+        maxPaths: Int,
+        maxMatches: Int,
+        paths: [String]?,
+        includeExtensions: [String],
+        excludePatterns: [String],
+        contextLines: Int,
+        wholeWord: Bool,
+        countOnly: Bool,
+        fuzzySpaceMatching: Bool,
+        allowLiteralUnescapeFallback: Bool,
+        rootScope: WorkspaceLookupRootScope,
+        store: WorkspaceFileContextStore,
+        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator
+    ) async throws -> SearchResults {
+        let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
+        _ = await store.awaitAppliedIngress(rootScope: rootScope)
+        EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
 
         let entryPerfState = EditFlowPerf.begin(
             EditFlowPerf.Stage.Search.entrypoint,
@@ -161,11 +252,11 @@ enum StoreBackedWorkspaceSearch {
             EditFlowPerf.Dimensions(status: (paths?.isEmpty == false) ? "explicit" : "all", fileCount: filesToSearch.count)
         )
 
-        let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
         let contentFreshnessPolicy: FileContentFreshnessPolicy = (effectiveMode == .content || effectiveMode == .both)
             ? .validateDiskMetadata
             : .cachedMetadata
         let aliasByRootPath = pathSearchAliasByRootPath(roots: visibleRootRecords)
+        let searchID = UUID()
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
         do {
@@ -202,6 +293,8 @@ enum StoreBackedWorkspaceSearch {
                     in: filesToSearch,
                     rootsByID: rootsByID,
                     store: store,
+                    contentFetchCoordinator: contentFetchCoordinator,
+                    searchID: searchID,
                     aliasByRootPath: aliasByRootPath
                 )
             }

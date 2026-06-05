@@ -140,8 +140,8 @@ class ReleasePromotionTests(unittest.TestCase):
         vendor_bin = root / "Vendor" / "Sparkle" / "bin"
         assets = temp_dir / "assets"
         fake_bin = temp_dir / "bin"
-        app = temp_dir / "fixture" / "RepoPrompt.app"
-        dmg_app = temp_dir / "dmg-fixture" / "RepoPrompt.app"
+        app = temp_dir / "fixture" / "RepoPrompt CE.app"
+        dmg_app = temp_dir / "dmg-fixture" / "RepoPrompt CE.app"
         for directory in (scripts, vendor_bin, assets, fake_bin, app / "Contents" / "MacOS", app / "Contents" / "Resources" / "bin"):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -279,7 +279,7 @@ class ReleasePromotionTests(unittest.TestCase):
             printf 'ditto\\n' >> "$FAKE_TOOL_CAPTURE"
             target="${@: -1}"
             mkdir -p "$target"
-            cp -R "$FAKE_APP_SOURCE" "$target/RepoPrompt.app"
+            cp -R "$FAKE_APP_SOURCE" "$target/RepoPrompt CE.app"
             """,
         )
         self.write_stub(
@@ -289,7 +289,7 @@ class ReleasePromotionTests(unittest.TestCase):
             printf 'hdiutil\\n' >> "$FAKE_TOOL_CAPTURE"
             if [[ "$1" == "attach" ]]; then
                 target="${@: -1}"
-                cp -R "$FAKE_DMG_APP_SOURCE" "$target/RepoPrompt.app"
+                cp -R "$FAKE_DMG_APP_SOURCE" "$target/RepoPrompt CE.app"
             fi
             """,
         )
