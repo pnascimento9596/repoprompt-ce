@@ -1085,8 +1085,10 @@ class PromptViewModel: ObservableObject {
     @Published private var isApplyingPresetOverrides = false
     private var isApplyingChatPreset = false
 
-    struct ChatPromptEntriesCacheKey: Hashable {
+    struct ChatPromptEntriesCacheKey: Equatable {
+        let selection: StoredSelection
         let codeMapUsage: CodeMapUsage
+        let filePathDisplay: FilePathDisplay
         let selectionVersion: UInt64
         let slicesVersion: UInt64
         let autoCodemapVersion: UInt64
@@ -1168,8 +1170,14 @@ class PromptViewModel: ObservableObject {
         let emptyPromptTokenCount: Int?
     }
 
-    var chatPromptEntriesCache: (key: ChatPromptEntriesCacheKey, entries: [PromptFileEntry])?
-    var chatCodemapFileAPIs: [FileAPI] = []
+    var chatPromptEntriesCache: (
+        key: ChatPromptEntriesCacheKey,
+        projection: WorkspacePromptProjectionAdapter.Projection,
+        entries: [PromptFileEntry]
+    )?
+    var chatPromptEntriesProjectionTask: Task<Void, Never>?
+    var chatPromptEntriesProjectionKey: ChatPromptEntriesCacheKey?
+    var chatPromptEntriesProjectionGeneration: UInt64 = 0
     var chatSelectionVersion: UInt64 = 0
     var chatSlicesVersion: UInt64 = 0
     var chatAutoCodemapVersion: UInt64 = 0
@@ -2125,20 +2133,18 @@ class PromptViewModel: ObservableObject {
                 self?.tokenCountingViewModel.markDirty(.codeMap)
                 self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
-                self?.refreshChatCodemapFileAPIsFromStore()
+                self?.bumpChatPromptEntriesFileAPIsVersion()
             }
             .store(in: &cancellables)
-
-        refreshChatCodemapFileAPIsFromStore()
 
         fileManager.fileSystemDeltasAppliedPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                // File content changes alter full-file prompt blocks even when selection and topology are unchanged.
-                // Track them in the cache key so an in-flight cold rebuild cannot re-store stale content.
+                // File changes can replace live view models even when selection is unchanged.
+                // Invalidate and cancel so an in-flight projection cannot publish stale identities.
                 guard let self else { return }
                 chatFileSystemDeltaVersion &+= 1
-                chatContextTokenBaselineCache = nil
+                invalidateChatPromptEntriesCache()
             }
             .store(in: &cancellables)
 
@@ -2197,6 +2203,10 @@ class PromptViewModel: ObservableObject {
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
+        chatPromptEntriesProjectionGeneration &+= 1
+        chatPromptEntriesProjectionTask?.cancel()
+        chatPromptEntriesProjectionTask = nil
+        chatPromptEntriesProjectionKey = nil
         chatPromptEntriesCache = nil
         chatContextTokenBaselineCache = nil
     }
@@ -2219,18 +2229,6 @@ class PromptViewModel: ObservableObject {
     private func bumpChatPromptEntriesFileAPIsVersion() {
         chatFileAPIsVersion &+= 1
         invalidateChatPromptEntriesCache()
-    }
-
-    private func refreshChatCodemapFileAPIsFromStore() {
-        Task { [weak self] in
-            guard let self else { return }
-            let apis = await workspaceFileContextStore.allCodemapFileAPIs()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                chatCodemapFileAPIs = apis
-                bumpChatPromptEntriesFileAPIsVersion()
-            }
-        }
     }
 
     // MARK: - Compose Tab Management
@@ -3828,6 +3826,10 @@ class PromptViewModel: ObservableObject {
         return workspaceManager.composeTab(with: activeTabID)?.selection
     }
 
+    func activeComposeTabStoredSelectionForPromptProjection() -> StoredSelection {
+        activeComposeTabStoredSelectionSnapshot() ?? StoredSelection()
+    }
+
     private func legacyRFMSnapshotSelectionForPromptPackaging() -> StoredSelection {
         // Legacy/test-only fallback for PromptViewModel instances that are not bound
         // to a WorkspaceManager/compose tab. Normal active copy/chat packaging reads
@@ -5198,6 +5200,7 @@ class PromptViewModel: ObservableObject {
     private func handleCodeMapsGloballyDisabledChanged(_ disabled: Bool) {
         guard codeMapsGloballyDisabled != disabled else { return }
         codeMapsGloballyDisabled = disabled
+        invalidateChatPromptEntriesCache()
         tokenCountingViewModel.markDirty(.codeMap.union(.fileTree))
         isDirty = true
         Task {
@@ -5235,6 +5238,7 @@ class PromptViewModel: ObservableObject {
 
     deinit {
         activeTabApplyTask?.cancel()
+        chatPromptEntriesProjectionTask?.cancel()
         cancellables.removeAll()
         /*
          // Stop any background timer/work owned by the token counter.

@@ -57,6 +57,49 @@ final class PromptMigrationRemovalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("includeMCPMetadata"))
     }
 
+    func testPromptSnapshotProjectionDelegatesReconstructionAndGuardsAsyncPublication() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let snapshotSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel+PromptSnapshotEntries.swift"
+            ),
+            encoding: .utf8
+        )
+        let viewModelSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+        let adapterSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/WorkspacePromptProjectionAdapter.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(snapshotSource.contains("WorkspacePromptProjectionAdapter(store: workspaceFileContextStore)"))
+        XCTAssertTrue(snapshotSource.contains("chatPromptEntriesProjectionGeneration == generation"))
+        XCTAssertTrue(snapshotSource.contains("chatPromptEntriesRequest().key == request.key"))
+        XCTAssertTrue(adapterSource.contains("captureWorkspaceFileContext"))
+        XCTAssertTrue(adapterSource.contains("WorkspaceContextProjectionService"))
+        XCTAssertTrue(adapterSource.contains("sections: [.selection]"))
+
+        for removedReconstruction in [
+            "buildPromptSnapshotEntriesForCurrentChatProjection",
+            "fileManager.selectedFiles",
+            "fileManager.autoCodemapFiles",
+            "selectionSlicesByFileID",
+            "validatedCurrentFileAPIs",
+            "switch codeMapUsage"
+        ] {
+            XCTAssertFalse(snapshotSource.contains(removedReconstruction), removedReconstruction)
+        }
+        XCTAssertFalse(viewModelSource.contains("chatCodemapFileAPIs"))
+        XCTAssertFalse(viewModelSource.contains("refreshChatCodemapFileAPIsFromStore"))
+        XCTAssertFalse(adapterSource.contains("switch codeMapUsage"))
+    }
+
     func testLegacyCopyOverridesAndCustomizationsIgnoreRemovedFields() throws {
         let presetID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000456"))
         let overridesRaw = """
