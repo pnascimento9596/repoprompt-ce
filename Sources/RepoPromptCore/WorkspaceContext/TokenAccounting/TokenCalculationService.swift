@@ -137,7 +137,17 @@ package struct PromptEntriesEvaluation {
 
 /// An actor for gathering file contents and running token calculations.
 package actor TokenCalculationService {
-    package init() {}
+    typealias CalculationOperation = @Sendable (TokenCalculationSnapshot) async throws -> TokenCalculationResult
+
+    package init() {
+        calculationOperation = Self.performCalculation
+    }
+
+    init(calculationOperation: @escaping CalculationOperation) {
+        self.calculationOperation = calculationOperation
+    }
+
+    private let calculationOperation: CalculationOperation
 
     /// Hold the currently running calculation task.
     private var currentCalculationTask: Task<TokenCalculationResult, Never>?
@@ -319,54 +329,80 @@ package actor TokenCalculationService {
     ) async -> TokenCalculationResult {
         currentCalculationTask?.cancel()
 
+        let calculationOperation = calculationOperation
         currentCalculationTask = Task.detached {
-            let evaluation = Self.evaluatePromptEntries(snapshot.promptEntries)
-            if Task.isCancelled { return Self.defaultResult }
-
-            let fileTreeContent: String = switch snapshot.fileTree {
-            case .none:
-                ""
-            case let .rendered(content):
-                content
-            case let .snapshot(treeSnapshot):
-                FileTreeSnapshotRenderer.generateFileTree(using: treeSnapshot)
+            do {
+                return try await calculationOperation(snapshot)
+            } catch {
+                return Self.defaultResult
             }
-            let fileTreeTokens = fileTreeContent.isEmpty ? 0 : Self.estimateTokens(for: fileTreeContent)
-            let components = Self.calculateComponentBreakdown(
-                promptText: snapshot.promptText,
-                selectedInstructionsText: snapshot.selectedInstructionsText,
-                fileTreeText: fileTreeContent,
-                gitDiffText: nil,
-                metadataText: nil,
-                duplicateUserInstructionsAtTop: snapshot.duplicateUserInstructionsAtTop
-            )
-
-            let finalTotalTokens = evaluation.totalDisplayTokens + components.totalNonFile
-            let finalCharCount = evaluation.charCount
-                + snapshot.promptText.count
-                + (snapshot.duplicateUserInstructionsAtTop ? snapshot.promptText.count : 0)
-                + snapshot.selectedInstructionsText.count
-
-            return TokenCalculationResult(
-                totalTokenCount: finalTotalTokens,
-                totalTokenCountFilesOnly: evaluation.totalContentTokens,
-                fileTokenInfo: evaluation.fileTokenInfo,
-                folderTokenInfo: evaluation.folderTokenInfo,
-                tokenCountString: String(format: "%.2fk", Double(finalTotalTokens) / 1000.0),
-                tokenCountFilesOnlyString: String(format: "%.2fk", Double(evaluation.totalContentTokens) / 1000.0),
-                charCount: finalCharCount,
-                fileTreeContent: fileTreeContent,
-                fileTreeTokenCount: Double(fileTreeTokens) / 1000.0,
-                fileTreeTokenCountRaw: fileTreeTokens,
-                codeMapContent: evaluation.codeMapContent,
-                codeMapFileCount: evaluation.codeMapFileCount,
-                codeMapTokenCount: evaluation.codeMapTokenCount
-            )
         }
 
         let result = await currentCalculationTask!.value
         currentCalculationTask = nil
         return result
+    }
+
+    /// Calculate token statistics without participating in the shared latest-call-wins task lifecycle.
+    package func calculatePromptStatsScoped(
+        snapshot: TokenCalculationSnapshot
+    ) async throws -> TokenCalculationResult {
+        let calculationOperation = calculationOperation
+        let task = Task.detached {
+            try await calculationOperation(snapshot)
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private static func performCalculation(
+        snapshot: TokenCalculationSnapshot
+    ) async throws -> TokenCalculationResult {
+        let evaluation = Self.evaluatePromptEntries(snapshot.promptEntries)
+        try Task.checkCancellation()
+
+        let fileTreeContent: String = switch snapshot.fileTree {
+        case .none:
+            ""
+        case let .rendered(content):
+            content
+        case let .snapshot(treeSnapshot):
+            FileTreeSnapshotRenderer.generateFileTree(using: treeSnapshot)
+        }
+        let fileTreeTokens = fileTreeContent.isEmpty ? 0 : Self.estimateTokens(for: fileTreeContent)
+        let components = Self.calculateComponentBreakdown(
+            promptText: snapshot.promptText,
+            selectedInstructionsText: snapshot.selectedInstructionsText,
+            fileTreeText: fileTreeContent,
+            gitDiffText: nil,
+            metadataText: nil,
+            duplicateUserInstructionsAtTop: snapshot.duplicateUserInstructionsAtTop
+        )
+
+        let finalTotalTokens = evaluation.totalDisplayTokens + components.totalNonFile
+        let finalCharCount = evaluation.charCount
+            + snapshot.promptText.count
+            + (snapshot.duplicateUserInstructionsAtTop ? snapshot.promptText.count : 0)
+            + snapshot.selectedInstructionsText.count
+
+        return TokenCalculationResult(
+            totalTokenCount: finalTotalTokens,
+            totalTokenCountFilesOnly: evaluation.totalContentTokens,
+            fileTokenInfo: evaluation.fileTokenInfo,
+            folderTokenInfo: evaluation.folderTokenInfo,
+            tokenCountString: String(format: "%.2fk", Double(finalTotalTokens) / 1000.0),
+            tokenCountFilesOnlyString: String(format: "%.2fk", Double(evaluation.totalContentTokens) / 1000.0),
+            charCount: finalCharCount,
+            fileTreeContent: fileTreeContent,
+            fileTreeTokenCount: Double(fileTreeTokens) / 1000.0,
+            fileTreeTokenCountRaw: fileTreeTokens,
+            codeMapContent: evaluation.codeMapContent,
+            codeMapFileCount: evaluation.codeMapFileCount,
+            codeMapTokenCount: evaluation.codeMapTokenCount
+        )
     }
 
     /// Cancel any pending token calculations.
