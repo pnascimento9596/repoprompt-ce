@@ -1,7 +1,7 @@
 import Foundation
 
 package struct WorkspaceContextProjection: Equatable {
-    package struct Section<Value: Equatable>: Equatable {
+    package struct Section<Value: Equatable & Sendable>: Equatable {
         package let provenance: WorkspaceFileContextCapture.Provenance
         package let value: Value
 

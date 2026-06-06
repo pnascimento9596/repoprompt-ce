@@ -3,13 +3,40 @@ import Foundation
 import XCTest
 
 final class WorkspaceContextProjectionServiceTests: XCTestCase {
+    func testProjectionAPISurfaceIsSendable() {
+        func requireSendable(_: (some Sendable).Type) {}
+
+        requireSendable(WorkspaceContextProjectionService.CaptureOperation.self)
+        requireSendable(WorkspaceContextProjectionService.Materializer.self)
+        requireSendable(WorkspaceContextProjectionRequest.self)
+        requireSendable(WorkspaceContextProjectionRequest.Sections.self)
+        requireSendable(WorkspaceContextProjectionMaterializationRequest.self)
+        requireSendable(WorkspaceContextProjectionMaterializationRequest.OccurrenceID.self)
+        requireSendable(WorkspaceContextProjectionMaterializationRequest.Codemap.self)
+        requireSendable(WorkspaceContextProjectionMaterializationRequest.Occurrence.self)
+        requireSendable(WorkspaceContextProjectionMaterialization.self)
+        requireSendable(WorkspaceContextProjectionMaterialization.TokenFacts.self)
+        requireSendable(WorkspaceContextProjectionMaterialization.Occurrence.self)
+        requireSendable(WorkspaceContextProjection.self)
+        requireSendable(WorkspaceContextProjection.Section<String>.self)
+        requireSendable(WorkspaceContextProjection.Section<WorkspaceSelectionProjection>.self)
+        requireSendable(WorkspaceContextProjection.Section<[String]>.self)
+        requireSendable(WorkspaceContextProjection.Section<CodeStructureProjection>.self)
+        requireSendable(WorkspaceContextProjection.Section<WorkspaceContextProjection.FileTree>.self)
+        requireSendable(WorkspaceContextProjection.Section<WorkspaceContextProjection.TokenViews>.self)
+        requireSendable(WorkspaceContextProjection.FileTree.self)
+        requireSendable(WorkspaceContextProjection.TokenViews.self)
+        requireSendable(WorkspaceSelectionProjection.self)
+        requireSendable(CodeStructureProjection.self)
+        requireSendable(TokenProjection.self)
+    }
+
     func testOmittedSectionsAreNilAndDoNotMaterialize() async throws {
         let capture = makeEmptyCapture()
-        var materialized = false
         let service = WorkspaceContextProjectionService(
             capture: { capture },
             materializer: { request in
-                materialized = true
+                XCTFail("Empty-section projection must not materialize")
                 return .init(provenance: request.provenance, occurrences: [])
             }
         )
@@ -22,7 +49,6 @@ final class WorkspaceContextProjectionServiceTests: XCTestCase {
         XCTAssertNil(projection.codeStructure)
         XCTAssertNil(projection.fileTree)
         XCTAssertNil(projection.tokens)
-        XCTAssertFalse(materialized)
     }
 
     func testRequestedEmptySectionsRemainPresentWithCaptureProvenance() async throws {
@@ -505,14 +531,13 @@ final class WorkspaceContextProjectionServiceTests: XCTestCase {
 
     func testCancellationIsCheckedAfterCaptureAndMaterialization() async throws {
         let capture = makeSingleFileCapture()
-        var materializerCalled = false
         let captureCancelledService = WorkspaceContextProjectionService(
             capture: {
                 withUnsafeCurrentTask { $0?.cancel() }
                 return capture
             },
             materializer: { request in
-                materializerCalled = true
+                XCTFail("Cancellation after capture must prevent materialization")
                 return .init(provenance: request.provenance, occurrences: [])
             }
         )
@@ -522,9 +547,7 @@ final class WorkspaceContextProjectionServiceTests: XCTestCase {
         do {
             _ = try await captureTask.value
             XCTFail("Expected cancellation after capture")
-        } catch is CancellationError {
-            XCTAssertFalse(materializerCalled)
-        }
+        } catch is CancellationError {}
 
         let materializerCancelledService = WorkspaceContextProjectionService(
             capture: { capture },
@@ -544,6 +567,28 @@ final class WorkspaceContextProjectionServiceTests: XCTestCase {
         do {
             _ = try await materializerTask.value
             XCTFail("Expected cancellation after materialization")
+        } catch is CancellationError {}
+    }
+
+    func testEmptySectionCancellationIsObservedWithoutMaterialization() async throws {
+        let capture = makeEmptyCapture()
+        let service = WorkspaceContextProjectionService(
+            capture: { capture },
+            materializer: { request in
+                XCTFail("Empty-section cancellation path must not materialize")
+                return .init(provenance: request.provenance, occurrences: [])
+            },
+            willReturnForTesting: {
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        )
+        let task = Task {
+            try await service.project(.init(sections: []))
+        }
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation on the empty-section path")
         } catch is CancellationError {}
     }
 

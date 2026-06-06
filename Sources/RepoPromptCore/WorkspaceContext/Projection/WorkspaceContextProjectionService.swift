@@ -16,8 +16,8 @@ package enum WorkspaceContextProjectionError: Error, Equatable {
 }
 
 package struct WorkspaceContextProjectionService {
-    package typealias CaptureOperation = () async throws -> WorkspaceFileContextCapture
-    package typealias Materializer = (
+    package typealias CaptureOperation = @Sendable () async throws -> WorkspaceFileContextCapture
+    package typealias Materializer = @Sendable (
         WorkspaceContextProjectionMaterializationRequest
     ) async throws -> WorkspaceContextProjectionMaterialization
 
@@ -40,6 +40,9 @@ package struct WorkspaceContextProjectionService {
 
     private let captureOperation: CaptureOperation
     private let materializer: Materializer
+    #if DEBUG
+        private let willReturnForTesting: (@Sendable () -> Void)?
+    #endif
 
     package init(
         capture: @escaping CaptureOperation,
@@ -47,7 +50,22 @@ package struct WorkspaceContextProjectionService {
     ) {
         captureOperation = capture
         self.materializer = materializer
+        #if DEBUG
+            willReturnForTesting = nil
+        #endif
     }
+
+    #if DEBUG
+        package init(
+            capture: @escaping CaptureOperation,
+            materializer: @escaping Materializer,
+            willReturnForTesting: @escaping @Sendable () -> Void
+        ) {
+            captureOperation = capture
+            self.materializer = materializer
+            self.willReturnForTesting = willReturnForTesting
+        }
+    #endif
 
     package func project(
         _ request: WorkspaceContextProjectionRequest
@@ -247,7 +265,7 @@ package struct WorkspaceContextProjectionService {
             tokensSection = nil
         }
 
-        return WorkspaceContextProjection(
+        let projection = WorkspaceContextProjection(
             prompt: promptSection,
             selection: selectionSection,
             fileBlocks: fileBlocksSection,
@@ -255,6 +273,11 @@ package struct WorkspaceContextProjectionService {
             fileTree: fileTreeSection,
             tokens: tokensSection
         )
+        #if DEBUG
+            willReturnForTesting?()
+        #endif
+        try Task.checkCancellation()
+        return projection
     }
 
     private struct ValidatedCapture {
