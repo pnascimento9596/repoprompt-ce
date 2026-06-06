@@ -579,7 +579,7 @@ struct AgentManageMCPToolService {
         let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
         let wasActive = session.runState.isActive
         if wasActive {
-            await agentModeVM.cancelAgentRun(tabID: target.tabID, waitForCleanup: false)
+            await agentModeVM.cancelAgentRun(tabID: target.tabID, completion: .terminalPublished)
             await Task.yield()
         }
 

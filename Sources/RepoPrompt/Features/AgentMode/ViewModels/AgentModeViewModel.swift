@@ -4957,11 +4957,13 @@ final class AgentModeViewModel: ObservableObject {
             switch intent {
             case .userExecutionLocationChange(confirmation: .activeRunStop):
                 cancelPendingInstruction(for: session)
+                // Terminal publication synchronously detaches the old provider/controller,
+                // so rebinding does not wait on potentially non-cooperative teardown.
                 await runService.cancelRun(
                     tabID: session.tabID,
                     session: session,
                     intent: .executionLocationChange,
-                    waitForCleanup: true
+                    completion: .terminalPublished
                 )
             case .userExecutionLocationChange:
                 throw ExecutionLocationTransitionError.confirmationRequired(.activeRunStop)
@@ -12620,17 +12622,25 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Cancel the agent run for a tab.
-    /// - Parameter waitForCleanup: When false, expensive provider/controller cleanup is dispatched in the background.
-    func cancelAgentRun(tabID: UUID, waitForCleanup: Bool = true) async {
+    ///
+    /// Terminal publication and synchronous provider detachment are the default return point.
+    /// Callers that destroy provider-owned infrastructure can explicitly await terminal teardown.
+    func cancelAgentRun(
+        tabID: UUID,
+        completion: AgentModeRunService.CancellationCompletion = .terminalPublished
+    ) async {
         guard let session = sessions[tabID] else { return }
         cancelPendingInstruction(for: session)
-        await runService.cancelRun(tabID: tabID, session: session, waitForCleanup: waitForCleanup)
+        await runService.cancelRun(tabID: tabID, session: session, completion: completion)
     }
 
     /// Cancel a render-time run target, refusing if the live tab no longer matches that target.
     /// - Returns: `true` when cancellation was routed to the guarded target; `false` when refused.
     @discardableResult
-    func cancelAgentRun(target: AgentRunCancelTarget, waitForCleanup: Bool = true) async -> Bool {
+    func cancelAgentRun(
+        target: AgentRunCancelTarget,
+        completion: AgentModeRunService.CancellationCompletion = .terminalPublished
+    ) async -> Bool {
         guard let session = sessions[target.tabID] else {
             logRejectedCancelTarget(target, session: nil, reason: "missing_session")
             resyncAfterRejectedCancelTarget(target)
@@ -12642,7 +12652,7 @@ final class AgentModeViewModel: ObservableObject {
             return false
         }
         cancelPendingInstruction(for: session)
-        await runService.cancelRun(tabID: target.tabID, session: session, waitForCleanup: waitForCleanup)
+        await runService.cancelRun(tabID: target.tabID, session: session, completion: completion)
         return true
     }
 
@@ -12865,7 +12875,7 @@ final class AgentModeViewModel: ObservableObject {
                         tabID: session.tabID,
                         session: session,
                         intent: .userStop,
-                        waitForCleanup: false
+                        completion: .terminalPublished
                     )
                     continuation.resume(returning: UserInstructionResponse(
                         text: nil,

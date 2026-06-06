@@ -342,6 +342,7 @@ extension AgentModeViewModel {
         var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
         var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
         var codexCurrentTurnID: String?
+        var codexCurrentTurnKind: CodexTurnKind?
 
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.
@@ -501,6 +502,7 @@ extension AgentModeViewModel {
             lastTerminalCommitRevision = nil
             providerTerminalDrainGeneration = 0
             codexCurrentTurnID = nil
+            codexCurrentTurnKind = nil
             let ownership = runLifecycleTracker.begin(
                 tabID: tabID,
                 persistentSessionID: activeAgentSessionID,

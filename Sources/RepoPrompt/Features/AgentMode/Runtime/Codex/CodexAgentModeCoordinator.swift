@@ -200,7 +200,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     func isCodexCompactionInFlight(session: AgentModeViewModel.TabSession) -> Bool {
-        session.codexPendingTurnKind == .compact || session.codexTurnKindsByID.values.contains(.compact)
+        session.codexPendingTurnKind == .compact
+            || session.codexCurrentTurnKind == .compact
+            || session.codexTurnKindsByID.values.contains(.compact)
     }
 
     private weak var viewModel: AgentModeViewModel?
@@ -1569,23 +1571,69 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexTurnKindsByID[turnID] = kind
         }
         session.codexPendingTurnKind = nil
+        session.codexCurrentTurnID = turnID
+        session.codexCurrentTurnKind = kind
         return kind
     }
 
-    private func trackedCodexTurnKindForCompletion(
+    private func correlatedCodexTurnKindForCompletion(
         turnID: String?,
         session: AgentModeViewModel.TabSession
-    ) -> AgentModeViewModel.TabSession.CodexTurnKind {
-        if let turnID,
-           let kind = session.codexTurnKindsByID.removeValue(forKey: turnID)
-        {
-            return kind
+    ) -> AgentModeViewModel.TabSession.CodexTurnKind? {
+        guard let kind = session.codexCurrentTurnKind else {
+            recordRejectedCodexTurnCompletion(
+                reason: "no_observed_start",
+                eventTurnID: turnID,
+                session: session
+            )
+            return nil
         }
-        if let pendingKind = session.codexPendingTurnKind {
-            session.codexPendingTurnKind = nil
-            return pendingKind
+        if let turnID {
+            guard let currentTurnID = session.codexCurrentTurnID else {
+                recordRejectedCodexTurnCompletion(
+                    reason: "missing_current_id",
+                    eventTurnID: turnID,
+                    session: session
+                )
+                return nil
+            }
+            guard turnID == currentTurnID else {
+                recordRejectedCodexTurnCompletion(
+                    reason: "turn_id_mismatch",
+                    eventTurnID: turnID,
+                    session: session
+                )
+                return nil
+            }
         }
-        return .user
+        if let currentTurnID = session.codexCurrentTurnID {
+            session.codexTurnKindsByID.removeValue(forKey: currentTurnID)
+        }
+        session.codexCurrentTurnID = nil
+        session.codexCurrentTurnKind = nil
+        return kind
+    }
+
+    private func recordRejectedCodexTurnCompletion(
+        reason: String,
+        eventTurnID: String?,
+        session: AgentModeViewModel.TabSession
+    ) {
+        #if DEBUG
+            AgentModePerfDiagnostics.increment(
+                "codex.turn_completion.rejected.\(reason)",
+                tabID: session.tabID
+            )
+            AgentModePerfDiagnostics.event(
+                "codex.turnCompletionRejected",
+                tabID: session.tabID,
+                fields: [
+                    "reason": reason,
+                    "eventTurnID": eventTurnID ?? "nil",
+                    "currentTurnID": session.codexCurrentTurnID ?? "nil"
+                ]
+            )
+        #endif
     }
 
     private func markCodexContextCompacted(_ session: AgentModeViewModel.TabSession) {
@@ -1598,6 +1646,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func resetTrackedCodexTurns(_ session: AgentModeViewModel.TabSession) {
         session.codexPendingTurnKind = nil
+        session.codexCurrentTurnID = nil
+        session.codexCurrentTurnKind = nil
         session.codexTurnKindsByID.removeAll()
     }
 
@@ -3915,7 +3965,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         clearCodexPendingAuthRetryTurn(session)
         cancelCodexTransportClosedFallback(for: session.tabID)
         resetTrackedCodexTurns(session)
-        session.codexCurrentTurnID = nil
         resetCodexWatchdogState(session)
         clearCodexNativeToolLiveness(session)
         session.activeReasoningItemID = nil
@@ -4416,7 +4465,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             enqueueCommandExecutionRunningUpdate(runningUpdate, session: session)
         case let .turnStarted(turnID):
             cancelCodexIdleShutdown(for: session.tabID)
-            session.codexCurrentTurnID = turnID
             clearStaleCodexPendingInteractionsForNewTurn(turnID, session: session)
             let turnKind = trackedCodexTurnKindForStart(turnID: turnID, session: session)
             let statusText = turnKind == .compact ? "Compacting context…" : "Thinking…"
@@ -4425,11 +4473,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         case let .turnCompleted(turnID, status):
-            if let turnID, let currentTurnID = session.codexCurrentTurnID, turnID != currentTurnID {
+            guard let turnKind = correlatedCodexTurnKindForCompletion(
+                turnID: turnID,
+                session: session
+            ) else {
                 return
             }
-            session.codexCurrentTurnID = nil
-            let turnKind = trackedCodexTurnKindForCompletion(turnID: turnID, session: session)
             if turnKind == .compact {
                 await settleCodexCompaction(
                     session,

@@ -29,6 +29,13 @@ final class AgentModeRunService {
         case executionLocationChange
     }
 
+    enum CancellationCompletion: Equatable {
+        /// Return after canonical terminal publication and synchronous provider detachment.
+        case terminalPublished
+        /// Also wait for the exactly-once attempt/provider teardown closure to return.
+        case terminalTeardownCompleted
+    }
+
     /// Strategy for restoring draft text back to the composer.
     enum DraftRestorationStrategy: Equatable {
         /// Only restore if the composer is currently empty.
@@ -932,9 +939,21 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentModeViewModel.TabSession,
         intent: CancellationIntent = .userStop,
-        waitForCleanup _: Bool = true
+        completion: CancellationCompletion = .terminalPublished
     ) async {
-        if session.runState.isTerminalForCommit, session.lastTerminalCommitRevision != nil {
+        if session.runState.isTerminalForCommit,
+           let revision = session.lastTerminalCommitRevision
+        {
+            await terminalCommitBarrier.awaitTerminalPublication(
+                for: revision.ownership,
+                session: session
+            )
+            if completion == .terminalTeardownCompleted {
+                await terminalCommitBarrier.awaitTerminalTeardown(
+                    for: revision.ownership,
+                    session: session
+                )
+            }
             return
         }
         hooks.cancelPendingQuestion(session)
@@ -998,6 +1017,7 @@ final class AgentModeRunService {
             expectedRunID: expectedRunID,
             terminalState: .cancelled,
             source: "runService.cancel",
+            completion: completion,
             attachmentDisposition: session.selectedAgent == .codexExec ? .restoreToPending : .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,
             supportsFollowUp: false,
@@ -1042,6 +1062,12 @@ final class AgentModeRunService {
                 return { await provider.dispose() }
             }
         ))
+        if completion == .terminalTeardownCompleted {
+            await terminalCommitBarrier.awaitTerminalTeardown(
+                for: ownership,
+                session: session
+            )
+        }
     }
 
     private func cancelToolsBeforeStoppingProvider(

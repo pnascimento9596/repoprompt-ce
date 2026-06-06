@@ -441,7 +441,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let session = makeRunningClaudeSession(controller: controller)
         session.pendingAssistantDelta = "buffered terminal tail"
 
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
 
         let revision = try XCTUnwrap(publishedRevision)
         XCTAssertEqual(session.runState, .cancelled)
@@ -450,11 +454,74 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(revision.assistantDeltaFlushGeneration, session.assistantDeltaFlushGeneration)
         XCTAssertEqual(session.lastTerminalCommitRevision, revision)
 
-        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
         XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
 
         assertOrderedEvents(
             ["assistant-flush", "bindings", "save", "commit:"],
+            in: recorder,
+            prefixMatches: true
+        )
+    }
+
+    func testConcurrentPublicationOnlyCancellationWaitsForCanonicalPublication() async throws {
+        let recorder = LifecycleRecorder()
+        let publicationGate = LifecyclePublicationGate()
+        let harness = makeHarness(
+            recorder: recorder,
+            publishTerminalCommit: { _, revision in
+                recorder.record("commit:start:\(revision.commitID.uuidString)")
+                await publicationGate.wait()
+                recorder.record("commit:finish:\(revision.commitID.uuidString)")
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.blockedPublication")
+
+        let firstCancelTask = Task {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalPublished
+            )
+            recorder.record("cancel:first-return")
+        }
+        try await waitUntil("First cancellation should reach terminal publication") {
+            recorder.contains(prefix: "commit:start:")
+        }
+
+        let secondCancelTask = Task {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalPublished
+            )
+            recorder.record("cancel:second-return")
+        }
+        await Task.yield()
+        XCTAssertFalse(recorder.contains("cancel:first-return"))
+        XCTAssertFalse(recorder.contains("cancel:second-return"))
+
+        await publicationGate.release()
+        try await withLifecycleTimeout("both publication-only cancellations") {
+            await firstCancelTask.value
+            await secondCancelTask.value
+        }
+
+        assertOrderedEvents(
+            ["commit:start:", "commit:finish:", "cancel:first-return"],
+            in: recorder,
+            prefixMatches: true
+        )
+        assertOrderedEvents(
+            ["commit:start:", "commit:finish:", "cancel:second-return"],
             in: recorder,
             prefixMatches: true
         )
@@ -475,10 +542,16 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.provider = provider
 
         try await withLifecycleTimeout("terminal cancellation publication", timeoutSeconds: 0.2) {
-            await harness.service.cancelRun(tabID: session.tabID, session: session)
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalPublished
+            )
         }
 
         XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.provider)
+        XCTAssertNil(session.runID)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
         try await waitUntil("Slow disposal should start asynchronously") {
             recorder.contains("headless:blocking-dispose-start")
@@ -493,6 +566,132 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         await provider.releaseDispose()
         try await waitUntil("Slow disposal should finish after release") {
+            recorder.contains("headless:blocking-dispose-finish")
+        }
+    }
+
+    func testCancellationCanAwaitTrackedTerminalTeardownCompletion() async throws {
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            headlessProviderFactory: { _, _ in provider }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.awaitTeardown")
+        session.provider = provider
+
+        let cancelTask = Task {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalTeardownCompleted
+            )
+            recorder.record("cancel:return")
+        }
+
+        try await waitUntil("Terminal publication and teardown should start") {
+            recorder.contains(prefix: "commit:")
+                && recorder.contains("headless:blocking-dispose-start")
+        }
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertFalse(recorder.contains("cancel:return"))
+
+        await provider.releaseDispose()
+        try await withLifecycleTimeout("cleanup-waiting cancellation return") {
+            await cancelTask.value
+        }
+
+        XCTAssertTrue(recorder.contains("cancel:return"))
+        assertOrderedEvents(
+            ["commit:", "headless:blocking-dispose-start", "headless:blocking-dispose-finish", "cancel:return"],
+            in: recorder,
+            prefixMatches: true
+        )
+    }
+
+    func testCleanupWaitAfterPriorTerminalPublicationAwaitsSameTeardownExactlyOnce() async throws {
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            headlessProviderFactory: { _, _ in provider }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.lateAwaitTeardown")
+        session.provider = provider
+
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
+        try await waitUntil("Publication-only cancellation should start teardown") {
+            recorder.contains("headless:blocking-dispose-start")
+        }
+
+        let cleanupWaitTask = Task {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalTeardownCompleted
+            )
+            recorder.record("late-cleanup:return")
+        }
+        await Task.yield()
+        XCTAssertFalse(recorder.contains("late-cleanup:return"))
+        XCTAssertEqual(recorder.events.count(where: { $0 == "headless:blocking-dispose-start" }), 1)
+
+        await provider.releaseDispose()
+        try await withLifecycleTimeout("late cleanup wait return") {
+            await cleanupWaitTask.value
+        }
+
+        XCTAssertTrue(recorder.contains("late-cleanup:return"))
+        XCTAssertEqual(recorder.events.count(where: { $0 == "headless:blocking-dispose-finish" }), 1)
+    }
+
+    func testExecutionLocationCancellationReturnsAfterSynchronousProviderDetachment() async throws {
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            headlessProviderFactory: { _, _ in provider }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.executionLocation")
+        session.provider = provider
+
+        try await withLifecycleTimeout("execution-location terminal publication", timeoutSeconds: 0.2) {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                intent: .executionLocationChange,
+                completion: .terminalPublished
+            )
+        }
+
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.provider)
+        XCTAssertNil(session.runID)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        try await waitUntil("Execution-location teardown should continue asynchronously") {
+            recorder.contains("headless:blocking-dispose-start")
+        }
+        let disposeFinishedBeforeRelease = await provider.isDisposeFinished()
+        XCTAssertFalse(disposeFinishedBeforeRelease)
+
+        await provider.releaseDispose()
+        try await waitUntil("Execution-location teardown should finish after release") {
             recorder.contains("headless:blocking-dispose-finish")
         }
     }
@@ -518,7 +717,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 session.selectedAgent = .codexExec
                 session.codexController = codexController
 
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(
+                    tabID: session.tabID,
+                    session: session,
+                    completion: .terminalPublished
+                )
 
                 XCTAssertNil(session.codexController, row.rawValue)
                 try await waitUntil("Codex teardown should complete after terminal publication") {
@@ -534,7 +737,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 session.selectedAgent = .claudeCode
                 session.claudeController = controller
 
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(
+                    tabID: session.tabID,
+                    session: session,
+                    completion: .terminalPublished
+                )
 
                 XCTAssertNil(session.claudeController, row.rawValue)
                 try await waitUntil("Claude teardown should complete after terminal publication") {
@@ -545,7 +752,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 session.selectedAgent = .cursor
                 session.provider = headlessProvider
 
-                await harness.service.cancelRun(tabID: session.tabID, session: session)
+                await harness.service.cancelRun(
+                    tabID: session.tabID,
+                    session: session,
+                    completion: .terminalPublished
+                )
 
                 XCTAssertNil(session.provider, row.rawValue)
                 try await waitUntil("Headless teardown should complete after terminal publication") {
@@ -565,7 +776,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     session.acpController = controller
 
                     try await withLifecycleTimeout("ACP cancel run") {
-                        await harness.service.cancelRun(tabID: session.tabID, session: session)
+                        await harness.service.cancelRun(
+                            tabID: session.tabID,
+                            session: session,
+                            completion: .terminalPublished
+                        )
                     }
 
                     XCTAssertNil(session.acpController, row.rawValue)
@@ -951,6 +1166,28 @@ private struct LifecycleTimeoutError: LocalizedError {
 
     var errorDescription: String? {
         "Lifecycle test timed out waiting for \(operation) after \(timeoutSeconds)s."
+    }
+}
+
+private actor LifecyclePublicationGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isReleased = false
+
+    func wait() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

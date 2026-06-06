@@ -23,6 +23,7 @@ final class AgentRunTerminalCommitBarrier {
         let expectedRunID: UUID?
         let terminalState: AgentSessionRunState
         let source: String
+        let completion: AgentModeRunService.CancellationCompletion
         let errorText: String?
         let attachmentReservationID: UUID?
         let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition
@@ -40,6 +41,7 @@ final class AgentRunTerminalCommitBarrier {
             expectedRunID: UUID?,
             terminalState: AgentSessionRunState,
             source: String,
+            completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
             errorText: String? = nil,
             attachmentReservationID: UUID? = nil,
             attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition,
@@ -56,6 +58,7 @@ final class AgentRunTerminalCommitBarrier {
             self.expectedRunID = expectedRunID
             self.terminalState = terminalState
             self.source = source
+            self.completion = completion
             self.errorText = errorText
             self.attachmentReservationID = attachmentReservationID
             self.attachmentDisposition = attachmentDisposition
@@ -70,6 +73,7 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     private let hooks: AgentModeRunService.Hooks
+    private var terminalTeardownTasks: [AgentRunOwnership: Task<Void, Never>] = [:]
 
     init(hooks: AgentModeRunService.Hooks) {
         self.hooks = hooks
@@ -202,22 +206,19 @@ final class AgentRunTerminalCommitBarrier {
         }
         hooks.scheduleSave(session.tabID)
         await hooks.publishTerminalCommit(session, revision)
+        let teardownTask = registerTerminalTeardown(
+            teardown,
+            ownership: request.ownership,
+            tabID: session.tabID
+        )
         session.terminalCommitInProgress = false
         request.postCommit()
 
-        if let teardown {
-            Task { @MainActor in
-                #if DEBUG
-                    AgentModePerfDiagnostics.increment("run.terminal.teardown.started", tabID: session.tabID)
-                #endif
-                await teardown()
-                #if DEBUG
-                    AgentModePerfDiagnostics.increment("run.terminal.teardown.completed", tabID: session.tabID)
-                #endif
-            }
-        }
         if let queuedInstruction {
             hooks.startFollowUpRun(session.tabID, queuedInstruction)
+        }
+        if request.completion == .terminalTeardownCompleted {
+            await teardownTask?.value
         }
 
         #if DEBUG
@@ -228,6 +229,49 @@ final class AgentRunTerminalCommitBarrier {
             )
         #endif
         return revision
+    }
+
+    func awaitTerminalPublication(
+        for ownership: AgentRunOwnership,
+        session: AgentModeViewModel.TabSession
+    ) async {
+        while session.terminalCommitInProgress {
+            if let revision = session.lastTerminalCommitRevision,
+               revision.ownership != ownership
+            {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
+    func awaitTerminalTeardown(
+        for ownership: AgentRunOwnership,
+        session: AgentModeViewModel.TabSession
+    ) async {
+        await awaitTerminalPublication(for: ownership, session: session)
+        guard session.lastTerminalCommitRevision?.ownership == ownership else { return }
+        await terminalTeardownTasks[ownership]?.value
+    }
+
+    private func registerTerminalTeardown(
+        _ teardown: AgentRunAttemptTerminalResources.Teardown?,
+        ownership: AgentRunOwnership,
+        tabID: UUID
+    ) -> Task<Void, Never>? {
+        guard let teardown else { return nil }
+        let task = Task { @MainActor [weak self] in
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.terminal.teardown.started", tabID: tabID)
+            #endif
+            await teardown()
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.terminal.teardown.completed", tabID: tabID)
+            #endif
+            self?.terminalTeardownTasks[ownership] = nil
+        }
+        terminalTeardownTasks[ownership] = task
+        return task
     }
 
     private func validatesOwnership(_ request: Request) -> Bool {

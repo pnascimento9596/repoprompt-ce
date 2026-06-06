@@ -759,7 +759,10 @@ final class AgentRunWorktreeStartTests: XCTestCase {
                         throw FixtureError.trackedSessionMissing
                     }
                     observeFirstAgentTaskIfNeeded()
-                    await window.agentModeViewModel.cancelAgentRun(tabID: trackedTabID, waitForCleanup: true)
+                    await window.agentModeViewModel.cancelAgentRun(
+                        tabID: trackedTabID,
+                        completion: .terminalTeardownCompleted
+                    )
                     if let firstObservedAgentTask {
                         firstObservedAgentTask.cancel()
                         try await boundedAwaitRetainedAgentTask(firstObservedAgentTask)

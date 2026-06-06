@@ -198,6 +198,134 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertFalse(bashItem.text.contains("inactive first chunk"))
     }
 
+    func testStaleCompletionBeforeObservedStartPreservesPendingTurnThenMatchingTurnFinalizes() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let ownership = session.activeRunOwnership
+        session.codexCurrentTurnID = nil
+        session.codexCurrentTurnKind = nil
+        session.codexTurnKindsByID.removeAll()
+        session.codexPendingTurnKind = .user
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "stale-turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertEqual(session.codexPendingTurnKind, .user)
+        XCTAssertNil(session.codexCurrentTurnID)
+        XCTAssertNil(session.codexCurrentTurnKind)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "current-turn"),
+            session: session
+        )
+
+        XCTAssertNil(session.codexPendingTurnKind)
+        XCTAssertEqual(session.codexCurrentTurnID, "current-turn")
+        XCTAssertEqual(session.codexCurrentTurnKind, .user)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "current-turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testMismatchedNonNilCompletionAfterStartPreservesCurrentCorrelation() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let ownership = session.activeRunOwnership
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "different-turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertEqual(session.codexCurrentTurnID, "turn")
+        XCTAssertEqual(session.codexCurrentTurnKind, .user)
+        XCTAssertEqual(session.codexTurnKindsByID["turn"], .user)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+    }
+
+    func testNilCompletionAfterIdentifiedStartCompletesCurrentTurn() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: nil, status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.codexCurrentTurnID)
+        XCTAssertNil(session.codexCurrentTurnKind)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testNilStartFollowedByNilCompletionCompletesAnonymousTurn() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexCurrentTurnID = nil
+        session.codexCurrentTurnKind = nil
+        session.codexTurnKindsByID.removeAll()
+        session.codexPendingTurnKind = .user
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: nil),
+            session: session
+        )
+
+        XCTAssertNil(session.codexCurrentTurnID)
+        XCTAssertEqual(session.codexCurrentTurnKind, .user)
+        XCTAssertNil(session.codexPendingTurnKind)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: nil, status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testNilCompletionWithoutObservedStartIsRejectedAndPreservesPendingTurn() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let ownership = session.activeRunOwnership
+        session.codexCurrentTurnID = nil
+        session.codexCurrentTurnKind = nil
+        session.codexTurnKindsByID.removeAll()
+        session.codexPendingTurnKind = .user
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: nil, status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunOwnership, ownership)
+        XCTAssertEqual(session.codexPendingTurnKind, .user)
+        XCTAssertNil(session.codexCurrentTurnID)
+        XCTAssertNil(session.codexCurrentTurnKind)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+    }
+
     func testActiveCodexNativeSendWaitsForAgentRunDrainBeforeSending() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         var drainStarted = false
@@ -276,6 +404,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.codexController = controller
         session.codexConversationID = "fake"
         session.codexCurrentTurnID = "turn"
+        session.codexCurrentTurnKind = .user
+        session.codexTurnKindsByID["turn"] = .user
         session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
         return session
     }
