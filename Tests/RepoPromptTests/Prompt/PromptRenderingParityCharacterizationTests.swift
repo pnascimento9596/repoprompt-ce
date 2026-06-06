@@ -382,36 +382,34 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
             total += try XCTUnwrap(codemapsByFileID[entry.file.id]?.fileAPI?.apiTokenCount)
         }
 
-        let service = WorkspaceContextProjectionService(
-            capture: { capture },
-            materializer: { request in
-                .init(
-                    provenance: request.provenance,
-                    occurrences: request.occurrences.map { occurrence in
-                        let displayTokens = occurrence.mode == .codemap
-                            ? occurrence.codemap?.tokens ?? 0
-                            : 100
-                        return .init(
-                            id: occurrence.id,
-                            content: nil,
-                            tokenFacts: .init(displayTokens: displayTokens, fullTokens: 100)
-                        )
-                    }
-                )
-            }
+        let normalizedAccounting = try await RepoPromptCore.PromptContextAccountingService().calculatePromptStats(
+            request: PromptContextAccountingRequest(
+                selection: selection,
+                codeMapUsage: .auto,
+                filePathDisplay: .relative
+            ),
+            store: store
         )
-        let projection = try await service.project(.init(
-            sections: [.selection],
+        let projection = try await WorkspacePromptProjectionAdapter(store: store).projectTokens(
+            selection: selection,
             codeMapUsage: .auto,
-            alternatePolicy: .init(includeFiles: true, codeMapUsage: .complete)
-        ))
+            filePathDisplay: .relative,
+            alternatePolicy: .init(includeFiles: true, codeMapUsage: .complete),
+            resolvedEntries: normalizedAccounting.resolvedEntries,
+            promptFileEntrySnapshots: normalizedAccounting.promptFileEntrySnapshots,
+            nonFileComponents: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+        )
 
-        XCTAssertEqual(projection.selection?.value.files.map(\.file.standardizedRelativePath), [
+        XCTAssertEqual(projection.selection.files.map(\.file.standardizedRelativePath), [
             "Selected.swift",
             "Auto.swift"
         ])
         XCTAssertEqual(
-            projection.selection?.value.alternate?.codemapTokens,
+            projection.selection.alternate?.codemapTokens,
+            selectedCodemapTokens + accountingCodemapTokens
+        )
+        XCTAssertEqual(
+            projection.tokens.userConfigured?.components.codemaps,
             selectedCodemapTokens + accountingCodemapTokens
         )
     }

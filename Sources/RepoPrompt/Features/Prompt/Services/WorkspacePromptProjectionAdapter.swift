@@ -2,8 +2,24 @@ import Foundation
 import RepoPromptCore
 
 struct WorkspacePromptProjectionAdapter {
-    enum Error: Swift.Error {
+    enum Error: Swift.Error, Equatable {
         case missingSelectionProjection
+        case missingTokenProjection
+        case projectionProvenanceMismatch
+        case missingTokenFacts(OccurrenceIdentity)
+    }
+
+    struct OccurrenceIdentity: Equatable, Hashable {
+        enum Mode: Equatable, Hashable {
+            case full
+            case slice
+            case codemap
+        }
+
+        let fileID: UUID
+        let standardizedPath: String
+        let mode: Mode
+        let ranges: [LineRange]
     }
 
     struct Entry: Equatable {
@@ -19,11 +35,24 @@ struct WorkspacePromptProjectionAdapter {
         let entries: [Entry]
     }
 
+    struct TokenAwareProjection: Equatable {
+        let provenance: WorkspaceFileContextCapture.Provenance
+        let selection: WorkspaceSelectionProjection
+        let tokens: WorkspaceContextProjection.TokenViews
+    }
+
     typealias CaptureOperation = @Sendable (
         _ selection: StoredSelection,
         _ fileTreeRequest: WorkspaceFileTreeSnapshotRequest,
         _ profile: PathLocateProfile
     ) async throws -> WorkspaceFileContextCapture
+
+    private struct OccurrenceTokenFact {
+        let identity: OccurrenceIdentity
+        let modificationDate: Date?
+        let displayTokens: Int
+        let fullTokens: Int
+    }
 
     private let capture: CaptureOperation
 
@@ -46,29 +75,15 @@ struct WorkspacePromptProjectionAdapter {
         codeMapUsage: CodeMapUsage,
         filePathDisplay: FilePathDisplay
     ) async throws -> Projection {
-        let capture = capture
-        let service = WorkspaceContextProjectionService(
-            capture: {
-                try await capture(
-                    selection,
-                    WorkspaceFileTreeSnapshotRequest(
-                        mode: .none,
-                        filePathDisplay: filePathDisplay,
-                        onlyIncludeRootsWithSelectedFiles: false,
-                        includeLegend: false,
-                        showCodeMapMarkers: false,
-                        rootScope: .allLoaded
-                    ),
-                    .uiAssisted
-                )
-            },
-            materializer: Self.materializeSelectionProjection
-        )
-        let projection = try await service.project(.init(
-            sections: [.selection],
+        let projection = try await projectContext(
+            selection: selection,
+            codeMapUsage: codeMapUsage,
             filePathDisplay: filePathDisplay,
-            codeMapUsage: codeMapUsage
-        ))
+            sections: [.selection],
+            materializer: { request in
+                try await Self.materializeSelectionProjection(request)
+            }
+        )
         guard let selectionProjection = projection.selection else {
             throw Error.missingSelectionProjection
         }
@@ -88,6 +103,49 @@ struct WorkspacePromptProjectionAdapter {
         )
     }
 
+    func projectTokens(
+        selection: StoredSelection,
+        codeMapUsage: CodeMapUsage,
+        filePathDisplay: FilePathDisplay,
+        alternatePolicy: WorkspaceSelectionProjectionRequest.AlternatePolicy?,
+        resolvedEntries: [ResolvedPromptFileEntry],
+        promptFileEntrySnapshots: [PromptFileEntrySnapshot],
+        nonFileComponents: TokenProjectionService.WorkspaceNonFileComponents,
+        tokenSource: TokenProjection.Source = .activeLive
+    ) async throws -> TokenAwareProjection {
+        let tokenFacts = try await Self.makeOccurrenceTokenFacts(
+            resolvedEntries: resolvedEntries,
+            promptFileEntrySnapshots: promptFileEntrySnapshots
+        )
+        let projection = try await projectContext(
+            selection: selection,
+            codeMapUsage: codeMapUsage,
+            filePathDisplay: filePathDisplay,
+            sections: [.selection, .tokens],
+            alternatePolicy: alternatePolicy,
+            tokenSource: tokenSource,
+            nonFileComponents: nonFileComponents,
+            materializer: { request in
+                try Self.materializeTokenProjection(request, tokenFacts: tokenFacts)
+            }
+        )
+        guard let selectionProjection = projection.selection else {
+            throw Error.missingSelectionProjection
+        }
+        guard let tokenProjection = projection.tokens else {
+            throw Error.missingTokenProjection
+        }
+        guard selectionProjection.provenance == tokenProjection.provenance else {
+            throw Error.projectionProvenanceMismatch
+        }
+
+        return TokenAwareProjection(
+            provenance: selectionProjection.provenance,
+            selection: selectionProjection.value,
+            tokens: tokenProjection.value
+        )
+    }
+
     @MainActor
     func mapToLivePromptEntries(
         _ projection: Projection,
@@ -104,6 +162,158 @@ struct WorkspacePromptProjectionAdapter {
                 isCodemap: entry.mode == .codemap,
                 ranges: entry.mode == .slice ? entry.ranges : nil
             )
+        }
+    }
+
+    private func projectContext(
+        selection: StoredSelection,
+        codeMapUsage: CodeMapUsage,
+        filePathDisplay: FilePathDisplay,
+        sections: WorkspaceContextProjectionRequest.Sections,
+        alternatePolicy: WorkspaceSelectionProjectionRequest.AlternatePolicy? = nil,
+        tokenSource: TokenProjection.Source = .virtualRecomputed,
+        nonFileComponents: TokenProjectionService.WorkspaceNonFileComponents = .init(
+            prompt: 0,
+            fileTree: 0,
+            meta: 0,
+            git: 0
+        ),
+        materializer: @escaping WorkspaceContextProjectionService.Materializer
+    ) async throws -> WorkspaceContextProjection {
+        let capture = capture
+        let service = WorkspaceContextProjectionService(
+            capture: {
+                try await capture(
+                    selection,
+                    WorkspaceFileTreeSnapshotRequest(
+                        mode: .none,
+                        filePathDisplay: filePathDisplay,
+                        onlyIncludeRootsWithSelectedFiles: false,
+                        includeLegend: false,
+                        showCodeMapMarkers: false,
+                        rootScope: .allLoaded
+                    ),
+                    .uiAssisted
+                )
+            },
+            materializer: materializer
+        )
+        return try await service.project(.init(
+            sections: sections,
+            filePathDisplay: filePathDisplay,
+            codeMapUsage: codeMapUsage,
+            alternatePolicy: alternatePolicy,
+            tokenSource: tokenSource,
+            nonFileTokenComponents: nonFileComponents
+        ))
+    }
+
+    private static func makeOccurrenceTokenFacts(
+        resolvedEntries: [ResolvedPromptFileEntry],
+        promptFileEntrySnapshots: [PromptFileEntrySnapshot]
+    ) async throws -> [OccurrenceTokenFact] {
+        let service = TokenCalculationService()
+        var remainingSnapshots = Array(promptFileEntrySnapshots.enumerated())
+        var facts: [OccurrenceTokenFact] = []
+        facts.reserveCapacity(resolvedEntries.count)
+
+        for entry in resolvedEntries {
+            let identity = occurrenceIdentity(for: entry)
+            guard let remainingIndex = remainingSnapshots.firstIndex(where: { _, snapshot in
+                snapshot.fileID == entry.file.id
+                    && snapshot.isCodemapRequested == entry.isCodemap
+                    && (snapshot.ranges ?? []) == identity.ranges
+            }) else {
+                throw Error.missingTokenFacts(identity)
+            }
+            let snapshot = remainingSnapshots.remove(at: remainingIndex).element
+            let evaluation = await service.evaluatePromptEntries([snapshot])
+            guard let result = evaluation.entryResultsByFileID[entry.file.id],
+                  result.renderMode == evaluationMode(for: identity.mode)
+            else {
+                throw Error.missingTokenFacts(identity)
+            }
+            facts.append(OccurrenceTokenFact(
+                identity: identity,
+                modificationDate: entry.file.modificationDate,
+                displayTokens: result.displayTokens,
+                fullTokens: result.fullTokens
+            ))
+        }
+        return facts
+    }
+
+    private static func materializeTokenProjection(
+        _ request: WorkspaceContextProjectionMaterializationRequest,
+        tokenFacts: [OccurrenceTokenFact]
+    ) throws -> WorkspaceContextProjectionMaterialization {
+        try WorkspaceContextProjectionMaterialization(
+            provenance: request.provenance,
+            occurrences: request.occurrences.map { occurrence in
+                let identity = occurrenceIdentity(for: occurrence)
+                guard let fact = tokenFacts.first(where: {
+                    $0.identity == identity
+                        && $0.modificationDate == occurrence.file.modificationDate
+                }) else {
+                    throw Error.missingTokenFacts(identity)
+                }
+                return .init(
+                    id: occurrence.id,
+                    content: nil,
+                    tokenFacts: .init(
+                        displayTokens: fact.displayTokens,
+                        fullTokens: fact.fullTokens
+                    )
+                )
+            }
+        )
+    }
+
+    private static func occurrenceIdentity(
+        for entry: ResolvedPromptFileEntry
+    ) -> OccurrenceIdentity {
+        let mode: OccurrenceIdentity.Mode = switch entry.mode {
+        case .fullFile:
+            .full
+        case .sliced:
+            .slice
+        case .codemap:
+            .codemap
+        }
+        return OccurrenceIdentity(
+            fileID: entry.file.id,
+            standardizedPath: entry.file.standardizedFullPath,
+            mode: mode,
+            ranges: entry.lineRanges ?? []
+        )
+    }
+
+    private static func occurrenceIdentity(
+        for occurrence: WorkspaceContextProjectionMaterializationRequest.Occurrence
+    ) -> OccurrenceIdentity {
+        let mode: OccurrenceIdentity.Mode = switch occurrence.mode {
+        case .full:
+            .full
+        case .slice:
+            .slice
+        case .codemap:
+            .codemap
+        }
+        return OccurrenceIdentity(
+            fileID: occurrence.file.id,
+            standardizedPath: occurrence.file.standardizedFullPath,
+            mode: mode,
+            ranges: occurrence.ranges
+        )
+    }
+
+    private static func evaluationMode(
+        for mode: OccurrenceIdentity.Mode
+    ) -> PromptEntriesEvaluation.RenderMode {
+        switch mode {
+        case .full: .full
+        case .slice: .slice
+        case .codemap: .codemap
         }
     }
 

@@ -121,6 +121,295 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
         XCTAssertEqual(completeProjection.entries.map(\.codemapOrigin), [nil, nil, .auto, .auto])
     }
 
+    func testTokenProjectionMatchesFactsByOccurrenceIdentityAndBuildsAlternateViews() async throws {
+        let root = makeRoot()
+        let full = makeFile(root: root, path: "Full.swift")
+        let sliced = makeFile(root: root, path: "Sliced.swift")
+        let auto = makeFile(root: root, path: "Auto.swift")
+        let ranges = [
+            LineRange(start: 3, end: 3, description: "third"),
+            LineRange(start: 1, end: 1)
+        ]
+        let fullCodemap = makeCodemap(file: full, root: root, symbol: "FullSymbol")
+        let autoCodemap = makeCodemap(file: auto, root: root, symbol: "AutoSymbol")
+        let selection = StoredSelection(
+            selectedPaths: [full.fullPath],
+            autoCodemapPaths: [auto.fullPath],
+            slices: [sliced.fullPath: ranges],
+            codemapAutoEnabled: true
+        )
+        let capture = makeCapture(
+            root: root,
+            files: [full, sliced, auto],
+            selection: selection,
+            selectedPaths: [.init(input: full.fullPath, resolution: .file(full))],
+            autoCodemapPaths: [.init(input: auto.fullPath, resolution: .file(auto))],
+            slices: [.init(path: sliced.fullPath, ranges: ranges, file: sliced, issue: nil)],
+            codemapSnapshots: [fullCodemap, autoCodemap]
+        )
+        let fullContent = "struct Full { let value = 1 }\n"
+        let slicedContent = "one\ntwo\nthree\nfour\n"
+        let autoTokens = try XCTUnwrap(autoCodemap.fileAPI?.apiTokenCount)
+        let fullCodemapTokens = try XCTUnwrap(fullCodemap.fileAPI?.apiTokenCount)
+        let resolvedEntries = [
+            ResolvedPromptFileEntry(file: full, loadedContent: fullContent, rootFolderPath: root.fullPath),
+            ResolvedPromptFileEntry(
+                file: sliced,
+                lineRanges: ranges,
+                mode: .sliced,
+                loadedContent: slicedContent,
+                rootFolderPath: root.fullPath
+            ),
+            ResolvedPromptFileEntry(file: auto, isCodemap: true, mode: .codemap, rootFolderPath: root.fullPath)
+        ]
+        let snapshots = [
+            PromptFileEntrySnapshot(
+                fileID: full.id,
+                relativePath: full.relativePath,
+                isCodemapRequested: false,
+                ranges: nil,
+                cachedFullTokenCount: TokenCalculationService.estimateTokens(for: fullContent),
+                loadedContent: fullContent,
+                codeMapContent: nil,
+                availableCodeMapTokenCount: fullCodemapTokens
+            ),
+            PromptFileEntrySnapshot(
+                fileID: sliced.id,
+                relativePath: sliced.relativePath,
+                isCodemapRequested: false,
+                ranges: ranges,
+                cachedFullTokenCount: TokenCalculationService.estimateTokens(for: slicedContent),
+                loadedContent: slicedContent,
+                codeMapContent: nil,
+                availableCodeMapTokenCount: 0
+            ),
+            PromptFileEntrySnapshot(
+                fileID: auto.id,
+                relativePath: auto.relativePath,
+                isCodemapRequested: true,
+                ranges: nil,
+                cachedFullTokenCount: nil,
+                loadedContent: nil,
+                codeMapContent: "Auto map",
+                availableCodeMapTokenCount: autoTokens
+            )
+        ]
+        let adapter = WorkspacePromptProjectionAdapter { _, _, _ in capture }
+
+        let projection = try await adapter.projectTokens(
+            selection: selection,
+            codeMapUsage: .auto,
+            filePathDisplay: .relative,
+            alternatePolicy: .init(includeFiles: true, codeMapUsage: .selected),
+            resolvedEntries: resolvedEntries,
+            promptFileEntrySnapshots: snapshots,
+            nonFileComponents: .init(prompt: 7, fileTree: 5, meta: 3, git: 2)
+        )
+
+        XCTAssertEqual(projection.provenance, capture.provenance)
+        XCTAssertEqual(projection.selection.files.map(\.mode), [.full, .slice, .codemap])
+        XCTAssertEqual(projection.selection.files.map(\.ranges), [nil, ranges, nil])
+        XCTAssertEqual(projection.selection.files[0].alternate?.mode, .codemap)
+        XCTAssertEqual(projection.selection.files[0].alternate?.tokens, fullCodemapTokens)
+        XCTAssertEqual(projection.selection.files[2].alternate?.mode, .hidden)
+        XCTAssertEqual(projection.selection.files[2].alternate?.tokens, 0)
+        XCTAssertEqual(projection.tokens.normalized.components.files, projection.selection.summary.totalTokens)
+        XCTAssertEqual(
+            projection.tokens.normalized.components.filesContent,
+            projection.selection.summary.fullTokens + projection.selection.summary.sliceTokens
+        )
+        XCTAssertEqual(projection.tokens.normalized.components.codemaps, autoTokens)
+        XCTAssertEqual(projection.tokens.normalized.components.prompt, 7)
+        XCTAssertEqual(projection.tokens.userConfigured?.components.codemaps, fullCodemapTokens)
+        XCTAssertEqual(
+            projection.tokens.userConfigured?.components.files,
+            fullCodemapTokens + projection.selection.summary.sliceTokens
+        )
+    }
+
+    func testTokenProjectionIncludesCompleteOnlyCodemapsAndCanHideContent() async throws {
+        let root = makeRoot()
+        let selected = makeFile(root: root, path: "Selected.swift")
+        let auto = makeFile(root: root, path: "Auto.swift")
+        let completeOnly = makeFile(root: root, path: "CompleteOnly.swift")
+        let selectedCodemap = makeCodemap(file: selected, root: root, symbol: "SelectedSymbol")
+        let autoCodemap = makeCodemap(file: auto, root: root, symbol: "AutoSymbol")
+        let completeCodemap = makeCodemap(file: completeOnly, root: root, symbol: "CompleteSymbol")
+        let selection = StoredSelection(
+            selectedPaths: [selected.fullPath],
+            autoCodemapPaths: [auto.fullPath],
+            codemapAutoEnabled: true
+        )
+        let capture = makeCapture(
+            root: root,
+            files: [selected, auto, completeOnly],
+            selection: selection,
+            selectedPaths: [.init(input: selected.fullPath, resolution: .file(selected))],
+            autoCodemapPaths: [.init(input: auto.fullPath, resolution: .file(auto))],
+            codemapSnapshots: [selectedCodemap, autoCodemap, completeCodemap]
+        )
+        let selectedContent = "struct Selected {}\n"
+        let autoTokens = try XCTUnwrap(autoCodemap.fileAPI?.apiTokenCount)
+        let selectedTokens = try XCTUnwrap(selectedCodemap.fileAPI?.apiTokenCount)
+        let completeTokens = try XCTUnwrap(completeCodemap.fileAPI?.apiTokenCount)
+        let adapter = WorkspacePromptProjectionAdapter { _, _, _ in capture }
+
+        let projection = try await adapter.projectTokens(
+            selection: selection,
+            codeMapUsage: .auto,
+            filePathDisplay: .relative,
+            alternatePolicy: .init(includeFiles: false, codeMapUsage: .complete),
+            resolvedEntries: [
+                ResolvedPromptFileEntry(file: selected, loadedContent: selectedContent, rootFolderPath: root.fullPath),
+                ResolvedPromptFileEntry(file: auto, isCodemap: true, mode: .codemap, rootFolderPath: root.fullPath)
+            ],
+            promptFileEntrySnapshots: [
+                PromptFileEntrySnapshot(
+                    fileID: selected.id,
+                    relativePath: selected.relativePath,
+                    isCodemapRequested: false,
+                    ranges: nil,
+                    cachedFullTokenCount: TokenCalculationService.estimateTokens(for: selectedContent),
+                    loadedContent: selectedContent,
+                    codeMapContent: nil,
+                    availableCodeMapTokenCount: selectedTokens
+                ),
+                PromptFileEntrySnapshot(
+                    fileID: auto.id,
+                    relativePath: auto.relativePath,
+                    isCodemapRequested: true,
+                    ranges: nil,
+                    cachedFullTokenCount: nil,
+                    loadedContent: nil,
+                    codeMapContent: "Auto map",
+                    availableCodeMapTokenCount: autoTokens
+                )
+            ],
+            nonFileComponents: .init(prompt: 4, fileTree: 0, meta: 0, git: 0)
+        )
+
+        XCTAssertEqual(projection.selection.alternate?.codemapTokens, selectedTokens + autoTokens + completeTokens)
+        XCTAssertEqual(projection.selection.alternate?.includedTotalTokens, autoTokens)
+        XCTAssertEqual(projection.tokens.userConfigured?.components.files, autoTokens)
+        XCTAssertEqual(projection.tokens.userConfigured?.components.filesContent, nil)
+        XCTAssertEqual(projection.tokens.userConfigured?.components.codemaps, autoTokens)
+        XCTAssertEqual(projection.tokens.userConfigured?.total, autoTokens + 4)
+    }
+
+    func testTokenProjectionRejectsFactsFromAnOlderFileRevision() async throws {
+        let root = makeRoot()
+        let captured = WorkspaceFileRecord(
+            rootID: root.id,
+            name: "Selected.swift",
+            relativePath: "Selected.swift",
+            fullPath: root.fullPath + "/Selected.swift",
+            parentFolderID: nil,
+            modificationDate: Date(timeIntervalSince1970: 2)
+        )
+        let accounted = WorkspaceFileRecord(
+            id: captured.id,
+            rootID: captured.rootID,
+            name: captured.name,
+            relativePath: captured.relativePath,
+            fullPath: captured.fullPath,
+            parentFolderID: captured.parentFolderID,
+            modificationDate: Date(timeIntervalSince1970: 1)
+        )
+        let selection = StoredSelection(selectedPaths: [captured.fullPath])
+        let capture = makeCapture(
+            root: root,
+            files: [captured],
+            selection: selection,
+            selectedPaths: [.init(input: captured.fullPath, resolution: .file(captured))]
+        )
+        let content = "struct Selected {}\n"
+        let adapter = WorkspacePromptProjectionAdapter { _, _, _ in capture }
+
+        do {
+            _ = try await adapter.projectTokens(
+                selection: selection,
+                codeMapUsage: .none,
+                filePathDisplay: .relative,
+                alternatePolicy: nil,
+                resolvedEntries: [ResolvedPromptFileEntry(file: accounted, loadedContent: content)],
+                promptFileEntrySnapshots: [
+                    PromptFileEntrySnapshot(
+                        fileID: accounted.id,
+                        relativePath: accounted.relativePath,
+                        isCodemapRequested: false,
+                        ranges: nil,
+                        cachedFullTokenCount: TokenCalculationService.estimateTokens(for: content),
+                        loadedContent: content,
+                        codeMapContent: nil,
+                        availableCodeMapTokenCount: 0
+                    )
+                ],
+                nonFileComponents: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+            )
+            XCTFail("Expected stale occurrence token facts")
+        } catch let error as WorkspacePromptProjectionAdapter.Error {
+            guard case let .missingTokenFacts(identity) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(identity.fileID, captured.id)
+            XCTAssertEqual(identity.standardizedPath, captured.standardizedFullPath)
+        }
+    }
+
+    func testTokenProjectionThrowsWhenOccurrenceIdentityHasNoRequiredFact() async throws {
+        let root = makeRoot()
+        let selected = makeFile(root: root, path: "Selected.swift")
+        let mismatched = WorkspaceFileRecord(
+            id: selected.id,
+            rootID: selected.rootID,
+            name: selected.name,
+            relativePath: "Renamed.swift",
+            fullPath: root.fullPath + "/Renamed.swift",
+            parentFolderID: nil
+        )
+        let selection = StoredSelection(selectedPaths: [selected.fullPath])
+        let capture = makeCapture(
+            root: root,
+            files: [selected],
+            selection: selection,
+            selectedPaths: [.init(input: selected.fullPath, resolution: .file(selected))]
+        )
+        let content = "struct Selected {}\n"
+        let adapter = WorkspacePromptProjectionAdapter { _, _, _ in capture }
+
+        do {
+            _ = try await adapter.projectTokens(
+                selection: selection,
+                codeMapUsage: .none,
+                filePathDisplay: .relative,
+                alternatePolicy: nil,
+                resolvedEntries: [ResolvedPromptFileEntry(file: mismatched, loadedContent: content)],
+                promptFileEntrySnapshots: [
+                    PromptFileEntrySnapshot(
+                        fileID: mismatched.id,
+                        relativePath: mismatched.relativePath,
+                        isCodemapRequested: false,
+                        ranges: nil,
+                        cachedFullTokenCount: TokenCalculationService.estimateTokens(for: content),
+                        loadedContent: content,
+                        codeMapContent: nil,
+                        availableCodeMapTokenCount: 0
+                    )
+                ],
+                nonFileComponents: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+            )
+            XCTFail("Expected missing occurrence token facts")
+        } catch let error as WorkspacePromptProjectionAdapter.Error {
+            guard case let .missingTokenFacts(identity) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(identity.fileID, selected.id)
+            XCTAssertEqual(identity.standardizedPath, selected.standardizedFullPath)
+            XCTAssertEqual(identity.mode, .full)
+            XCTAssertEqual(identity.ranges, [])
+        }
+    }
+
     @MainActor
     func testLiveMappingRequiresCurrentRecordIdentityAndPreservesProjectedModeAndRanges() {
         let root = makeRoot()
