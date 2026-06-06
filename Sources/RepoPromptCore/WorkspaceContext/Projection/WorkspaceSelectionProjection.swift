@@ -239,6 +239,7 @@ package struct WorkspaceSelectionProjectionRequest: Equatable {
     }
 
     package let entries: [Entry]
+    package let completeAlternateEntries: [Entry]
     package let codeMapUsage: CodeMapUsage
     package let codemapAutoEnabled: Bool
     package let missingPaths: [String]
@@ -247,6 +248,7 @@ package struct WorkspaceSelectionProjectionRequest: Equatable {
 
     package init(
         entries: [Entry],
+        completeAlternateEntries: [Entry] = [],
         codeMapUsage: CodeMapUsage,
         codemapAutoEnabled: Bool,
         missingPaths: [String] = [],
@@ -254,6 +256,7 @@ package struct WorkspaceSelectionProjectionRequest: Equatable {
         alternatePolicy: AlternatePolicy? = nil
     ) {
         self.entries = entries
+        self.completeAlternateEntries = completeAlternateEntries
         self.codeMapUsage = codeMapUsage
         self.codemapAutoEnabled = codemapAutoEnabled
         self.missingPaths = missingPaths

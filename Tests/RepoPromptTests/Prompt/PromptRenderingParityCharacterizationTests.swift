@@ -315,6 +315,107 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
         XCTAssertEqual(occurrences(of: "_git_data/", in: content), 0)
     }
 
+    func testCompleteAlternateCodemapCandidatesMatchPromptAccountingEligibility() async throws {
+        let root = try makeTemporaryRoot(name: "CompleteAlternateParity")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let selectedURL = root.appendingPathComponent("Selected.swift")
+        let autoURL = root.appendingPathComponent("Auto.swift")
+        let completeOnlyURL = root.appendingPathComponent("CompleteOnly.swift")
+        try write("selected content", to: selectedURL)
+        try write("auto content", to: autoURL)
+        try write("complete content", to: completeOnlyURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        await store.applyObservedCodemapResults([
+            WorkspaceObservedCodemapResult(
+                fullPath: selectedURL.path,
+                modificationDate: modificationDate,
+                fileAPI: makeFileAPI(path: selectedURL.path, symbol: "selectedSymbol")
+            ),
+            WorkspaceObservedCodemapResult(
+                fullPath: autoURL.path,
+                modificationDate: modificationDate,
+                fileAPI: makeFileAPI(path: autoURL.path, symbol: "autoSymbol")
+            ),
+            WorkspaceObservedCodemapResult(
+                fullPath: completeOnlyURL.path,
+                modificationDate: modificationDate,
+                fileAPI: makeFileAPI(path: completeOnlyURL.path, symbol: "completeOnlySymbol")
+            )
+        ])
+        let selection = StoredSelection(
+            selectedPaths: [selectedURL.path],
+            autoCodemapPaths: [autoURL.path],
+            codemapAutoEnabled: true
+        )
+
+        let accounting = try await RepoPromptCore.PromptContextAccountingService().resolveEntries(
+            selection: selection,
+            store: store,
+            codeMapUsage: .complete
+        )
+        XCTAssertEqual(
+            Set(accounting.entries.filter(\.isCodemap).map(\.file.standardizedRelativePath)),
+            Set(["Auto.swift", "CompleteOnly.swift"])
+        )
+
+        let capture = try await store.captureWorkspaceFileContext(
+            selection: selection,
+            fileTreeRequest: WorkspaceFileTreeSnapshotRequest(
+                mode: .none,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                showCodeMapMarkers: false,
+                rootScope: .allLoaded
+            ),
+            profile: .uiAssisted
+        )
+        let codemapsByFileID = Dictionary(uniqueKeysWithValues: capture.codemapSnapshots.map { ($0.fileID, $0) })
+        let selectedRecord = try XCTUnwrap(capture.materializedFiles.first {
+            $0.standardizedRelativePath == "Selected.swift"
+        })
+        let selectedCodemapTokens = try XCTUnwrap(codemapsByFileID[selectedRecord.id]?.fileAPI?.apiTokenCount)
+        let accountingCodemapTokens = try accounting.entries.filter(\.isCodemap).reduce(into: 0) { total, entry in
+            total += try XCTUnwrap(codemapsByFileID[entry.file.id]?.fileAPI?.apiTokenCount)
+        }
+
+        let service = WorkspaceContextProjectionService(
+            capture: { capture },
+            materializer: { request in
+                .init(
+                    provenance: request.provenance,
+                    occurrences: request.occurrences.map { occurrence in
+                        let displayTokens = occurrence.mode == .codemap
+                            ? occurrence.codemap?.tokens ?? 0
+                            : 100
+                        return .init(
+                            id: occurrence.id,
+                            content: nil,
+                            tokenFacts: .init(displayTokens: displayTokens, fullTokens: 100)
+                        )
+                    }
+                )
+            }
+        )
+        let projection = try await service.project(.init(
+            sections: [.selection],
+            codeMapUsage: .auto,
+            alternatePolicy: .init(includeFiles: true, codeMapUsage: .complete)
+        ))
+
+        XCTAssertEqual(projection.selection?.value.files.map(\.file.standardizedRelativePath), [
+            "Selected.swift",
+            "Auto.swift"
+        ])
+        XCTAssertEqual(
+            projection.selection?.value.alternate?.codemapTokens,
+            selectedCodemapTokens + accountingCodemapTokens
+        )
+    }
+
     private func makeEntry(
         id: String,
         relativePath: String,
@@ -402,6 +503,19 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
             modificationDate: modificationDate,
             fileAPI: makeFileAPI(path: entry.file.fullPath, symbol: "codemapOnlySymbol")
         )
+    }
+
+    private func makeTemporaryRoot(name: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptTests", isDirectory: true)
+            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    private func write(_ content: String, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func occurrences(of needle: String, in haystack: String) -> Int {

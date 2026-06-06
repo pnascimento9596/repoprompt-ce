@@ -91,6 +91,57 @@ final class WorkspaceSelectionProjectionServiceTests: XCTestCase {
         XCTAssertEqual(auto.alternate?.includedTotalTokens, 132)
     }
 
+    func testCompleteAlternateEntriesAffectOnlyAlternateTotals() {
+        let selected = makeEntry(
+            path: "Selected.swift",
+            mode: .full,
+            displayTokens: 100,
+            fullTokens: 100,
+            codemapTokens: 10
+        )
+        let auto = makeEntry(
+            path: "Auto.swift",
+            mode: .codemap,
+            displayTokens: 12,
+            fullTokens: 300,
+            codemapTokens: 12
+        )
+        let completeOnly = makeEntry(
+            path: "CompleteOnly.swift",
+            mode: .codemap,
+            displayTokens: 14,
+            fullTokens: 0,
+            codemapTokens: 14
+        )
+
+        let projection = WorkspaceSelectionProjectionService.project(.init(
+            entries: [selected, auto],
+            completeAlternateEntries: [completeOnly],
+            codeMapUsage: .auto,
+            codemapAutoEnabled: true,
+            alternatePolicy: .init(includeFiles: true, codeMapUsage: .complete)
+        ))
+
+        XCTAssertEqual(projection.files.map(\.file.standardizedRelativePath), ["Selected.swift", "Auto.swift"])
+        XCTAssertEqual(projection.summary, .init(
+            fullCount: 1,
+            sliceCount: 0,
+            codemapCount: 1,
+            fullTokens: 100,
+            sliceTokens: 0,
+            codemapTokens: 12
+        ))
+        XCTAssertEqual(projection.files.map(\.alternate?.tokens), [10, nil])
+        XCTAssertEqual(projection.alternate, .init(
+            codeMapUsage: .complete,
+            includesFiles: true,
+            contentTokens: 0,
+            codemapTokens: 36,
+            totalTokens: 36,
+            includedTotalTokens: 36
+        ))
+    }
+
     func testAlternateIncludeFilesFalseUsesFrozenBaseCodemapTotalRule() {
         let entries = [
             makeEntry(path: "Full.swift", mode: .full, displayTokens: 100, fullTokens: 100, codemapTokens: 10),

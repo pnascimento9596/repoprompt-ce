@@ -149,6 +149,77 @@ final class WorkspaceContextProjectionServiceTests: XCTestCase {
         assertAllPresentSections(projection, have: fixture.capture.provenance)
     }
 
+    func testCompleteAlternateIncludesCompleteOnlyCodemapsWithoutChangingNormalizedOccurrences() async throws {
+        let root = makeRoot()
+        let selected = makeFile(root: root, path: "Selected.swift")
+        let auto = makeFile(root: root, path: "Auto.swift")
+        let completeOnly = makeFile(root: root, path: "CompleteOnly.swift")
+        let selectedCodemap = makeCodemap(file: selected, root: root, symbol: "SelectedSymbol")
+        let autoCodemap = makeCodemap(file: auto, root: root, symbol: "AutoSymbol")
+        let completeOnlyCodemap = makeCodemap(file: completeOnly, root: root, symbol: "CompleteOnlySymbol")
+        let selectedCodemapTokens = try XCTUnwrap(selectedCodemap.fileAPI?.apiTokenCount)
+        let autoCodemapTokens = try XCTUnwrap(autoCodemap.fileAPI?.apiTokenCount)
+        let completeOnlyCodemapTokens = try XCTUnwrap(completeOnlyCodemap.fileAPI?.apiTokenCount)
+        let capture = makeCapture(
+            root: root,
+            files: [selected, auto, completeOnly],
+            selection: StoredSelection(
+                selectedPaths: [selected.fullPath],
+                autoCodemapPaths: [auto.fullPath],
+                codemapAutoEnabled: true
+            ),
+            selectedPaths: [.init(input: selected.fullPath, resolution: .file(selected))],
+            autoCodemapPaths: [.init(input: auto.fullPath, resolution: .file(auto))],
+            codemapSnapshots: [selectedCodemap, autoCodemap, completeOnlyCodemap]
+        )
+        let service = WorkspaceContextProjectionService(
+            capture: { capture },
+            materializer: { request in
+                XCTAssertEqual(request.occurrences.map(\.file.standardizedRelativePath), [
+                    "Selected.swift",
+                    "Auto.swift"
+                ])
+                XCTAssertEqual(request.occurrences.map(\.mode), [.full, .codemap])
+                return .init(
+                    provenance: request.provenance,
+                    occurrences: request.occurrences.map { occurrence in
+                        let displayTokens = occurrence.mode == .codemap ? autoCodemapTokens : 100
+                        return .init(
+                            id: occurrence.id,
+                            content: nil,
+                            tokenFacts: .init(displayTokens: displayTokens, fullTokens: 100)
+                        )
+                    }
+                )
+            }
+        )
+
+        let projection = try await service.project(.init(
+            sections: [.selection, .tokens],
+            codeMapUsage: .auto,
+            alternatePolicy: .init(includeFiles: true, codeMapUsage: .complete)
+        ))
+
+        XCTAssertEqual(projection.selection?.value.files.map(\.file.standardizedRelativePath), [
+            "Selected.swift",
+            "Auto.swift"
+        ])
+        XCTAssertEqual(projection.selection?.value.summary, .init(
+            fullCount: 1,
+            sliceCount: 0,
+            codemapCount: 1,
+            fullTokens: 100,
+            sliceTokens: 0,
+            codemapTokens: autoCodemapTokens
+        ))
+        let expectedCompleteTokens = selectedCodemapTokens + autoCodemapTokens + completeOnlyCodemapTokens
+        XCTAssertEqual(projection.selection?.value.alternate?.codemapTokens, expectedCompleteTokens)
+        XCTAssertEqual(projection.selection?.value.alternate?.totalTokens, expectedCompleteTokens)
+        XCTAssertEqual(projection.tokens?.value.normalized.components.files, 100 + autoCodemapTokens)
+        XCTAssertEqual(projection.tokens?.value.userConfigured?.components.files, expectedCompleteTokens)
+        XCTAssertEqual(projection.tokens?.value.userConfigured?.components.codemaps, expectedCompleteTokens)
+    }
+
     func testNilContentOmitsBlockWhileEmptyContentEmitsEmptyFence() async throws {
         let root = makeRoot()
         let nilFile = makeFile(root: root, path: "Nil.swift")

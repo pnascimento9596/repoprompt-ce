@@ -63,6 +63,13 @@ package struct WorkspaceContextProjectionService {
             codemapsByFileID: validated.codemapsByFileID,
             request: request
         )
+        let completeAlternateOccurrences = Self.makeCompleteAlternateOccurrences(
+            capture: capture,
+            rootsByID: validated.rootsByID,
+            codemapsByFileID: validated.codemapsByFileID,
+            normalized: preparedOccurrences,
+            request: request
+        )
         let occurrences = preparedOccurrences.map(\.value)
 
         let needsContent = request.sections.contains(.files)
@@ -118,6 +125,21 @@ package struct WorkspaceContextProjectionService {
                             codemapTokens: occurrence.codemap?.tokens ?? 0
                         ),
                         codemapAvailable: occurrence.codemap != nil
+                    )
+                },
+                completeAlternateEntries: completeAlternateOccurrences.compactMap { prepared in
+                    let occurrence = prepared.value
+                    guard let codemap = occurrence.codemap else { return nil }
+                    return WorkspaceSelectionProjectionRequest.Entry(
+                        file: occurrence.file,
+                        metadata: occurrence.metadata,
+                        mode: .codemap,
+                        tokens: .init(
+                            displayTokens: codemap.tokens,
+                            fullTokens: 0,
+                            codemapTokens: codemap.tokens
+                        ),
+                        codemapAvailable: true
                     )
                 },
                 codeMapUsage: request.codeMapUsage,
@@ -565,6 +587,34 @@ package struct WorkspaceContextProjectionService {
         }
 
         return prepared
+    }
+
+    private static func makeCompleteAlternateOccurrences(
+        capture: WorkspaceFileContextCapture,
+        rootsByID: [UUID: WorkspaceRootRecord],
+        codemapsByFileID: [UUID: WorkspaceCodemapSnapshot],
+        normalized: [PreparedOccurrence],
+        request: WorkspaceContextProjectionRequest
+    ) -> [PreparedOccurrence] {
+        guard request.alternatePolicy?.codeMapUsage == .complete,
+              request.codeMapUsage != .complete,
+              request.sections.contains(.selection) || request.sections.contains(.tokens)
+        else { return [] }
+
+        let normalizedFileIDs = Set(normalized.map(\.value.file.id))
+        let complete = makeOccurrences(
+            capture: capture,
+            rootsByID: rootsByID,
+            codemapsByFileID: codemapsByFileID,
+            request: .init(
+                sections: request.sections,
+                filePathDisplay: request.filePathDisplay,
+                codeMapUsage: .complete
+            )
+        )
+        return complete.filter {
+            $0.value.mode == .codemap && !normalizedFileIDs.contains($0.value.file.id)
+        }
     }
 
     private static func sliceRanges(

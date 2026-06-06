@@ -90,6 +90,12 @@ package enum WorkspaceSelectionProjectionService {
             ))
         }
 
+        if request.alternatePolicy?.codeMapUsage == .complete {
+            for entry in request.completeAlternateEntries where entry.codemapAvailable {
+                alternateCodemapTokens += entry.tokens.codemapTokens
+            }
+        }
+
         let summary = WorkspaceSelectionProjection.Summary(
             fullCount: fullCount,
             sliceCount: sliceCount,
