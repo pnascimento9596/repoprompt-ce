@@ -36,7 +36,7 @@ Existing app/proxy owners remain compatible through Phase 2 Slice 2:
 
 | Existing target | Current responsibility retained during Item 0 |
 | --- | --- |
-| `RepoPrompt` | SwiftUI/AppKit shell, sole constructor/consumer of the Slice 2 runtime, and owner of composition, observation, mutation, diagnostics, readiness, UI conversion, MCP, and prompt/rendering adapters |
+| `RepoPrompt` | SwiftUI/AppKit shell, sole constructor/consumer of the Slice 2 runtime, and owner of composition, observation, mutation, diagnostics, readiness, UI conversion, MCP, and prompt projection/policy adapters |
 | `RepoPromptMCP` / `repoprompt-mcp` | Existing app-bundled socket proxy, interactive client, and exec client |
 | `RepoPromptShared` | Foundation-only app/CLI MCP bootstrap and control wire contracts |
 
@@ -49,9 +49,9 @@ Keep `platforms: [.macOS(.v14)]` during this migration. The first milestone is a
 - `RepoPromptCoreMacOS` owns workspace directory listing and FSEvents watching behind injected Core contracts. Core has no default macOS watcher construction or Application Support discovery.
 - `RepoPromptEmbeddedWorkspaceRuntimeFactory` is the sole production factory. The app supplies CoreMacOS listing/watching plus app mutation, diagnostics, readiness, observation, cache-root, and view-model adapters.
 - The temporary Slice 1 `WorkspaceSessionSelectionForwarder` and obsolete app runtime source paths are deleted; app behavior is adapted rather than duplicated.
-- Prompt rendering, workspace-context projection, MCP provider/catalog/DTO/formatter/dispatch ownership, and app-proxy transport remain app-owned for Slice 3/Phase 3.
+- Core now owns deterministic factual rendering for already-classified file, codemap-text, slice, and diff values. The app retains entry conversion, artifact classification, display/codemap projection, Git fallback, prompt/chat/clipboard policy, workspace-context and token/code-structure projection, Context Builder/MCP envelopes, MCP provider/catalog/DTO/formatter/dispatch ownership, and app-proxy transport.
 - `Sources/RepoPromptHeadless/**` and `Tests/RepoPromptHeadlessTests/**` remain byte-for-byte unchanged from `7e686cf`; headless does not construct the new runtime.
-- `Scripts/test_shared_runtime_phase2_slice1_boundaries.py` and `Scripts/test_shared_runtime_phase2_boundaries.py` enforce authority, no-read-rewrite, runtime ownership, sole construction, importer-backed dependencies, frozen fixtures/headless, and no-Slice-3 boundaries.
+- `Scripts/test_shared_runtime_phase2_slice1_boundaries.py` and `Scripts/test_shared_runtime_phase2_boundaries.py` enforce authority, no-read-rewrite, runtime ownership, sole construction, importer-backed dependencies, frozen fixtures/headless, and the narrow neutral factual-rendering boundary.
 
 ## Locked ownership rules
 

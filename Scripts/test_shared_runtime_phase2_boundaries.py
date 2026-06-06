@@ -54,6 +54,8 @@ RETIRED_RUNTIME_PATHS = (
 REQUIRED_PROMPT_ASSEMBLY_PATHS = (
     "Sources/RepoPromptCore/Prompt/PromptAssemblyBuilder.swift",
     "Sources/RepoPromptCore/Prompt/PromptContextAccountingService.swift",
+    "Sources/RepoPromptCore/Prompt/PromptRenderingService.swift",
+    "Sources/RepoPromptCore/Prompt/PromptRenderingValues.swift",
     "Sources/RepoPromptCore/Prompt/PromptRenderPolicy.swift",
     "Sources/RepoPromptCore/Prompt/PromptSection.swift",
     "Sources/RepoPrompt/Features/Prompt/Models/PromptSection+DisplayName.swift",
@@ -249,6 +251,70 @@ def main() -> int:
             fail(f"App prompt accounting facade redeclares Core ownership: {declaration}")
     if "private let core = RepoPromptCore.PromptContextAccountingService()" not in app_accounting_source:
         fail("App prompt accounting compatibility owner must delegate to RepoPromptCore")
+
+    core_rendering_values_source = (
+        ROOT / "Sources/RepoPromptCore/Prompt/PromptRenderingValues.swift"
+    ).read_text()
+    core_rendering_service_source = (
+        ROOT / "Sources/RepoPromptCore/Prompt/PromptRenderingService.swift"
+    ).read_text()
+    app_packaging_source = (
+        ROOT / "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+    ).read_text()
+    for declaration in (
+        "package struct PromptRenderingFileValue",
+        "package struct PromptRenderingDiffValue",
+        "package struct PromptRenderedFileBlock",
+        "package struct PromptPartitionedFileBlocks",
+        "package struct PromptRenderedFactualSnippets",
+    ):
+        if declaration not in core_rendering_values_source:
+            fail(f"Canonical Core prompt rendering value missing: {declaration}")
+    if "package enum PromptRenderingService" not in core_rendering_service_source:
+        fail("Canonical Core prompt rendering service missing")
+    for delegation in (
+        "PromptRenderingService.codeFenceStart",
+        "PromptRenderingService.renderFileBlocks",
+        "PromptRenderingService.renderPartitionedFileBlocks",
+        "PromptRenderingService.renderDiffParts",
+        "PromptRenderingService.renderSelectedDiffText",
+        "PromptRenderingService.renderFactualSnippets",
+    ):
+        if delegation not in app_packaging_source:
+            fail(f"App prompt packaging facade must delegate factual rendering: {delegation}")
+    for retained_app_token in ("private enum GitDiffArtifact", "_git_data"):
+        if retained_app_token not in app_packaging_source:
+            fail(f"App prompt packaging policy owner missing: {retained_app_token}")
+        if retained_app_token in core_rendering_values_source or retained_app_token in core_rendering_service_source:
+            fail(f"Core prompt rendering must not own app classification policy: {retained_app_token}")
+    for forbidden_core_token in (
+        "FileViewModel",
+        "PromptFileEntry",
+        "ResolvedPromptFileEntry",
+        "FileAPI",
+        "WorkspaceCodemapSnapshot",
+        "CopyPreset",
+        "AIMessage",
+        "ConversationEntry",
+        "MCP",
+        "Worktree",
+        "UserDefaults",
+        "NSPasteboard",
+        "DateFormatter",
+        "Diagnostics",
+    ):
+        if forbidden_core_token in core_rendering_values_source or forbidden_core_token in core_rendering_service_source:
+            fail(f"Core prompt rendering leaks app/product policy: {forbidden_core_token}")
+    for retired_app_helper in (
+        "private static func renderFullFileBlock",
+        "private static func renderSliceFileBlock",
+        "private static func renderFileBlock",
+        "private static func formatRange",
+        "SliceAssemblyBuilder.build(",
+        "URL(fileURLWithPath:",
+    ):
+        if retired_app_helper in app_packaging_source:
+            fail(f"App prompt packaging retains duplicate factual renderer: {retired_app_helper}")
 
     core_root = ROOT / "Sources/RepoPromptCore"
     forbidden_imports = {

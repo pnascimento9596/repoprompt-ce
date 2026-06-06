@@ -132,6 +132,97 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
         XCTAssertEqual(occurrences(of: "MissingCodemapFallback", in: partitioned.contentBlocks.joined()), 1)
     }
 
+    func testResolvedAdapterPreservesMultiRootLabelsResolverPrecedenceAndOmittedEntryIdentity() throws {
+        let betaRootID = try XCTUnwrap(UUID(uuidString: "99999999-9999-9999-9999-999999999999"))
+        let alpha = makeEntry(
+            id: "22222222-2222-2222-2222-222222222222",
+            relativePath: "Sources/Alpha.swift",
+            content: "struct Alpha {}\n"
+        )
+        let omitted = makeEntry(
+            id: "33333333-3333-3333-3333-333333333333",
+            relativePath: "Sources/Omitted.swift",
+            content: nil
+        )
+        let beta = makeEntry(
+            id: "44444444-4444-4444-4444-444444444444",
+            relativePath: "Sources/Beta.swift",
+            content: "struct Beta {}\n",
+            rootID: betaRootID,
+            rootPath: "/workspace/Beta"
+        )
+
+        let records = PromptPackagingService.generateFileBlocksDetailed(
+            files: [alpha, omitted, beta],
+            filePathDisplay: .relative,
+            displayPathResolver: { entry in
+                entry.file.id == beta.file.id ? "override/Beta.swift" : nil
+            }
+        )
+
+        XCTAssertEqual(records.map(\.file.relativePath), ["Sources/Alpha.swift", "Sources/Beta.swift"])
+        XCTAssertEqual(records.map(\.text), [
+            "File: Alpha/Sources/Alpha.swift\n```swift\nstruct Alpha {}\n\n```",
+            "File: override/Beta.swift\n```swift\nstruct Beta {}\n\n```"
+        ])
+
+        let coreBlocks = PromptRenderingService.renderFileBlocks([
+            PromptRenderingFileValue(
+                displayPath: "Alpha/Sources/Alpha.swift",
+                fileName: alpha.file.name,
+                content: alpha.loadedContent
+            ),
+            PromptRenderingFileValue(
+                displayPath: "Sources/Omitted.swift",
+                fileName: omitted.file.name,
+                content: omitted.loadedContent
+            ),
+            PromptRenderingFileValue(
+                displayPath: "override/Beta.swift",
+                fileName: beta.file.name,
+                content: beta.loadedContent
+            )
+        ])
+        XCTAssertEqual(records.map(\.text), coreBlocks.map(\.text))
+    }
+
+    @MainActor
+    func testPromptFileEntryAdapterPreservesAsyncSlicesMultiRootLabelsAndCodemapProjection() async {
+        let alpha = makeFileViewModel(
+            rootPath: "/workspace/Alpha",
+            relativePath: "Sources/Alpha.swift",
+            content: "one\ntwo\nthree\n"
+        )
+        let beta = makeFileViewModel(
+            rootPath: "/workspace/Beta",
+            relativePath: "Sources/Beta.swift",
+            content: "struct BetaFullContentMustNotRender {}\n"
+        )
+        beta.setCodeMap(makeFileAPI(path: beta.fullPath, symbol: "betaCodemapSymbol"))
+
+        let records = await PromptPackagingService.generateFileBlocksDetailed(
+            files: [
+                PromptFileEntry(
+                    file: alpha,
+                    isCodemap: false,
+                    ranges: [LineRange(start: 2, end: 2, description: "middle")]
+                ),
+                PromptFileEntry(file: beta, isCodemap: true, ranges: nil)
+            ],
+            filePathDisplay: .relative
+        )
+
+        XCTAssertEqual(records.map(\.file.id), [alpha.id, beta.id])
+        XCTAssertEqual(records.map(\.isCodemap), [false, true])
+        XCTAssertEqual(
+            records[0].text,
+            "File: Alpha/Sources/Alpha.swift\n(lines 2: middle)\n```swift\ntwo\n\n```"
+        )
+        XCTAssertTrue(records[1].text.contains("File: Beta/Sources/Beta.swift"), records[1].text)
+        XCTAssertTrue(records[1].text.contains("betaCodemapSymbol"), records[1].text)
+        XCTAssertFalse(records[1].text.contains("BetaFullContentMustNotRender"), records[1].text)
+    }
+
     func testResolvedClipboardPackagingFreezesDiffArtifactOrderingAndNonDuplication() async {
         let full = makeEntry(
             id: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
@@ -229,15 +320,19 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
         relativePath: String,
         content: String?,
         isCodemap: Bool = false,
-        ranges: [LineRange]? = nil
+        ranges: [LineRange]? = nil,
+        rootID: UUID? = nil,
+        rootPath: String? = nil
     ) -> ResolvedPromptFileEntry {
         let fileID = UUID(uuidString: id)!
+        let entryRootID = rootID ?? self.rootID
+        let entryRootPath = rootPath ?? self.rootPath
         let file = WorkspaceFileRecord(
             id: fileID,
-            rootID: rootID,
+            rootID: entryRootID,
             name: (relativePath as NSString).lastPathComponent,
             relativePath: relativePath,
-            fullPath: "\(rootPath)/\(relativePath)",
+            fullPath: "\(entryRootPath)/\(relativePath)",
             parentFolderID: nil,
             modificationDate: modificationDate
         )
@@ -247,7 +342,53 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
             lineRanges: ranges,
             mode: ranges == nil ? (isCodemap ? .codemap : .fullFile) : .sliced,
             loadedContent: content,
-            rootFolderPath: rootPath
+            rootFolderPath: entryRootPath
+        )
+    }
+
+    private func makeFileViewModel(
+        rootPath: String,
+        relativePath: String,
+        content: String
+    ) -> FileViewModel {
+        let fullPath = "\(rootPath)/\(relativePath)"
+        return FileViewModel(
+            file: File(
+                name: (relativePath as NSString).lastPathComponent,
+                path: fullPath,
+                modificationDate: modificationDate
+            ),
+            rootPath: rootPath,
+            rootIdentifier: UUID(),
+            rootFolderPath: rootPath,
+            fileSystemService: nil,
+            relativePathOverride: relativePath,
+            contentProvider: PromptRenderingContentProvider(
+                content: content,
+                modificationDate: modificationDate,
+                fullPath: fullPath
+            )
+        )
+    }
+
+    private func makeFileAPI(path: String, symbol: String) -> FileAPI {
+        FileAPI(
+            filePath: path,
+            imports: [],
+            classes: [],
+            functions: [
+                FunctionInfo(
+                    name: symbol,
+                    parameters: [],
+                    returnType: nil,
+                    definitionLine: "func \(symbol)()",
+                    lineNumber: 7
+                )
+            ],
+            enums: [],
+            globalVars: [],
+            macros: [],
+            referencedTypes: []
         )
     }
 
@@ -259,28 +400,45 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
             relativePath: entry.file.relativePath,
             fullPath: entry.file.fullPath,
             modificationDate: modificationDate,
-            fileAPI: FileAPI(
-                filePath: entry.file.fullPath,
-                imports: [],
-                classes: [],
-                functions: [
-                    FunctionInfo(
-                        name: "codemapOnlySymbol",
-                        parameters: [],
-                        returnType: nil,
-                        definitionLine: "func codemapOnlySymbol()",
-                        lineNumber: 7
-                    )
-                ],
-                enums: [],
-                globalVars: [],
-                macros: [],
-                referencedTypes: []
-            )
+            fileAPI: makeFileAPI(path: entry.file.fullPath, symbol: "codemapOnlySymbol")
         )
     }
 
     private func occurrences(of needle: String, in haystack: String) -> Int {
         haystack.components(separatedBy: needle).count - 1
     }
+}
+
+private final class PromptRenderingContentProvider: FileViewModelContentProvider, @unchecked Sendable {
+    private let content: String
+    private let storedModificationDate: Date
+    private let fullPath: String
+
+    init(content: String, modificationDate: Date, fullPath: String) {
+        self.content = content
+        storedModificationDate = modificationDate
+        self.fullPath = fullPath
+    }
+
+    func loadContentWithDate() async throws -> (content: String?, modificationDate: Date) {
+        (content, storedModificationDate)
+    }
+
+    func regularFileExistsOnDisk() async -> Bool {
+        true
+    }
+
+    func modificationDate() async throws -> Date {
+        storedModificationDate
+    }
+
+    func fullPathForReveal() async -> String {
+        fullPath
+    }
+
+    func editContent(_ newContent: String) async throws {}
+
+    func move(toRelativePath newRelativePath: String) async throws {}
+
+    func moveToTrash() async throws {}
 }
