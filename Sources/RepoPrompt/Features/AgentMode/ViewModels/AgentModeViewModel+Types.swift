@@ -709,12 +709,25 @@ extension AgentModeViewModel {
         let path: String
         let name: String?
         let branch: String?
+        let head: String?
+        let isDetached: Bool
         let label: String
         let colorHex: String?
+        let isLocked: Bool
+        let lockReason: String?
         let isPrunable: Bool
+        let prunableReason: String?
 
         var id: String {
-            worktreeID
+            presentationID
+        }
+
+        /// Stable SwiftUI identity for picker presentation. Selection semantics
+        /// remain repositoryID + worktreeID; this ID also includes the normalized
+        /// path so malformed duplicate Git records cannot collide in ForEach.
+        var presentationID: String {
+            let checkoutPath = CheckoutPathIdentity.canonicalPathOrOriginal(path)
+            return "\(repositoryID)::\(worktreeID)::\(checkoutPath)"
         }
     }
 

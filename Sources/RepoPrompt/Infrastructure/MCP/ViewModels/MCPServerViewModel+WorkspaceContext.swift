@@ -246,47 +246,6 @@ extension MCPServerViewModel {
         )
     }
 
-    nonisolated static func gitDiffCandidates(from selection: StoredSelection) -> [String] {
-        var candidates = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
-        let seen = Set(candidates)
-        var dedupedSeen = seen
-        for (path, ranges) in StoredSelectionPathNormalization.standardizedSlices(selection.slices) where !ranges.isEmpty {
-            guard dedupedSeen.insert(path).inserted else { continue }
-            candidates.append(path)
-        }
-        return candidates
-    }
-
-    nonisolated static func resolveGitDiffPaths(
-        candidates: [String],
-        resolvedMap: [String: String],
-        normalizeUserInput: (String) -> String,
-        fileExists: (String) -> Bool
-    ) -> [String] {
-        var seen = Set<String>()
-        var results: [String] = []
-        results.reserveCapacity(candidates.count)
-
-        for raw in candidates {
-            if let resolved = resolvedMap[raw] {
-                let std = StandardizedPath.absolute(resolved)
-                if seen.insert(std).inserted {
-                    results.append(std)
-                }
-                continue
-            }
-
-            let normalized = normalizeUserInput(raw)
-            guard normalized.hasPrefix("/") else { continue }
-            let std = StandardizedPath.absolute(normalized)
-            if fileExists(std), seen.insert(std).inserted {
-                results.append(std)
-            }
-        }
-
-        return results
-    }
-
     @MainActor
     private func resolvedContextForExportSelectedFiles(
         _ resolvedContext: ResolvedTabContextSnapshot?
@@ -363,53 +322,30 @@ extension MCPServerViewModel {
         // Run-bound sessions and explicitly bound tabs should export from their bound tab
         // state, not from whichever compose tab happens to be active in the UI.
         let lookupContext = await lookupContext(for: context)
-        let selection = lookupContext.physicalizeSelection(context.selection)
         let effectivePromptText = context.promptText
-
         let store = promptVM.workspaceFileContextStore
-        let effectiveCodeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
-            selection: selection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted,
-            codeMapUsage: effectiveCodeMapUsage
-        )
-        let fileEntries = resolution.entries
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-
-        let combinedTreeAndMap: String?
-        if cfg.rendersFileTree {
-            let rawFileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: selection,
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: cfg.effectiveFileTreeMode),
-                    filePathDisplay: promptVM.filePathDisplayOption,
-                    onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
-                    includeLegend: true,
-                    showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
-                    rootScope: lookupContext.rootScope
-                ),
-                profile: .uiAssisted
+        var effectiveCfg = cfg
+        effectiveCfg.codeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
+        let preAssembly = await PromptContextPreAssemblyService.resolve(
+            PromptContextPreAssemblyRequest(
+                cfg: effectiveCfg,
+                selection: context.selection,
+                store: store,
+                lookupContext: lookupContext,
+                filePathDisplay: promptVM.filePathDisplayOption,
+                onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
+                selectedGitDiffFolderPolicy: .filesOnly,
+                selectedGitDiffLookupProfile: .mcpSelection,
+                selectedGitDiffArtifactPolicy: .respectGitInclusion,
+                selectedGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] paths in
+                    await gitViewModel.getDiffForAbsolutePaths(paths, forceRefreshStatus: true)
+                },
+                completeGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] in
+                    await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+                }
             )
-            let fileTreeSnapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot
-            let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-            combinedTreeAndMap = tree.isEmpty ? nil : tree
-        } else {
-            combinedTreeAndMap = nil
-        }
-
-        let gitDiff: String?
-        switch cfg.gitInclusion {
-        case .none:
-            gitDiff = nil
-        case .selected:
-            let selectedPaths = await gitDiffPaths(for: selection)
-            gitDiff = await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
-        case .complete:
-            gitDiff = await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-        }
+        )
 
         let combinedMeta = promptVM.metaInstructions(
             for: cfg,
@@ -417,39 +353,24 @@ extension MCPServerViewModel {
         )
         let includeMetaBlock = !combinedMeta.isEmpty
 
-        let clipboardFilePathDisplay = promptVM.filePathDisplayOption
         return await PromptPackagingService.generateClipboardContent(
             metaInstructions: combinedMeta,
             userInstructions: cfg.includeUserPrompt ? effectivePromptText : "",
-            files: fileEntries,
-            fileTreeContent: combinedTreeAndMap,
-            gitDiff: gitDiff,
+            files: preAssembly.entries,
+            fileTreeContent: preAssembly.fileTreeContent,
+            gitDiff: preAssembly.gitDiff,
             includeSavedPrompts: includeMetaBlock,
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
             filePathDisplay: promptVM.filePathDisplayOption,
-            codemapSnapshots: codemapSnapshots,
+            codemapSnapshots: preAssembly.codemapSnapshots,
             includeDatetimeInUserInstructions: promptVM.includeDatetimeInUserInstructions,
             promptSectionsOrder: promptVM.promptSectionsOrder,
             disabledPromptSections: promptVM.disabledPromptSections,
             duplicateUserInstructionsAtTop: promptVM.duplicateUserInstructionsAtTop,
             displayPathResolver: { entry in
-                lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: entry.file.standardizedFullPath, display: clipboardFilePathDisplay)
+                preAssembly.displayPath(for: entry)
             }
-        )
-    }
-
-    func gitDiffPaths(for selection: StoredSelection) async -> [String] {
-        let candidates = Self.gitDiffCandidates(from: selection)
-        guard !candidates.isEmpty else { return [] }
-
-        let resolvedFiles = await promptVM.workspaceFileContextStore.lookupFiles(atPaths: candidates, profile: .mcpSelection, rootScope: .allLoaded)
-        let resolvedMap = resolvedFiles.mapValues { $0.standardizedFullPath }
-        return Self.resolveGitDiffPaths(
-            candidates: candidates,
-            resolvedMap: resolvedMap,
-            normalizeUserInput: { ($0 as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines) },
-            fileExists: { FileManager.default.fileExists(atPath: $0) }
         )
     }
 }

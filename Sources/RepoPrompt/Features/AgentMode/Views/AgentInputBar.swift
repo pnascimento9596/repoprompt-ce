@@ -19,6 +19,7 @@ struct AgentComposerActions {
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
     let removeTaggedFile: (_ tabID: UUID, _ attachmentID: UUID) -> Void
+    let agentWorkspaceLookupContext: (_ tabID: UUID?) async -> WorkspaceLookupContext
     let slashSkillSuggestions: (_ query: String) async -> [MentionSuggestion]
     let modelOptions: (_ agent: AgentProviderKind, _ includeClaudeEffortVariants: Bool) -> [AgentModelOption]
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
@@ -123,6 +124,10 @@ struct AgentInputBar: View {
                 )
             },
             removeTaggedFile: { tabID, attachmentID in agentModeVM.removePendingTaggedFile(tabID: tabID, attachmentID: attachmentID) },
+            agentWorkspaceLookupContext: { tabID in
+                guard let tabID else { return .visibleWorkspace }
+                return await agentModeVM.agentWorkspaceLookupContext(tabID: tabID)
+            },
             slashSkillSuggestions: { query in await agentModeVM.slashSkillSuggestions(for: query) },
             modelOptions: { agent, includeClaudeEffortVariants in
                 agentModeVM.modelOptions(for: agent, includeClaudeEffortVariants: includeClaudeEffortVariants)
@@ -165,6 +170,7 @@ struct AgentInputBar: View {
             statusPillsUI: statusPillsUI,
             oracleViewModel: oracleViewModel,
             promptManager: promptManager,
+            selectionCoordinator: selectionCoordinator,
             runtimeVM: runtimeVM,
             windowID: windowID
         )
@@ -560,6 +566,10 @@ struct AgentComposerView: View, Equatable {
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
                     fileTagSelectionCoordinator: selectionCoordinator,
+                    fileTagLookupContextIdentity: AnyHashable(props.fileTagLookupContextIdentity),
+                    fileTagLookupContextProvider: { [tabID = props.currentTabID] in
+                        await actions.agentWorkspaceLookupContext(tabID)
+                    },
                     onFileTagCommitted: handleFileTagCommitted(_:),
                     slashSkillSuggestionsProvider: { query in
                         await actions.slashSkillSuggestions(query)

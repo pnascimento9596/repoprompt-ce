@@ -24,6 +24,7 @@ struct AgentWorkspaceRootsSectionView: View {
     /// by logical workspace-root path. When non-empty, the matching root rows
     /// render a `MERGE → <target>` capsule beside the worktree capsule.
     var worktreeMergeAttentionsByLogicalRootPath: [String: AgentWorktreeMergeAttention] = [:]
+    var branchSwitchActions: AgentWorkspaceBranchSwitchActions = .unavailable
 
     @State private var addFolderError: String?
     @State private var hoveredRootID: UUID?
@@ -135,6 +136,10 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private var bottomBarBottomPadding: CGFloat {
         fontPreset.scaledClamped(8, max: 12)
+    }
+
+    private var worktreeCapsuleLabelMaxWidth: CGFloat {
+        fontPreset.scaledClamped(128, min: 82, max: 170)
     }
 
     private var roots: [AgentWorkspaceRootRow] {
@@ -367,12 +372,14 @@ struct AgentWorkspaceRootsSectionView: View {
             }
 
             if let gitContext = row.gitContext {
-                gitContextCapsule(gitContext)
-                    .layoutPriority(-1)
+                gitContextCapsule(gitContext, row: row)
+                    .layoutPriority(3)
             }
 
             if let worktree = row.worktree {
                 worktreeCapsule(worktree)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(0)
             }
 
             if let attention = mergeAttention(for: row) {
@@ -436,27 +443,12 @@ struct AgentWorkspaceRootsSectionView: View {
 
     // MARK: - Git Context Capsule
 
-    private func gitContextCapsule(_ context: GitWorktreeContextSummary) -> some View {
-        HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
-            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
-            Text(context.breadcrumbText)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: fontPreset.scaledClamped(118, min: 72, max: 150), alignment: .leading)
-        }
-        .foregroundColor(.secondary)
-        .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
-        .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
-        .background(
-            Capsule().fill(Color.secondary.opacity(0.10))
+    private func gitContextCapsule(_ context: GitWorktreeContextSummary, row: AgentWorkspaceRootRow) -> some View {
+        GitContextBranchSwitchCapsule(
+            row: row,
+            context: context,
+            actions: branchSwitchActions
         )
-        .overlay(
-            Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75)
-        )
-        .hoverTooltip(context.tooltipText, .top)
-        .accessibilityLabel(context.accessibilityText)
     }
 
     // MARK: - Worktree Capsule
@@ -467,7 +459,7 @@ struct AgentWorkspaceRootsSectionView: View {
     /// glyph so a stale binding stays visible.
     private func worktreeCapsule(_ worktree: AgentWorktreeIndicator) -> some View {
         let tint = worktree.isAvailable ? worktree.color : Color.secondary
-        let glyph = worktree.isAvailable ? worktree.iconName : "exclamationmark.triangle.fill"
+        let glyph = worktree.isAvailable ? "arrow.triangle.branch" : "exclamationmark.triangle.fill"
         let label = worktree.isAvailable
             ? worktree.capsuleText
             : "\(worktree.capsuleText) (unavailable)"
@@ -477,6 +469,8 @@ struct AgentWorkspaceRootsSectionView: View {
             Text(label)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
                 .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: worktreeCapsuleLabelMaxWidth, alignment: .leading)
         }
         .foregroundColor(tint)
         .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))

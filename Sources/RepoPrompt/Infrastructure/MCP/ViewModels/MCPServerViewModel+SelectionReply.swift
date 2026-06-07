@@ -117,7 +117,14 @@ extension MCPServerViewModel {
         case .none:
             return nil
         case .selected:
-            let selectedPaths = await gitDiffPaths(for: selection)
+            let selectedPaths = await WorkspaceGitDiffSelectionResolver.selectedGitDiffPaths(
+                for: selection,
+                store: promptVM.workspaceFileContextStore,
+                rootScope: .allLoaded,
+                folderPolicy: .filesOnly,
+                profile: .mcpSelection,
+                allowFilesystemFallback: WorkspaceLookupRootScope.allLoaded.allowsSelectedGitDiffFilesystemFallback
+            )
             return await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
         case .complete:
             return await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
@@ -246,12 +253,15 @@ extension MCPServerViewModel {
         extraInvalid: [String] = [],
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
-        virtualContext: TabScopedContext? = nil
+        virtualContext: TabScopedContext? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> ToolResultDTOs.SelectionReply {
         // Always use .auto mode for manage_selection (normalized view)
         let effectiveOverride = effectiveMCPCodeMapUsage(codeMapUsageOverride ?? .auto)
         let lookupContext = if let virtualContext {
             await lookupContext(for: virtualContext)
+        } else if let lookupContextOverride {
+            lookupContextOverride
         } else {
             WorkspaceLookupContext.visibleWorkspace
         }

@@ -46,14 +46,26 @@ actor GitBackend: VCSBackend {
     }
 
     func getLocalBranches(at repoURL: URL, limit: Int) async throws -> [VCSBranch] {
-        let branches = try await gitService.getLocalBranches(at: repoURL)
-        return Array(branches.prefix(limit)).map { branch in
+        let branches = try await gitService.getLocalBranches(at: repoURL, limit: limit)
+        return branches.map { branch in
             VCSBranch(
                 name: branch.name,
                 isCurrent: branch.isCurrent,
                 lastCommitDate: branch.lastCommitDate
             )
         }
+    }
+
+    func gitBranchSwitchOptions(at repoURL: URL) async throws -> GitBranchSwitchOptions {
+        try await gitService.gitBranchSwitchOptions(at: repoURL)
+    }
+
+    func preflightGitBranchSwitch(branchName: String, at repoURL: URL) async throws -> GitBranchSwitchPreflight {
+        try await gitService.preflightGitBranchSwitch(branchName: branchName, at: repoURL)
+    }
+
+    func switchGitBranch(_ request: GitBranchSwitchRequest, at repoURL: URL) async throws -> GitBranchSwitchResult {
+        try await gitService.switchGitBranch(request, at: repoURL)
     }
 
     func getRemoteBranches(at repoURL: URL, limit: Int) async throws -> [VCSBranch] {

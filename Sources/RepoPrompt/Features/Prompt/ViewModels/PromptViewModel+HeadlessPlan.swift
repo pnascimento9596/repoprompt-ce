@@ -44,40 +44,34 @@ extension PromptViewModel {
         gitScopeOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil
     ) async -> AIMessage {
-        // 1. Resolve file entries from the frozen snapshot selection through the headless store.
-        let store = workspaceFileContextStore
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
-            selection: snapshot.selection,
-            store: store,
-            rootScope: .allLoaded,
-            profile: .uiAssisted,
-            codeMapUsage: .auto // Plan always uses auto
+        let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
+        let headlessConfig = PromptContextResolved(
+            includeFiles: true,
+            includeUserPrompt: true,
+            includeMetaPrompts: false,
+            includeFileTree: true,
+            fileTreeMode: .auto,
+            codeMapUsage: .auto,
+            gitInclusion: effectiveGitScope,
+            storedPromptIds: []
         )
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-        let (diffEntries, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(resolution.entries)
+        let preAssembly = await preAssemblePromptContext(
+            cfg: headlessConfig,
+            selection: snapshot.selection,
+            lookupContext: allLoadedWorkspaceLookupContext(),
+            gitBaseOverride: gitBaseOverride
+        )
+        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
         // 2. Generate file contents
         let fileBlocks = PromptPackagingService.generateFileContents(
             codeEntries,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: codemapSnapshots
+            codemapSnapshots: preAssembly.codemapSnapshots
         )
 
-        // 3. Build file tree (auto mode for plan) from the headless store snapshot.
-        let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-            selection: snapshot.selection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: .auto,
-                filePathDisplay: filePathDisplayOption,
-                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-                includeLegend: true,
-                showCodeMapMarkers: true,
-                rootScope: .allLoaded
-            ),
-            profile: .uiAssisted
-        )
-        let fileTree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
+        // 3. Use the neutral pre-assembly file tree.
+        let fileTree = preAssembly.fileTreeContent ?? ""
 
         // 4. System prompt based on mode
         let systemPrompt: String = {
@@ -104,21 +98,7 @@ extension PromptViewModel {
         // 5. Single-user conversation
         let conversation = [ConversationEntry(role: .user, content: snapshot.promptText)]
 
-        let gitDiff: String? = await PromptPackagingService.resolveGitDiff(
-            fromDiffEntries: diffEntries
-        ) {
-            guard mode == .review else { return nil }
-            let effectiveScope = gitScopeOverride ?? .selected
-            switch effectiveScope {
-            case .none:
-                return nil
-            case .selected:
-                let selectedPaths = await resolvedSelectedGitDiffPaths(for: snapshot.selection)
-                return await gitViewModel.getDiffForAbsolutePaths(selectedPaths, vs: gitBaseOverride, forceRefreshStatus: true)
-            case .complete:
-                return await gitViewModel.getDiffUsing(inclusionMode: .all, vs: gitBaseOverride, forceRefreshStatus: true)
-            }
-        }
+        let gitDiff = preAssembly.gitDiff
 
         // 6. Assemble AIMessage (no warning, no meta prompts)
         return PromptPackagingService.buildAIMessage(
@@ -133,47 +113,5 @@ extension PromptViewModel {
             disabledPromptSections: disabledPromptSections,
             duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
         )
-    }
-
-    @MainActor
-    func resolvedSelectedGitDiffPaths(for selection: StoredSelection) async -> [String] {
-        let candidates = MCPServerViewModel.gitDiffCandidates(from: selection)
-        guard !candidates.isEmpty else { return [] }
-
-        let store = workspaceFileContextStore
-        let requests = candidates.map {
-            WorkspacePathLookupRequest(userPath: $0, profile: .uiAssisted, rootScope: .allLoaded)
-        }
-        let resolved = await store.lookupPaths(requests)
-
-        var seen = Set<String>()
-        var selectedPaths: [String] = []
-
-        func append(_ fullPath: String) {
-            let standardized = StandardizedPath.absolute(fullPath)
-            guard seen.insert(standardized).inserted else { return }
-            selectedPaths.append(standardized)
-        }
-
-        for candidate in candidates {
-            guard let result = resolved[candidate] else { continue }
-            if let file = result.file {
-                append(file.standardizedFullPath)
-                continue
-            }
-
-            guard let folder = result.folder else { continue }
-            let prefix = folder.standardizedRelativePath
-            let files = await store.files(inRoot: folder.rootID)
-            for file in files {
-                let isInFolder = prefix.isEmpty
-                    || file.standardizedRelativePath == prefix
-                    || file.standardizedRelativePath.hasPrefix(prefix + "/")
-                guard isInFolder else { continue }
-                append(file.standardizedFullPath)
-            }
-        }
-
-        return selectedPaths
     }
 }

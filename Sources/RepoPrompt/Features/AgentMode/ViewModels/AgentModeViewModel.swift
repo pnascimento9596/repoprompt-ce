@@ -2034,11 +2034,17 @@ final class AgentModeViewModel: ObservableObject {
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
 
-        // Observe tab changes
-        promptManager.$activeComposeTabID
-            .removeDuplicates()
-            .sink { [weak self] tabID in
-                self?.onTabChanged(tabID)
+        // Observe post-storage tab changes. This notification does not replay the current value;
+        // setAgentModeActive(true) remains the explicit activation bootstrap.
+        NotificationCenter.default.publisher(for: .activeComposeTabChanged)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notificationWindowID = notification.userInfo?["windowID"] as? Int,
+                      notificationWindowID == windowID
+                else {
+                    return
+                }
+                onTabChanged(notification.userInfo?["tabID"] as? UUID)
             }
             .store(in: &cancellables)
 
@@ -2654,6 +2660,32 @@ final class AgentModeViewModel: ObservableObject {
 
     func boundSessionID(for tabID: UUID) -> UUID? {
         explicitActiveSessionID(for: tabID) ?? preferredSidebarSessionID(for: tabID)
+    }
+
+    func agentWorkspaceLookupContextIdentity(tabID: UUID?, session: TabSession? = nil) -> AgentWorkspaceLookupContextIdentity {
+        guard let tabID else {
+            return AgentWorkspaceLookupContextSource(activeAgentSessionID: nil, worktreeBindings: []).identity
+        }
+        let resolvedSession = session ?? sessions[tabID]
+        return AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: composerSourceAgentSessionID(tabID: tabID, session: resolvedSession),
+            worktreeBindings: resolvedSession?.worktreeBindings ?? []
+        ).identity
+    }
+
+    func activeAgentWorkspaceLookupContext() async -> WorkspaceLookupContext {
+        guard let tabID = currentTabID else { return .visibleWorkspace }
+        return await agentWorkspaceLookupContext(tabID: tabID, session: sessions[tabID])
+    }
+
+    func agentWorkspaceLookupContext(tabID: UUID, session: TabSession? = nil) async -> WorkspaceLookupContext {
+        guard let store = promptManager?.workspaceFileContextStore else { return .visibleWorkspace }
+        let resolvedSession = session ?? sessions[tabID]
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: composerSourceAgentSessionID(tabID: tabID, session: resolvedSession),
+            worktreeBindings: resolvedSession?.worktreeBindings ?? []
+        )
+        return await AgentWorkspaceLookupContextResolver.lookupContext(source: source, store: store)
     }
 
     private func makeSession(for tabID: UUID) -> TabSession {
@@ -4737,6 +4769,10 @@ final class AgentModeViewModel: ObservableObject {
         if session.tabID == currentTabID {
             updatePermissionBindingState(from: session)
         }
+        if didCopyParentWorktreeBindings {
+            syncComposerUIState(tabID: session.tabID)
+            syncStatusPillsUIState()
+        }
         syncSidebarUIState(refresh: true, reason: .parentRepair)
         if assignedParent || didCopyParentWorktreeBindings || didRefreshMCPPermissionProfile {
             scheduleSave(for: session.tabID)
@@ -4787,6 +4823,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         session.isDirty = true
         updateWorktreeBindingSummariesInIndex(for: session)
+        syncComposerUIState(tabID: session.tabID)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
         syncStatusPillsUIState()
         scheduleSave(for: session.tabID)
@@ -4803,6 +4840,7 @@ final class AgentModeViewModel: ObservableObject {
         session.worktreeBindings = bindings
         session.isDirty = true
         updateWorktreeBindingSummariesInIndex(for: session)
+        syncComposerUIState(tabID: session.tabID)
         syncSidebarUIState(refresh: true, reason: .metadataUpdated)
         syncStatusPillsUIState()
         scheduleSave(for: session.tabID)
@@ -4841,28 +4879,11 @@ final class AgentModeViewModel: ObservableObject {
             throw ExecutionLocationTransitionError.unavailable("Execution location is unavailable for this tab.")
         }
         let context = try await executionLocationContext()
-        let localPath = Self.standardizedWorkspacePath(context.logicalRoot.standardizedFullPath)
-        return try await VCSService.shared.listGitWorktrees(at: context.repo.rootURL)
-            .filter { Self.standardizedWorkspacePath($0.path) != localPath }
-            .map { worktree in
-                let fallbackLabel = worktree.name ?? worktree.branch ?? (worktree.isMain ? "main" : nil)
-                let identity = GlobalSettingsStore.shared.resolvedWorktreeVisualIdentity(
-                    repositoryID: worktree.repository.repositoryID,
-                    worktreeID: worktree.worktreeID,
-                    fallbackLabel: fallbackLabel
-                )
-                return AgentExecutionWorktreeSelection(
-                    repositoryID: worktree.repository.repositoryID,
-                    repoKey: worktree.repository.repoKey,
-                    worktreeID: worktree.worktreeID,
-                    path: worktree.path,
-                    name: worktree.name,
-                    branch: worktree.branch,
-                    label: identity.label ?? fallbackLabel ?? URL(fileURLWithPath: worktree.path).lastPathComponent,
-                    colorHex: identity.colorHex,
-                    isPrunable: worktree.isPrunable
-                )
-            }
+        let localPath = CheckoutPathIdentity(context.logicalRoot.standardizedFullPath)
+        let selections = try await VCSService.shared.listGitWorktrees(at: context.repo.rootURL)
+            .filter { CheckoutPathIdentity($0.path) != localPath }
+            .map(Self.executionWorktreeSelection(from:))
+        return Self.dedupedExecutionWorktreeSelections(selections)
             .sorted { lhs, rhs in
                 if lhs.isPrunable != rhs.isPrunable { return !lhs.isPrunable }
                 let labelOrder = lhs.label.localizedCaseInsensitiveCompare(rhs.label)
@@ -5143,7 +5164,7 @@ final class AgentModeViewModel: ObservableObject {
         session.isDirty = true
     }
 
-    private func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
+    func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
         guard let sessionID = session.activeAgentSessionID,
               var entry = sessionIndex[sessionID]
         else {
@@ -11281,17 +11302,33 @@ final class AgentModeViewModel: ObservableObject {
     private func fileContentsXMLForTaggedPaths(
         _ taggedPaths: [String],
         tokenBudget: Int,
-        maxFiles: Int
+        maxFiles: Int,
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
+    ) async -> String? {
+        guard let promptManager else { return nil }
+        return await Self.taggedFileContentsXMLForTaggedPaths(
+            taggedPaths,
+            tokenBudget: tokenBudget,
+            maxFiles: maxFiles,
+            store: promptManager.workspaceFileContextStore,
+            lookupContext: lookupContext
+        )
+    }
+
+    static func taggedFileContentsXMLForTaggedPaths(
+        _ taggedPaths: [String],
+        tokenBudget: Int,
+        maxFiles: Int,
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async -> String? {
         guard !taggedPaths.isEmpty else { return nil }
-        guard let promptManager else { return nil }
 
         enum TaggedReadableFile {
             case workspace(ResolvedPromptFileEntry)
             case external(WorkspaceExternalReadableFile)
         }
 
-        let store = promptManager.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
         var orderedFiles: [TaggedReadableFile] = []
         orderedFiles.reserveCapacity(min(taggedPaths.count, maxFiles))
@@ -11299,11 +11336,16 @@ final class AgentModeViewModel: ObservableObject {
         workspaceEntries.reserveCapacity(min(taggedPaths.count, maxFiles))
         var seenFileIDs = Set<UUID>()
         var seenExternalPaths = Set<String>()
-        let rootsByID = await Dictionary(uniqueKeysWithValues: store.rootRefs(scope: .allLoaded).map { ($0.id, $0) })
+        let rootsByID = await Dictionary(uniqueKeysWithValues: store.rootRefs(scope: lookupContext.rootScope).map { ($0.id, $0) })
 
         for taggedPath in taggedPaths {
             guard orderedFiles.count < maxFiles else { break }
-            guard let readable = await readableService.resolveReadableFile(taggedPath, profile: .mcpRead, rootScope: .allLoaded) else { continue }
+            let translatedPath = lookupContext.translateInputPath(taggedPath)
+            guard let readable = await readableService.resolveReadableFile(
+                translatedPath,
+                profile: .mcpRead,
+                rootScope: lookupContext.rootScope
+            ) else { continue }
             switch readable {
             case let .workspace(file):
                 guard seenFileIDs.insert(file.id).inserted,
@@ -11329,7 +11371,13 @@ final class AgentModeViewModel: ObservableObject {
 
         let workspaceBlocks = PromptPackagingService.generateFileBlocksDetailed(
             files: workspaceEntries,
-            filePathDisplay: .relative
+            filePathDisplay: .relative,
+            displayPathResolver: { entry in
+                lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                    forPhysicalPath: entry.file.standardizedFullPath,
+                    display: .relative
+                )
+            }
         )
         let workspaceBlocksByID = Dictionary(uniqueKeysWithValues: workspaceBlocks.map { ($0.file.id, $0.text) })
 
@@ -11423,14 +11471,23 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         let store = promptManager.workspaceFileContextStore
-        let resolvedPaths = await resolvedWorkspaceTaggedSelectionPaths(rawPaths: rawPaths, store: store)
+        let lookupContext = await agentWorkspaceLookupContext(tabID: tabID, session: session(for: tabID, createIfNeeded: false))
+        let resolvedPaths = await resolvedWorkspaceTaggedSelectionPaths(
+            rawPaths: rawPaths,
+            store: store,
+            lookupContext: lookupContext
+        )
         guard !resolvedPaths.isEmpty else { return }
 
         if promptManager.activeComposeTabID == tabID {
             workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true)
         }
         guard var tab = workspaceManager.composeTab(with: tabID) else { return }
-        let updatedSelection = Self.selectionByPromotingPathsToFullSelection(tab.selection, paths: resolvedPaths)
+        let updatedSelection = Self.selectionByPromotingPathsToFullSelection(
+            tab.selection,
+            paths: resolvedPaths,
+            lookupContext: lookupContext
+        )
         guard updatedSelection != tab.selection else { return }
         tab.selection = updatedSelection
         workspaceManager.updateComposeTabStoredOnly(tab)
@@ -11445,7 +11502,8 @@ final class AgentModeViewModel: ObservableObject {
 
     private func resolvedWorkspaceTaggedSelectionPaths(
         rawPaths: [String],
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext
     ) async -> [String] {
         var normalizedPaths: [String] = []
         normalizedPaths.reserveCapacity(rawPaths.count)
@@ -11457,42 +11515,49 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard !normalizedPaths.isEmpty else { return [] }
 
-        let requests = normalizedPaths.map {
-            WorkspacePathLookupRequest(userPath: $0, profile: .mcpRead, rootScope: .allLoaded)
+        let translatedPaths = normalizedPaths.map { lookupContext.translateInputPath($0) }
+        let requests = translatedPaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: .mcpRead, rootScope: lookupContext.rootScope)
         }
         let lookupResults = await store.lookupPaths(requests)
         var resolvedPaths: [String] = []
         resolvedPaths.reserveCapacity(normalizedPaths.count)
         var seenResolved = Set<String>()
-        for path in normalizedPaths {
-            guard let file = lookupResults[path]?.file else { continue }
-            let standardizedPath = file.standardizedFullPath
-            guard seenResolved.insert(standardizedPath).inserted else { continue }
-            resolvedPaths.append(standardizedPath)
+        for translatedPath in translatedPaths {
+            guard let file = lookupResults[translatedPath]?.file else { continue }
+            let physicalPath = file.standardizedFullPath
+            guard seenResolved.insert(physicalPath).inserted else { continue }
+            resolvedPaths.append(lookupContext.displayPath(forPhysicalPath: physicalPath, display: .full))
         }
         return resolvedPaths
     }
 
     nonisolated static func selectionByPromotingPathsToFullSelection(
         _ selection: StoredSelection,
-        paths: [String]
+        paths: [String],
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) -> StoredSelection {
+        let logicalSelection = lookupContext.logicalizeSelection(selection)
         let promotedPaths = StoredSelectionPathNormalization.standardizedPaths(paths)
-        guard !promotedPaths.isEmpty else { return selection }
+        guard !promotedPaths.isEmpty else { return logicalSelection == selection ? selection : logicalSelection }
 
-        let existingPaths = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
-        let existingAutoCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(selection.autoCodemapPaths)
-        let existingSlices = StoredSelectionPathNormalization.standardizedSlices(selection.slices)
-        let promotedSet = Set(promotedPaths)
+        let existingPaths = StoredSelectionPathNormalization.standardizedPaths(logicalSelection.selectedPaths)
+        let existingAutoCodemapPaths = StoredSelectionPathNormalization.standardizedPaths(logicalSelection.autoCodemapPaths)
+        let existingSlices = StoredSelectionPathNormalization.standardizedSlices(logicalSelection.slices)
+        let promotedKeys = Set(promotedPaths.map { physicalizedSelectionKey($0, lookupContext: lookupContext) })
 
         var mergedPaths = existingPaths
-        var seen = Set(existingPaths)
-        for path in promotedPaths where seen.insert(path).inserted {
+        var seen = Set(existingPaths.map { physicalizedSelectionKey($0, lookupContext: lookupContext) })
+        for path in promotedPaths where seen.insert(physicalizedSelectionKey(path, lookupContext: lookupContext)).inserted {
             mergedPaths.append(path)
         }
 
-        let filteredAutoCodemapPaths = existingAutoCodemapPaths.filter { !promotedSet.contains($0) }
-        let filteredSlices = existingSlices.filter { !promotedSet.contains($0.key) }
+        let filteredAutoCodemapPaths = existingAutoCodemapPaths.filter {
+            !promotedKeys.contains(physicalizedSelectionKey($0, lookupContext: lookupContext))
+        }
+        let filteredSlices = existingSlices.filter {
+            !promotedKeys.contains(physicalizedSelectionKey($0.key, lookupContext: lookupContext))
+        }
 
         let normalizedSelection = StoredSelection(
             selectedPaths: existingPaths,
@@ -11506,7 +11571,19 @@ final class AgentModeViewModel: ObservableObject {
             slices: filteredSlices,
             codemapAutoEnabled: selection.codemapAutoEnabled
         )
-        return updatedSelection == normalizedSelection ? selection : updatedSelection
+        return updatedSelection == normalizedSelection && logicalSelection == selection ? selection : updatedSelection
+    }
+
+    private nonisolated static func physicalizedSelectionKey(
+        _ path: String,
+        lookupContext: WorkspaceLookupContext
+    ) -> String {
+        let translated = lookupContext.translateInputPath(path)
+        let expanded = (translated as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            return StandardizedPath.absolute(expanded)
+        }
+        return StandardizedPath.relative(expanded)
     }
 
     @MainActor
@@ -11519,9 +11596,17 @@ final class AgentModeViewModel: ObservableObject {
     ) async -> String {
         let effectiveAgent = session?.selectedAgent ?? agent ?? activeSession?.selectedAgent ?? selectedAgent
         let withSkillExpansion = await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
+        let lookupContext: WorkspaceLookupContext = if let session {
+            await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
+        } else if let tabID = currentTabID {
+            await agentWorkspaceLookupContext(tabID: tabID, session: sessions[tabID])
+        } else {
+            .visibleWorkspace
+        }
         let withTaggedFiles = await augmentUserMessageWithTaggedFileContents(
             withSkillExpansion,
-            taggedFileAttachments: taggedFileAttachments
+            taggedFileAttachments: taggedFileAttachments,
+            lookupContext: lookupContext
         )
         let withAttachmentRendering = renderProviderMessage(
             text: withTaggedFiles,
@@ -11720,7 +11805,8 @@ final class AgentModeViewModel: ObservableObject {
     @MainActor
     private func augmentUserMessageWithTaggedFileContents(
         _ text: String,
-        taggedFileAttachments: [AgentTaggedFileAttachment] = []
+        taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async -> String {
         guard !text.contains("<file_contents>") else { return text }
         var orderedPaths: [String] = []
@@ -11743,7 +11829,8 @@ final class AgentModeViewModel: ObservableObject {
         guard let xml = await fileContentsXMLForTaggedPaths(
             orderedPaths,
             tokenBudget: Self.taggedFileContentsTokenBudget,
-            maxFiles: Self.taggedFileContentsMaxFiles
+            maxFiles: Self.taggedFileContentsMaxFiles,
+            lookupContext: lookupContext
         ) else {
             return text
         }
@@ -12836,7 +12923,11 @@ final class AgentModeViewModel: ObservableObject {
         // Check for queued instructions first
         if !session.pendingInstructions.isEmpty {
             let queuedText = session.pendingInstructions.removeFirst()
-            let text = await augmentUserMessageForProviderSend(queuedText)
+            let text = await augmentUserMessageForProviderSend(
+                queuedText,
+                agent: session.selectedAgent,
+                session: session
+            )
             return UserInstructionResponse(text: text, timedOut: false, elapsedSeconds: 0)
         }
 
@@ -13220,7 +13311,7 @@ final class AgentModeViewModel: ObservableObject {
         guard shouldIncludeInitialThreadContext(for: session) else {
             return initialMessage
         }
-        let context = await initialThreadContext(tabID: tabID)
+        let context = await initialThreadContext(tabID: tabID, session: session)
         return Self.composeInitialThreadMessage(
             initialMessage: initialMessage,
             fileTree: context.fileTree,
@@ -13229,7 +13320,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func buildInitialThreadContextBlock(tabID: UUID) async -> String? {
-        let context = await initialThreadContext(tabID: tabID)
+        let context = await initialThreadContext(tabID: tabID, session: sessions[tabID])
         let block = Self.composeInitialThreadMessage(
             initialMessage: "",
             fileTree: context.fileTree,
@@ -13273,7 +13364,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func initialThreadContext(tabID: UUID) async -> (fileTree: String, promptText: String?) {
+    private func initialThreadContext(tabID: UUID, session: TabSession?) async -> (fileTree: String, promptText: String?) {
         guard let promptManager else {
             return ("", nil)
         }
@@ -13285,19 +13376,12 @@ final class AgentModeViewModel: ObservableObject {
         let tabState = workspaceManager?.composeTab(with: tabID)
         let promptText = isActiveTab ? promptManager.promptText : tabState?.promptText
         let selection = tabState?.selection ?? StoredSelection()
-        let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+        let lookupContext = await agentWorkspaceLookupContext(tabID: tabID, session: session)
+        let fileTree = await AgentProviderContextBuilder.initialFileTree(
             selection: selection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: .auto,
-                filePathDisplay: .relative,
-                onlyIncludeRootsWithSelectedFiles: false,
-                includeLegend: true,
-                showCodeMapMarkers: true,
-                rootScope: .allLoaded
-            ),
-            profile: .uiAssisted
+            store: store,
+            lookupContext: lookupContext
         )
-        let fileTree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
         return (fileTree, promptText)
     }
 
@@ -14022,9 +14106,11 @@ final class AgentModeViewModel: ObservableObject {
             agentKind: sourceSession.selectedAgent
         )
         let transcriptXML = buildForkTranscriptXML(from: sourceTranscript, upToItemID: upToItemID)
+        let lookupContext = await agentWorkspaceLookupContext(tabID: sourceTabID, session: sourceSession)
         let fileContentsBlock = await buildForkFileContentsBlock(
             selection: sourceSelection,
-            tokenCap: 60000
+            tokenCap: 60000,
+            lookupContext: lookupContext
         )
         // delivery_id makes crash/restart retries best-effort idempotent at the prompt level.
         let deliveryID = UUID().uuidString
@@ -14047,9 +14133,11 @@ final class AgentModeViewModel: ObservableObject {
               let sourceTabID = currentTabID else { return "" }
         workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true)
         let sourceSelection = workspaceManager.composeTab(with: sourceTabID)?.selection ?? StoredSelection()
+        let lookupContext = await agentWorkspaceLookupContext(tabID: sourceTabID, session: sessions[sourceTabID])
         return await buildForkFileContentsBlock(
             selection: sourceSelection,
-            tokenCap: tokenCap
+            tokenCap: tokenCap,
+            lookupContext: lookupContext
         )
     }
 
@@ -14262,31 +14350,23 @@ final class AgentModeViewModel: ObservableObject {
     @MainActor
     private func buildForkFileContentsBlock(
         selection: StoredSelection,
-        tokenCap: Int
+        tokenCap: Int,
+        lookupContext: WorkspaceLookupContext
     ) async -> String {
         guard let promptManager else { return "" }
 
-        let store = promptManager.workspaceFileContextStore
-        let accountingService = PromptContextAccountingService()
-        let request = PromptContextAccountingRequest(
+        return await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
-            codeMapUsage: .auto,
-            filePathDisplay: .relative,
-            rootScope: .allLoaded,
-            pathLocateProfile: .uiAssisted
-        )
-        let accounting = await accountingService.calculatePromptStats(request: request, store: store)
-        let entries = accounting.resolvedEntries
-        let selectionTokens = accounting.tokenResult.totalTokenCountFilesOnly
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-
-        if selectionTokens > tokenCap {
-            // Over cap: use the same formatted summary as manage_selection tool responses
-            if let mcp = mcpServer {
+            tokenCap: tokenCap,
+            store: promptManager.workspaceFileContextStore,
+            lookupContext: lookupContext,
+            overTokenCapSummaryProvider: { [weak self] selection, lookupContext in
+                guard let self, let mcp = mcpServer else { return nil }
                 let reply = await mcp.buildTabSelectionReply(
                     from: selection,
                     includeBlocks: false,
-                    display: .relative
+                    display: .relative,
+                    lookupContextOverride: lookupContext
                 )
                 let summary = ToolOutputFormatter.formatSelectionReplyToString(reply)
                 return """
@@ -14295,16 +14375,6 @@ final class AgentModeViewModel: ObservableObject {
                 </selection_summary>
                 """
             }
-            // Fallback if MCP server unavailable
-            return "<selection_summary>\(entries.count) files, ~\(selectionTokens) tokens (contents omitted, exceeds \(tokenCap) token cap)</selection_summary>"
-        }
-
-        let blocks = PromptPackagingService.generateFileContents(entries, filePathDisplay: .relative, codemapSnapshots: codemapSnapshots)
-        guard !blocks.isEmpty else { return "" }
-        return """
-        <file_contents>
-        \(blocks.joined(separator: "\n\n"))
-        </file_contents>
-        """
+        )
     }
 }

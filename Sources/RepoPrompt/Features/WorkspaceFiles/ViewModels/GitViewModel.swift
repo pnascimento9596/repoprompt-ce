@@ -45,7 +45,8 @@ final class GitViewModel: ObservableObject {
     }
 
     func gitWorktreeContext(forStandardizedRootPath path: String) -> GitWorktreeContextSummary? {
-        gitWorktreeContextsByRootPath[path]
+        let key = CheckoutPathIdentity.canonicalPathOrOriginal(path)
+        return gitWorktreeContextsByRootPath[key] ?? gitWorktreeContextsByRootPath[path]
     }
 
     private func setGitWorktreeContextsByRootPath(_ contexts: [String: GitWorktreeContextSummary]) {
@@ -54,15 +55,16 @@ final class GitViewModel: ObservableObject {
     }
 
     private func setGitWorktreeContext(_ context: GitWorktreeContextSummary?, forStandardizedRootPath path: String) {
+        let key = CheckoutPathIdentity.canonicalPathOrOriginal(path)
         if let context {
-            guard gitWorktreeContextsByRootPath[path] != context else { return }
+            guard gitWorktreeContextsByRootPath[key] != context else { return }
             var next = gitWorktreeContextsByRootPath
-            next[path] = context
+            next[key] = context
             gitWorktreeContextsByRootPath = next
         } else {
-            guard gitWorktreeContextsByRootPath[path] != nil else { return }
+            guard gitWorktreeContextsByRootPath[key] != nil else { return }
             var next = gitWorktreeContextsByRootPath
-            next.removeValue(forKey: path)
+            next.removeValue(forKey: key)
             gitWorktreeContextsByRootPath = next
         }
     }
@@ -103,6 +105,9 @@ final class GitViewModel: ObservableObject {
     private var rootUpdateTask: Task<Void, Never>?
     private var rootUpdateGeneration: Int = 0
     private var lastVisibleRootPaths: [String] = []
+    private var lastVisibleRootRawPaths: [String] = []
+    private var gitContextRefreshTask: Task<Void, Never>?
+    private var isRefreshingGitContexts = false
 
     private var resolvedStateTask: Task<Void, Never>?
     private var latestStatusGeneration: Int = 0
@@ -162,12 +167,12 @@ final class GitViewModel: ObservableObject {
         availableTags = snapshot.availableTags
         currentGitRootPath = snapshot.gitRootPath
         if !snapshot.rootPath.isEmpty {
-            let standardizedRootPath = if selectedRootFolder?.fullPath == snapshot.rootPath {
-                selectedRootFolder?.standardizedFullPath ?? Self.normalizeForComparison(snapshot.rootPath)
+            let contextKey = if selectedRootFolder?.fullPath == snapshot.rootPath {
+                selectedRootFolder?.standardizedFullPath ?? snapshot.rootPath
             } else {
-                Self.normalizeForComparison(snapshot.rootPath)
+                snapshot.rootPath
             }
-            setGitWorktreeContext(snapshot.gitWorktreeContext, forStandardizedRootPath: standardizedRootPath)
+            setGitWorktreeContext(snapshot.gitWorktreeContext, forStandardizedRootPath: contextKey)
         }
         latestStatusGeneration = snapshot.generation
         latestStatusRootPath = snapshot.rootPath
@@ -339,15 +344,17 @@ final class GitViewModel: ObservableObject {
         gitEnabledStatus = gitEnabledStatus.filter { key, _ in
             rootFolders.contains { $0.fullPath == key }
         }
-        let visibleStandardizedPaths = Set(rootFolders.map(\.standardizedFullPath))
+        let visibleStandardizedPaths = Set(rootFolders.map { CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath) })
         setGitWorktreeContextsByRootPath(gitWorktreeContextsByRootPath.filter { key, _ in
             visibleStandardizedPaths.contains(key)
         })
 
         let rootPaths = rootFolders.map(\.fullPath)
-        let standardizedRootPaths = rootFolders.map(\.standardizedFullPath)
-        let standardizedPathByRootPath = Dictionary(uniqueKeysWithValues: rootFolders.map { ($0.fullPath, $0.standardizedFullPath) })
+        let standardizedRootPaths = rootFolders.map { CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath) }
+        let standardizedPathByRootPath = Self.standardizedPathByRootPath(for: rootFolders)
         lastVisibleRootPaths = standardizedRootPaths
+        lastVisibleRootRawPaths = rootPaths
+        updateGitContextRefreshLoop()
         rootUpdateGeneration &+= 1
         let generation = rootUpdateGeneration
         let inclusionMode = gitDiffInclusionMode
@@ -370,18 +377,7 @@ final class GitViewModel: ObservableObject {
                 guard generation == rootUpdateGeneration else { return (false, nil) }
                 guard standardizedRootPaths == lastVisibleRootPaths else { return (false, nil) }
 
-                var map: [String: Bool] = [:]
-                var contexts: [String: GitWorktreeContextSummary] = [:]
-                for detection in detections {
-                    map[detection.rootPath] = detection.isGitRepo
-                    if let context = detection.gitWorktreeContext {
-                        let standardizedPath = standardizedPathByRootPath[detection.rootPath]
-                            ?? StandardizedPath.absolute(detection.rootPath)
-                        contexts[standardizedPath] = context
-                    }
-                }
-                gitEnabledStatus = map
-                setGitWorktreeContextsByRootPath(contexts)
+                applyRootDetections(detections, standardizedPathByRootPath: standardizedPathByRootPath)
 
                 let gitFolders = gitEnabledRootFolders
                 if selectedRootFolder == nil ||
@@ -394,6 +390,63 @@ final class GitViewModel: ObservableObject {
             guard updateResult.isCurrent else { return }
             await statusActor.setSelectedRoot(updateResult.selectedRootPath)
         }
+    }
+
+    private static func standardizedPathByRootPath(for rootFolders: [FolderViewModel]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: rootFolders.map {
+            ($0.fullPath, CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath))
+        })
+    }
+
+    private func applyRootDetections(
+        _ detections: [GitStatusActor.RepoDetection],
+        standardizedPathByRootPath: [String: String]
+    ) {
+        var map: [String: Bool] = [:]
+        var contexts: [String: GitWorktreeContextSummary] = [:]
+        for detection in detections {
+            map[detection.rootPath] = detection.isGitRepo
+            if let context = detection.gitWorktreeContext {
+                let standardizedPath = standardizedPathByRootPath[detection.rootPath]
+                    ?? CheckoutPathIdentity.canonicalPathOrOriginal(detection.rootPath)
+                contexts[standardizedPath] = context
+            }
+        }
+        if gitEnabledStatus != map {
+            gitEnabledStatus = map
+        }
+        setGitWorktreeContextsByRootPath(contexts)
+    }
+
+    private func updateGitContextRefreshLoop() {
+        guard !lastVisibleRootRawPaths.isEmpty else {
+            gitContextRefreshTask?.cancel()
+            gitContextRefreshTask = nil
+            return
+        }
+        guard gitContextRefreshTask == nil else { return }
+        gitContextRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                guard !Task.isCancelled else { break }
+                await self?.refreshVisibleGitContextsFromWorkspaceRoots()
+            }
+        }
+    }
+
+    private func refreshVisibleGitContextsFromWorkspaceRoots() async {
+        guard !isRefreshingGitContexts else { return }
+        let rootPaths = lastVisibleRootRawPaths
+        guard !rootPaths.isEmpty else { return }
+        let standardizedRootPaths = lastVisibleRootPaths
+        let standardizedPathByRootPath = Self.standardizedPathByRootPath(for: availableRootFolders)
+        isRefreshingGitContexts = true
+        defer { isRefreshingGitContexts = false }
+        let detections = await statusActor.updateRoots(rootPaths)
+        guard rootPaths == lastVisibleRootRawPaths,
+              standardizedRootPaths == lastVisibleRootPaths
+        else { return }
+        applyRootDetections(detections, standardizedPathByRootPath: standardizedPathByRootPath)
     }
 
     // MARK: - Fetch API (delegates to actor)
@@ -434,6 +487,28 @@ final class GitViewModel: ObservableObject {
 
     func refresh() async {
         await fetchUnstagedFiles(trigger: .explicitRefresh)
+    }
+
+    func loadGitBranchSwitchOptions(forRootPath rootPath: String) async throws -> GitBranchSwitchOptions {
+        try await statusActor.loadGitBranchSwitchOptions(forRootPath: rootPath)
+    }
+
+    func preflightGitBranchSwitch(
+        branchName: String,
+        forRootPath rootPath: String
+    ) async throws -> GitBranchSwitchPreflight {
+        try await statusActor.preflightGitBranchSwitch(branchName: branchName, forRootPath: rootPath)
+    }
+
+    func switchGitBranch(
+        _ request: GitBranchSwitchRequest,
+        forRootPath rootPath: String,
+        standardizedRootPath: String? = nil
+    ) async throws -> GitBranchSwitchResult {
+        let (result, context) = try await statusActor.switchGitBranch(request, forRootPath: rootPath)
+        let contextKey = CheckoutPathIdentity.canonicalPathOrOriginal(standardizedRootPath ?? rootPath)
+        setGitWorktreeContext(context, forStandardizedRootPath: contextKey)
+        return result
     }
 
     var hasValidRepository: Bool {
@@ -665,6 +740,11 @@ final class GitViewModel: ObservableObject {
         latestStatusRootPath = nil
         currentGitRootPath = nil
         setGitWorktreeContextsByRootPath([:])
+        lastVisibleRootPaths = []
+        lastVisibleRootRawPaths = []
+        gitContextRefreshTask?.cancel()
+        gitContextRefreshTask = nil
+        isRefreshingGitContexts = false
         availableBranches = []
         availableRemoteBranches = []
         availableTags = []
@@ -681,6 +761,7 @@ final class GitViewModel: ObservableObject {
         statusStreamTask?.cancel()
         searchDebounceTask?.cancel()
         rootUpdateTask?.cancel()
+        gitContextRefreshTask?.cancel()
         resolvedStateTask?.cancel()
     }
 

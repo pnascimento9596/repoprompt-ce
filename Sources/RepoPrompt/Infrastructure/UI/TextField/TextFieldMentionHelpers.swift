@@ -16,6 +16,8 @@ final class FileTagMentionHelper {
     private weak var fileTagStore: WorkspaceFileContextStore?
     private var fileTagSearchService: WorkspaceSearchService?
     private weak var fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?
+    private var fileTagLookupContextIdentity: AnyHashable?
+    private var fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)?
     private var refreshTask: Task<Void, Never>?
     private var suggestionTask: Task<Void, Never>?
     private var commitFinalizationTask: Task<Void, Never>?
@@ -28,7 +30,9 @@ final class FileTagMentionHelper {
         enabled: Bool,
         store: WorkspaceFileContextStore?,
         searchService: WorkspaceSearchService?,
-        selectionCoordinator: WorkspaceSelectionCoordinator?
+        selectionCoordinator: WorkspaceSelectionCoordinator?,
+        lookupContextIdentity: AnyHashable?,
+        lookupContextProvider: (() async -> WorkspaceLookupContext)?
     ) {
         guard enabled else {
             let hadState = (service != nil || fileTagStore != nil || triggerRange != nil || refreshTask != nil || suggestionTask != nil)
@@ -36,6 +40,8 @@ final class FileTagMentionHelper {
             fileTagStore = nil
             fileTagSearchService = nil
             fileTagSelectionCoordinator = nil
+            fileTagLookupContextIdentity = nil
+            fileTagLookupContextProvider = nil
             if hadState {
                 dismiss()
             }
@@ -43,16 +49,23 @@ final class FileTagMentionHelper {
         }
 
         var shouldRefreshNow = false
-        if service == nil || store !== fileTagStore || searchService !== fileTagSearchService || selectionCoordinator !== fileTagSelectionCoordinator {
+        let lookupContextChanged = lookupContextIdentity != fileTagLookupContextIdentity
+        if service == nil || store !== fileTagStore || searchService !== fileTagSearchService || selectionCoordinator !== fileTagSelectionCoordinator || lookupContextChanged {
+            if lookupContextChanged {
+                dismiss()
+            }
             service = AgentFileTagSuggestionService(
                 store: store,
                 searchService: searchService,
                 selectionCoordinator: selectionCoordinator,
+                lookupContextProvider: lookupContextProvider,
                 maxResults: 5
             )
             fileTagStore = store
             fileTagSearchService = searchService
             fileTagSelectionCoordinator = selectionCoordinator
+            fileTagLookupContextIdentity = lookupContextIdentity
+            fileTagLookupContextProvider = lookupContextProvider
             shouldRefreshNow = true
         }
         if shouldRefreshNow {

@@ -113,7 +113,29 @@ struct AgentModeSessionsSidebarView: View {
                 apiSettingsVM: apiSettingsVM,
                 onManageWorkspaces: onManageWorkspaces,
                 worktreeIndicatorsByLogicalRootPath: worktreeIndicatorsByLogicalRootPath,
-                worktreeMergeAttentionsByLogicalRootPath: worktreeMergeAttentionsByLogicalRootPath
+                worktreeMergeAttentionsByLogicalRootPath: worktreeMergeAttentionsByLogicalRootPath,
+                branchSwitchActions: AgentWorkspaceBranchSwitchActions(
+                    loadOptions: { row in
+                        try await promptManager.gitViewModel.loadGitBranchSwitchOptions(forRootPath: row.fullPath)
+                    },
+                    preflight: { row, branchName in
+                        try await promptManager.gitViewModel.preflightGitBranchSwitch(
+                            branchName: branchName,
+                            forRootPath: row.fullPath
+                        )
+                    },
+                    switchBranch: { row, preflight in
+                        try await agentModeVM.switchGitBranchFromWorkspaceRoot(
+                            row,
+                            preflight: preflight,
+                            gitViewModel: promptManager.gitViewModel,
+                            currentTabID: currentTabID
+                        )
+                    },
+                    isAgentRunActive: {
+                        agentModeVM.isAgentRunActive(tabID: currentTabID)
+                    }
+                )
             )
         }
     }

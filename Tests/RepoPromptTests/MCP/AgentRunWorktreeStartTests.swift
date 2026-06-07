@@ -602,10 +602,26 @@ final class AgentRunWorktreeStartTests: XCTestCase {
             let fixture = try makeGitFixture()
             let parentWorktree = fixture.sandbox.appendingPathComponent("parent-worktree", isDirectory: true)
             let explicitWorktree = fixture.sandbox.appendingPathComponent("explicit-worktree", isDirectory: true)
-            try runGit(["worktree", "add", "-b", "feature/parent-\(fixture.suffix)", parentWorktree.path, "HEAD"], cwd: fixture.repo)
-            try runGit(["worktree", "add", "-b", "feature/explicit-\(fixture.suffix)", explicitWorktree.path, "HEAD"], cwd: fixture.repo)
-            let descriptors = try await VCSService.shared.listGitWorktrees(at: fixture.repo)
-            let explicitDescriptor = try XCTUnwrap(descriptors.first { samePath($0.path, explicitWorktree.path) })
+            let expectedHead = try GitWorktreeTestSupport.runGit(["rev-parse", "HEAD"], cwd: fixture.repo)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let parentBranch = "feature/parent-\(fixture.suffix)"
+            let explicitBranch = "feature/explicit-\(fixture.suffix)"
+            try runGit(["worktree", "add", "-b", parentBranch, parentWorktree.path, "HEAD"], cwd: fixture.repo)
+            try runGit(["worktree", "add", "-b", explicitBranch, explicitWorktree.path, "HEAD"], cwd: fixture.repo)
+            _ = try await GitWorktreeTestSupport.waitForStableDescriptor(
+                repo: fixture.repo,
+                path: parentWorktree,
+                expectedBranch: parentBranch,
+                expectedHead: expectedHead,
+                listDescriptors: { try await VCSService.shared.listGitWorktrees(at: fixture.repo) }
+            )
+            let explicitDescriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+                repo: fixture.repo,
+                path: explicitWorktree,
+                expectedBranch: explicitBranch,
+                expectedHead: expectedHead,
+                listDescriptors: { try await VCSService.shared.listGitWorktrees(at: fixture.repo) }
+            )
             let window = try await makeWindow(root: fixture.repo)
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
             let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -628,7 +644,23 @@ final class AgentRunWorktreeStartTests: XCTestCase {
                 args["inherit_worktree"] = .bool(false)
             }
 
-            let value = try await service.execute(args: args)
+            let value: Value
+            do {
+                value = try await service.execute(args: args)
+            } catch {
+                let descriptors = await (try? VCSService.shared.listGitWorktrees(at: fixture.repo)) ?? []
+                XCTFail("""
+                agent_run.start failed after explicit worktree descriptor had stabilized: \(error.localizedDescription)
+                requested_worktree_id: \(explicitDescriptor.worktreeID)
+                \(GitWorktreeTestSupport.descriptorDump(
+                    repo: fixture.repo,
+                    expectedPath: explicitWorktree,
+                    requestedID: explicitDescriptor.worktreeID,
+                    descriptors: descriptors
+                ))
+                """)
+                throw error
+            }
 
             let object = try XCTUnwrap(value.objectValue)
             let sessionObject = try XCTUnwrap(object["session"]?.objectValue)

@@ -49,7 +49,8 @@ extension AgentModeViewModel {
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
             autoEditEnabled: autoEditEnabled,
             stagedSlashCommand: stagedSlashCommandProps(tabID: tabID),
-            draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init)
+            draftRestorationEvent: draftRestorationEvent.map(AgentDraftRestorationProps.init),
+            fileTagLookupContextIdentity: agentWorkspaceLookupContextIdentity(tabID: tabID, session: session)
         )
     }
 

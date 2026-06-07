@@ -1246,6 +1246,47 @@ extension MCPServerViewModel {
         return merged
     }
 
+    enum MCPSelectionCoordinatorPersistenceResult: Equatable {
+        case persisted
+        case unchanged
+        case unavailable
+    }
+
+    static func logicalizeSelectionForPersistence(
+        _ selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext
+    ) -> StoredSelection {
+        lookupContext.logicalizeSelection(selection)
+    }
+
+    @MainActor
+    @discardableResult
+    static func persistMCPSelectionThroughCoordinator(
+        _ selection: StoredSelection,
+        for tabID: UUID,
+        selectionCoordinator: WorkspaceSelectionCoordinator?
+    ) async -> MCPSelectionCoordinatorPersistenceResult {
+        guard let selectionCoordinator,
+              let current = selectionCoordinator.selectionSnapshot(for: tabID, flushPendingUIIfActive: false)
+        else { return .unavailable }
+        guard current.selection != selection else { return .unchanged }
+        _ = await selectionCoordinator.persistSelection(
+            selection,
+            for: tabID,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: true
+        )
+        return .persisted
+    }
+
+    @MainActor
+    private func persistenceSafeTabContext(_ context: TabContextSnapshot) async -> TabContextSnapshot {
+        let lookupContext = await lookupContext(for: context)
+        var persisted = context
+        persisted.selection = Self.logicalizeSelectionForPersistence(context.selection, lookupContext: lookupContext)
+        return persisted
+    }
+
     @MainActor
     func persistResolvedTabContextSnapshot(
         _ resolved: ResolvedTabContextSnapshot,
@@ -1253,18 +1294,60 @@ extension MCPServerViewModel {
         mutated: Bool
     ) async {
         guard mutated else { return }
-        let context = resolved.snapshot
+        let context = await persistenceSafeTabContext(resolved.snapshot)
         if !resolved.usesActiveTabCompatibility,
            let connectionID = metadata.connectionID,
            var latest = tabContextByConnectionID[connectionID],
            latest.tabID == context.tabID
         {
-            latest.selection = context.selection
-            tabContextByConnectionID[connectionID] = latest
-            await pushVirtualContextToUI(latest)
+            let persistenceResult = await Self.persistMCPSelectionThroughCoordinator(
+                context.selection,
+                for: context.tabID,
+                selectionCoordinator: selectionCoordinator
+            )
+            if latest.selection != context.selection {
+                latest.selection = context.selection
+                tabContextByConnectionID[connectionID] = latest
+                await pushVirtualContextToUI(latest)
+            }
+            if persistenceResult == .unavailable {
+                await commitTabContext(selectionOnlyCommitContext(from: context))
+            }
         } else {
-            await commitTabContext(selectionOnlyCommitContext(from: context))
+            let persistenceResult = await Self.persistMCPSelectionThroughCoordinator(
+                context.selection,
+                for: context.tabID,
+                selectionCoordinator: selectionCoordinator
+            )
+            if persistenceResult == .unavailable {
+                await commitTabContext(selectionOnlyCommitContext(from: context))
+            }
         }
+    }
+
+    @MainActor
+    private func readFileAutoSelectionPersistenceContext(
+        selection: StoredSelection,
+        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+    ) async -> TabContextSnapshot? {
+        guard var context = readFileAutoSelectionContext(for: contextKey),
+              context.tabID == contextKey.tabID
+        else { return nil }
+        context.selection = selection
+        return context
+    }
+
+    @MainActor
+    private func persistedSelectionForReadFileAutoSelection(
+        selection: StoredSelection,
+        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+    ) async -> StoredSelection {
+        guard let persistenceContext = await readFileAutoSelectionPersistenceContext(
+            selection: selection,
+            contextKey: contextKey
+        ) else { return selection }
+        let persistedContext = await persistenceSafeTabContext(persistenceContext)
+        return persistedContext.selection
     }
 
     @MainActor
@@ -1279,19 +1362,34 @@ extension MCPServerViewModel {
               let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == contextKey.tabID })
         else { return false }
 
+        let persistedSelection = await persistedSelectionForReadFileAutoSelection(
+            selection: selection,
+            contextKey: contextKey
+        )
+
         if case let .bound(connectionID, _) = contextKey.route,
            var latest = tabContextByConnectionID[connectionID]
         {
-            latest.selection = selection
+            latest.selection = persistedSelection
             tabContextByConnectionID[connectionID] = latest
         }
 
-        var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
-        guard updatedTab.selection != selection else { return false }
-        updatedTab.selection = selection
-        updatedTab.lastModified = Date()
-        await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
-            manager.updateComposeTabStoredOnly(updatedTab)
+        let currentTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
+        guard currentTab.selection != persistedSelection else { return false }
+        let persistenceResult = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
+            await Self.persistMCPSelectionThroughCoordinator(
+                persistedSelection,
+                for: contextKey.tabID,
+                selectionCoordinator: selectionCoordinator
+            )
+        }
+        if persistenceResult == .unavailable {
+            var updatedTab = currentTab
+            updatedTab.selection = persistedSelection
+            updatedTab.lastModified = Date()
+            await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
+                manager.updateComposeTabStoredOnly(updatedTab)
+            }
         }
         return true
     }
@@ -1337,43 +1435,10 @@ extension MCPServerViewModel {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding]
     ) async -> WorkspaceRootBindingProjection? {
-        let store = promptVM.workspaceFileContextStore
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
-        var boundRoots: [WorkspaceRootBindingProjection.BoundRoot] = []
-        for binding in bindings {
-            let logicalPath = StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath)
-            let logicalRoot = visibleRoots.first { $0.standardizedFullPath == logicalPath }
-                ?? WorkspaceRootRef(
-                    id: UUID(),
-                    name: binding.logicalRootName ?? URL(fileURLWithPath: logicalPath).lastPathComponent,
-                    fullPath: logicalPath
-                )
-            do {
-                let physicalRecord = try await store.loadRoot(
-                    path: binding.worktreeRootPath,
-                    kind: .sessionWorktree,
-                    respectGitignore: true,
-                    respectRepoIgnore: true,
-                    respectCursorignore: true
-                )
-                let physicalRoot = WorkspaceRootRef(
-                    id: physicalRecord.id,
-                    name: logicalRoot.name,
-                    fullPath: physicalRecord.standardizedFullPath
-                )
-                boundRoots.append(.init(logicalRoot: logicalRoot, physicalRoot: physicalRoot, binding: binding))
-            } catch {
-                selectionLog("Failed to materialize session worktree root for session=\(sessionID): \(error.localizedDescription)")
-                let physicalRoot = WorkspaceRootRef(
-                    id: UUID(),
-                    name: logicalRoot.name,
-                    fullPath: StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
-                )
-                boundRoots.append(.init(logicalRoot: logicalRoot, physicalRoot: physicalRoot, binding: binding))
-            }
-        }
-        guard !boundRoots.isEmpty else { return nil }
-        return WorkspaceRootBindingProjection(sessionID: sessionID, boundRoots: boundRoots, visibleLogicalRoots: visibleRoots)
+        await WorkspaceRootBindingProjectionMaterializer(store: promptVM.workspaceFileContextStore).materialize(
+            sessionID: sessionID,
+            bindings: bindings
+        )
     }
 
     static func resolveFileToolLookupRootScope(

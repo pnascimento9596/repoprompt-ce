@@ -165,16 +165,17 @@ struct AgentModeDetailWithSidebarView: View {
                 agentModeVM.syncTranscriptUIState()
                 agentModeVM.syncRunInteractionUIState()
                 agentModeVM.syncStatusPillsUIState()
-                agentModeVM.syncRuntimeMetricsUIState(
-                    liveSelectedFileCount: promptManager.fileManager.selectedFiles.count
-                )
+                syncRuntimeMetricsSelectionCount()
                 stressHarness?.bootstrapIfNeeded(currentTabID: currentTabID)
             }
             .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
                 syncContextBuilderQuestionPresentation()
             }
-            .onReceive(promptManager.fileManager.$selectedFiles.map(\.count).removeDuplicates()) { count in
-                agentModeVM.syncRuntimeMetricsUIState(liveSelectedFileCount: count)
+            .onReceive(promptManager.fileManager.$selectedFiles.map(\.count).removeDuplicates()) { _ in
+                syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
+            }
+            .onReceive(selectionCoordinator.changes) { change in
+                syncRuntimeMetricsSelectionCount(from: change)
             }
             .onChange(of: currentTabID) { _, tabID in
                 syncContextBuilderQuestionPresentation()
@@ -182,9 +183,7 @@ struct AgentModeDetailWithSidebarView: View {
                 agentModeVM.syncTranscriptUIState()
                 agentModeVM.syncRunInteractionUIState()
                 agentModeVM.syncStatusPillsUIState()
-                agentModeVM.syncRuntimeMetricsUIState(
-                    liveSelectedFileCount: promptManager.fileManager.selectedFiles.count
-                )
+                syncRuntimeMetricsSelectionCount()
                 stressHarness?.bootstrapIfNeeded(currentTabID: tabID)
             }
             .onDisappear { stressHarness?.pause() }
@@ -212,15 +211,16 @@ struct AgentModeDetailWithSidebarView: View {
                 agentModeVM.syncTranscriptUIState()
                 agentModeVM.syncRunInteractionUIState()
                 agentModeVM.syncStatusPillsUIState()
-                agentModeVM.syncRuntimeMetricsUIState(
-                    liveSelectedFileCount: promptManager.fileManager.selectedFiles.count
-                )
+                syncRuntimeMetricsSelectionCount()
             }
             .onReceive(contextBuilderAgentVM.$pendingAskUser) { _ in
                 syncContextBuilderQuestionPresentation()
             }
-            .onReceive(promptManager.fileManager.$selectedFiles.map(\.count).removeDuplicates()) { count in
-                agentModeVM.syncRuntimeMetricsUIState(liveSelectedFileCount: count)
+            .onReceive(promptManager.fileManager.$selectedFiles.map(\.count).removeDuplicates()) { _ in
+                syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent()
+            }
+            .onReceive(selectionCoordinator.changes) { change in
+                syncRuntimeMetricsSelectionCount(from: change)
             }
             .onChange(of: currentTabID) { _, tabID in
                 syncContextBuilderQuestionPresentation()
@@ -228,14 +228,42 @@ struct AgentModeDetailWithSidebarView: View {
                 agentModeVM.syncTranscriptUIState()
                 agentModeVM.syncRunInteractionUIState()
                 agentModeVM.syncStatusPillsUIState()
-                agentModeVM.syncRuntimeMetricsUIState(
-                    liveSelectedFileCount: promptManager.fileManager.selectedFiles.count
-                )
+                syncRuntimeMetricsSelectionCount()
             }
         #endif
     }
 
     private func syncContextBuilderQuestionPresentation() {
         isContextBuilderQuestionPresented = contextBuilderAgentVM.pendingAskUser(for: currentTabID) != nil
+    }
+
+    private var runtimeMetricsTargetTabID: UUID? {
+        currentTabID ?? promptManager.activeComposeTabID
+    }
+
+    private func syncRuntimeMetricsSelectionCount() {
+        guard let targetTabID = runtimeMetricsTargetTabID,
+              let snapshot = selectionCoordinator.selectionSnapshot(for: targetTabID, flushPendingUIIfActive: true)
+        else {
+            agentModeVM.syncRuntimeMetricsUIState(liveSelectedFileCount: nil)
+            return
+        }
+        syncRuntimeMetricsSelectionCount(selection: snapshot.selection)
+    }
+
+    private func syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent() {
+        guard runtimeMetricsTargetTabID == selectionCoordinator.activeTabID() else { return }
+        syncRuntimeMetricsSelectionCount()
+    }
+
+    private func syncRuntimeMetricsSelectionCount(from change: WorkspaceSelectionCoordinator.Change) {
+        guard change.tabID == runtimeMetricsTargetTabID else { return }
+        syncRuntimeMetricsSelectionCount(selection: change.selection)
+    }
+
+    private func syncRuntimeMetricsSelectionCount(selection: StoredSelection) {
+        agentModeVM.syncRuntimeMetricsUIState(
+            liveSelectedFileCount: AgentContextExportResolver.selectionFileCount(selection)
+        )
     }
 }

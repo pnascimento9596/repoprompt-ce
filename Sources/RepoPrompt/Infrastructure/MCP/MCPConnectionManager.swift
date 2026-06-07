@@ -2483,7 +2483,7 @@ actor ServerNetworkManager {
         let now = Date()
         if now.timeIntervalSince(lastKillSignalCleanupAt) >= killSignalCleanupInterval {
             lastKillSignalCleanupAt = now
-            MCPKillSignal.cleanupStaleSignals()
+            MCPKillSignal.cleanupStaleSignals(in: MCPFilesystemConstants.identity.killSignalsDirectoryURL())
         }
     }
 
@@ -2597,20 +2597,6 @@ actor ServerNetworkManager {
         lastBootstrapHealthCheckAt = now
 
         let socketPath = resolvedBootstrapSocketURL().path
-        let exists = FileManager.default.fileExists(atPath: socketPath)
-
-        if !exists {
-            log.warning("Bootstrap socket path missing: \(socketPath). Restarting listener.")
-            restartBootstrapSocketServer(reason: "socket_path_missing", lifecycleGeneration: healthCheckLifecycleGeneration)
-            return
-        }
-
-        if !isUnixDomainSocket(atPath: socketPath) {
-            log.warning("Bootstrap socket path is not a socket: \(socketPath). Restarting listener.")
-            restartBootstrapSocketServer(reason: "socket_path_not_socket", lifecycleGeneration: healthCheckLifecycleGeneration)
-            return
-        }
-
         guard let server = bootstrapSocketServer,
               bootstrapSocketServerLifecycleGeneration == healthCheckLifecycleGeneration
         else {
@@ -2624,6 +2610,12 @@ actor ServerNetworkManager {
 
         let diagnostics = await server.diagnostics()
         guard isCurrentBootstrapListener(server, lifecycleGeneration: healthCheckLifecycleGeneration) else { return }
+        if !diagnostics.ownsSocketPath {
+            log.warning("Bootstrap listener no longer owns socket path \(socketPath) (status=\(String(describing: diagnostics.socketPathStatus))); stopping orphan and restarting with backoff.")
+            restartBootstrapSocketServer(reason: "socket_path_ownership_lost", lifecycleGeneration: healthCheckLifecycleGeneration)
+            return
+        }
+
         if !diagnostics.listenFDValid {
             log.warning("Bootstrap listen FD invalid; restarting.")
             restartBootstrapSocketServer(reason: "listen_fd_invalid", lifecycleGeneration: healthCheckLifecycleGeneration)
@@ -2647,14 +2639,6 @@ actor ServerNetworkManager {
     private func bootstrapBackoffDelay(for failures: Int) -> TimeInterval {
         let capped = min(failures, 4)
         return min(10.0, pow(2.0, Double(capped)))
-    }
-
-    private func isUnixDomainSocket(atPath path: String) -> Bool {
-        var info = stat()
-        if lstat(path, &info) != 0 {
-            return false
-        }
-        return (info.st_mode & S_IFMT) == S_IFSOCK
     }
 
     private func restartBootstrapSocketServer(
@@ -3722,7 +3706,8 @@ actor ServerNetworkManager {
                 try MCPKillSignal.writeKillSignal(
                     sessionToken: token,
                     reason: reason,
-                    message: message
+                    message: message,
+                    directory: MCPFilesystemConstants.identity.killSignalsDirectoryURL()
                 )
                 connectionLog("Wrote kill signal for session \(token.prefix(8))...")
             } catch {
@@ -3751,7 +3736,7 @@ actor ServerNetworkManager {
         // Periodic cleanup of expired entries
         cleanupExpiredKilledSessions()
         cleanupExpiredUserKilledClients()
-        MCPKillSignal.cleanupStaleSignals()
+        MCPKillSignal.cleanupStaleSignals(in: MCPFilesystemConstants.identity.killSignalsDirectoryURL())
     }
 
     /// Soft-disconnects a connection without kill signals or cooldowns.
@@ -8400,6 +8385,24 @@ actor ServerNetworkManager {
         return await limiter.activeCount() > 0
     }
 
+    #if DEBUG
+        func connectionLimiterSnapshotForTesting(
+            connectionID: UUID
+        ) async -> AsyncLimiter.DebugSnapshot? {
+            guard let limiter = callLimiters[connectionID] else { return nil }
+            return await limiter.debugSnapshot()
+        }
+
+        func setConnectionLimiterStateObserverForTesting(
+            connectionID: UUID,
+            observer: ((AsyncLimiter.DebugSnapshot) -> Void)?
+        ) async -> Bool {
+            guard let limiter = callLimiters[connectionID] else { return false }
+            await limiter.setDebugStateObserver(observer)
+            return true
+        }
+    #endif
+
     private func oldestEvictableConnectionID() async -> UUID? {
         let threshold = pressureEvictIdleSeconds
         guard threshold > 0 else { return nil }
@@ -8587,6 +8590,16 @@ actor AsyncLimiter {
     /// Tracks the number of tasks currently inside withPermit (including queued ones)
     private var inFlight: Int = 0
 
+    #if DEBUG
+        struct DebugSnapshot: Equatable {
+            let permits: Int
+            let waiterCount: Int
+            let inFlight: Int
+        }
+
+        private var debugStateObserver: ((DebugSnapshot) -> Void)?
+    #endif
+
     init(limit: Int) {
         self.limit = max(1, limit)
         permits = max(1, limit)
@@ -8596,9 +8609,13 @@ actor AsyncLimiter {
     private func acquirePermit() async {
         if permits > 0 {
             permits -= 1
+            notifyDebugStateChanged()
             return
         }
-        await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation {
+            waiters.append($0)
+            notifyDebugStateChanged()
+        }
         // When resumed, the caller now has a permit (recycled from a release)
     }
 
@@ -8611,6 +8628,7 @@ actor AsyncLimiter {
         } else {
             permits = min(permits + 1, limit)
         }
+        notifyDebugStateChanged()
     }
 
     /// Number of in-flight operations (0 means idle).
@@ -8619,12 +8637,43 @@ actor AsyncLimiter {
         inFlight
     }
 
+    #if DEBUG
+        func debugSnapshot() -> DebugSnapshot {
+            makeDebugSnapshot()
+        }
+
+        func setDebugStateObserver(
+            _ observer: ((DebugSnapshot) -> Void)?
+        ) {
+            debugStateObserver = observer
+            observer?(makeDebugSnapshot())
+        }
+
+        private func makeDebugSnapshot() -> DebugSnapshot {
+            DebugSnapshot(
+                permits: permits,
+                waiterCount: waiters.count,
+                inFlight: inFlight
+            )
+        }
+
+        private func notifyDebugStateChanged() {
+            debugStateObserver?(makeDebugSnapshot())
+        }
+    #else
+        private func notifyDebugStateChanged() {}
+    #endif
+
     /// Executes an operation with a permit, limiting concurrency.
     func withPermit<T>(
         _ op: @Sendable () async throws -> T
     ) async rethrows -> T {
         inFlight += 1
-        defer { inFlight -= 1 }
+        notifyDebugStateChanged()
+        defer {
+            inFlight -= 1
+            notifyDebugStateChanged()
+        }
         await acquirePermit()
         defer { releasePermit() }
         return try await op()

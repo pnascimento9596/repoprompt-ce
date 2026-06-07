@@ -49,9 +49,45 @@ final class GitWorktreeContextResolverTests: XCTestCase {
         XCTAssertEqual(refreshed.first?.gitWorktreeContext?.branchDisplayText, "feature/context-refresh")
     }
 
-    private func makeGitFixture() throws -> URL {
+    func testGitStatusActorSwitchBranchRefreshesSelectedNestedRootInSameCheckout() async throws {
         let root = try makeTemporaryDirectory()
-        let repo = root.appendingPathComponent("repo", isDirectory: true)
+        let targetRepo = try makeGitFixture(name: "target", in: root)
+        let selectedNestedRoot = targetRepo.appendingPathComponent("apps/web", isDirectory: true)
+        try runGit(["switch", "-c", "feature/non-selected"], cwd: targetRepo)
+        try runGit(["switch", "main"], cwd: targetRepo)
+
+        let actor = GitStatusActor(vcsService: VCSService())
+        _ = await actor.updateRoots([selectedNestedRoot.path, targetRepo.path])
+        await actor.setSelectedRoot(selectedNestedRoot.path)
+        let initialSnapshot = await actor.getLatestSnapshot()
+        XCTAssertEqual(initialSnapshot?.gitWorktreeContext?.branchDisplayText, "main")
+
+        let preflight = try await actor.preflightGitBranchSwitch(
+            branchName: "feature/non-selected",
+            forRootPath: targetRepo.path
+        )
+        let (_, context) = try await actor.switchGitBranch(
+            GitBranchSwitchRequest(
+                branchName: "feature/non-selected",
+                expectedCurrentBranch: preflight.currentBranch,
+                expectedCurrentHead: preflight.currentHead
+            ),
+            forRootPath: targetRepo.path
+        )
+
+        XCTAssertEqual(context?.branchDisplayText, "feature/non-selected")
+        let refreshedSnapshot = await actor.getLatestSnapshot()
+        XCTAssertEqual(refreshedSnapshot?.rootPath, selectedNestedRoot.path)
+        XCTAssertEqual(refreshedSnapshot?.gitWorktreeContext?.branchDisplayText, "feature/non-selected")
+    }
+
+    private func makeGitFixture(name: String = "repo", in existingRoot: URL? = nil) throws -> URL {
+        let root = if let existingRoot {
+            existingRoot
+        } else {
+            try makeTemporaryDirectory()
+        }
+        let repo = root.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
         try runGit(["init", "-b", "main"], cwd: repo)
         try runGit(["config", "user.email", "test@example.com"], cwd: repo)

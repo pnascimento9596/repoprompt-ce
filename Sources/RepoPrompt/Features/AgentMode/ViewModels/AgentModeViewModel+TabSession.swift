@@ -89,6 +89,10 @@ extension AgentModeViewModel {
         /// until its first destination-side send succeeds.
         var hasSentFirstMessage: Bool = false
 
+        var deservesProviderVisibleBranchSwitchNote: Bool {
+            runState.isActive || providerSessionID != nil || !items.isEmpty || hasSentFirstMessage
+        }
+
         /// Ephemeral location intent for a new manual thread. It is consumed on first send
         /// and intentionally never persisted as session state.
         var pendingInitialStartLocation: InitialStartLocation = .local

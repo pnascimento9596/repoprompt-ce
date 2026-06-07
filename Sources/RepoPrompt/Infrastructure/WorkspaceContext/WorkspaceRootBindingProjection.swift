@@ -266,6 +266,57 @@ struct WorkspaceRootBindingProjection: Equatable {
     }
 }
 
+struct WorkspaceRootBindingProjectionMaterializer {
+    let store: WorkspaceFileContextStore
+
+    func materialize(
+        sessionID: UUID,
+        bindings: [AgentSessionWorktreeBinding]
+    ) async -> WorkspaceRootBindingProjection? {
+        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        var boundRoots: [WorkspaceRootBindingProjection.BoundRoot] = []
+        for binding in bindings {
+            let logicalPath = StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath)
+            let logicalRoot = visibleRoots.first { $0.standardizedFullPath == logicalPath }
+                ?? WorkspaceRootRef(
+                    id: UUID(),
+                    name: binding.logicalRootName ?? URL(fileURLWithPath: logicalPath).lastPathComponent,
+                    fullPath: logicalPath
+                )
+            let physicalRoot: WorkspaceRootRef
+            do {
+                let physicalRecord = try await store.loadRoot(
+                    path: binding.worktreeRootPath,
+                    kind: .sessionWorktree,
+                    respectGitignore: true,
+                    respectRepoIgnore: true,
+                    respectCursorignore: true
+                )
+                physicalRoot = WorkspaceRootRef(
+                    id: physicalRecord.id,
+                    name: logicalRoot.name,
+                    fullPath: physicalRecord.standardizedFullPath
+                )
+            } catch {
+                // Fail closed for bound sessions: keep the logical -> physical projection so
+                // display paths and complete-diff policy still know this session is worktree-bound,
+                // but do not substitute the logical/base root when the physical worktree cannot be
+                // loaded. `sessionBoundWorkspace` scopes only include actually loaded
+                // `.sessionWorktree` roots, so lookups against this fabricated ref miss instead of
+                // reading stale base-checkout content.
+                physicalRoot = WorkspaceRootRef(
+                    id: UUID(),
+                    name: logicalRoot.name,
+                    fullPath: StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
+                )
+            }
+            boundRoots.append(.init(logicalRoot: logicalRoot, physicalRoot: physicalRoot, binding: binding))
+        }
+        guard !boundRoots.isEmpty else { return nil }
+        return WorkspaceRootBindingProjection(sessionID: sessionID, boundRoots: boundRoots, visibleLogicalRoots: visibleRoots)
+    }
+}
+
 struct WorkspaceLookupContext: Equatable {
     let rootScope: WorkspaceLookupRootScope
     let bindingProjection: WorkspaceRootBindingProjection?

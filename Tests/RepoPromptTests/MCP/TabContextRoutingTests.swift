@@ -1,9 +1,17 @@
+import Combine
 import Foundation
 import MCP
 @testable import RepoPrompt
 import XCTest
 
 final class TabContextRoutingTests: XCTestCase {
+    private var cancellables: Set<AnyCancellable> = []
+
+    override func tearDown() {
+        cancellables.removeAll()
+        super.tearDown()
+    }
+
     func testBindingResolverResolvesExplicitContextIDAndLegacyTabIDAlias() async throws {
         let contextID = UUID()
         let workspaceID = UUID()
@@ -300,6 +308,219 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testPersistResolvedTabContextSnapshotPublishesInactiveTabAndLogicalizesWorktreeSelection() async throws {
+        let logicalRoot = try makeTemporaryDirectory(named: "logical-root")
+        let worktreeRoot = try makeTemporaryDirectory(named: "worktree-root")
+        try FileManager.default.createDirectory(
+            at: logicalRoot.appendingPathComponent("Sources", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: worktreeRoot.appendingPathComponent("Sources", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try "// app".write(to: worktreeRoot.appendingPathComponent("Sources/App.swift"), atomically: true, encoding: .utf8)
+        try "// dependency".write(to: worktreeRoot.appendingPathComponent("Sources/Dependency.swift"), atomically: true, encoding: .utf8)
+        defer {
+            try? FileManager.default.removeItem(at: logicalRoot.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
+        }
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let activeTabID = UUID()
+        let inactiveTabID = UUID()
+        let activeSelection = StoredSelection(selectedPaths: [logicalRoot.appendingPathComponent("Sources/Active.swift").path])
+        let inactiveInitialSelection = StoredSelection(selectedPaths: [logicalRoot.appendingPathComponent("Sources/Old.swift").path])
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Persist Resolved Tab Context \(UUID().uuidString.prefix(8))",
+            repoPaths: [logicalRoot.path],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "persistResolvedTabContextSnapshotTest")
+        let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+            ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
+            ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveInitialSelection)
+        ]
+        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = activeTabID
+        await window.workspaceManager.switchWorkspace(
+            to: window.workspaceManager.workspaces[workspaceIndex],
+            saveState: false,
+            reason: "persistResolvedTabContextSnapshotTestTabs"
+        )
+        let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        _ = try await window.workspaceFileContextStore.loadRoot(path: logicalRoot.path)
+
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        window.selectionCoordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let sessionID = UUID()
+        let physicalSelection = StoredSelection(
+            selectedPaths: [worktreeRoot.appendingPathComponent("Sources/App.swift").path],
+            autoCodemapPaths: [worktreeRoot.appendingPathComponent("Sources/Dependency.swift").path],
+            codemapAutoEnabled: false
+        )
+        let context = MCPServerViewModel.TabContextSnapshot(
+            tabID: inactiveTabID,
+            windowID: window.windowID,
+            workspaceID: workspace.id,
+            promptText: "agent prompt",
+            selection: physicalSelection,
+            selectedMetaPromptIDs: [],
+            tabName: "Agent",
+            runID: nil,
+            activeAgentSessionID: sessionID,
+            worktreeBindings: [
+                makeWorktreeBinding(
+                    logicalRoot: WorkspaceRootRef(id: UUID(), name: "logical-root", fullPath: logicalRoot.path),
+                    physicalRoot: WorkspaceRootRef(id: UUID(), name: "logical-root", fullPath: worktreeRoot.path)
+                )
+            ],
+            explicitlyBound: true
+        )
+        let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
+            snapshot: context,
+            usesActiveTabCompatibility: false
+        )
+        let activeSelectionBeforePersistence = try XCTUnwrap(window.workspaceManager.composeTab(with: activeTabID)?.selection)
+
+        await window.mcpServer.persistResolvedTabContextSnapshot(
+            resolved,
+            metadata: MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "test", windowID: window.windowID),
+            mutated: true
+        )
+
+        let persistedInactiveSelection = try XCTUnwrap(window.workspaceManager.composeTab(with: inactiveTabID)?.selection)
+        XCTAssertEqual(
+            persistedInactiveSelection.selectedPaths,
+            [logicalRoot.appendingPathComponent("Sources/App.swift").path]
+        )
+        XCTAssertEqual(
+            persistedInactiveSelection.autoCodemapPaths,
+            [logicalRoot.appendingPathComponent("Sources/Dependency.swift").path]
+        )
+        XCTAssertEqual(window.workspaceManager.composeTab(with: activeTabID)?.selection, activeSelectionBeforePersistence)
+        XCTAssertEqual(
+            changes.last,
+            .init(tabID: inactiveTabID, selection: persistedInactiveSelection, source: .mcpTabContext)
+        )
+    }
+
+    @MainActor
+    func testMCPSelectionPersistenceWritesInactiveTabThroughCoordinator() async {
+        let activeTabID = UUID()
+        let inactiveTabID = UUID()
+        let activeSelection = StoredSelection(selectedPaths: ["/tmp/active.swift"])
+        let inactiveSelection = StoredSelection(selectedPaths: ["/tmp/old-agent.swift"])
+        let nextSelection = StoredSelection(
+            selectedPaths: ["/tmp/new-agent.swift"],
+            codemapAutoEnabled: false
+        )
+        let manager = FakeMCPSelectionManager(
+            tabs: [
+                ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
+                ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveSelection)
+            ],
+            activeTabID: activeTabID
+        )
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: manager,
+            store: WorkspaceFileContextStore()
+        )
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let result = await MCPServerViewModel.persistMCPSelectionThroughCoordinator(
+            nextSelection,
+            for: inactiveTabID,
+            selectionCoordinator: coordinator
+        )
+
+        XCTAssertEqual(result, .persisted)
+        XCTAssertEqual(manager.composeTab(with: inactiveTabID)?.selection, nextSelection)
+        XCTAssertEqual(manager.composeTab(with: activeTabID)?.selection, activeSelection)
+        XCTAssertEqual(changes.last, .init(tabID: inactiveTabID, selection: nextSelection, source: .mcpTabContext))
+    }
+
+    @MainActor
+    func testMCPSelectionPersistenceReturnsUnchangedWithoutPublishingDuplicateChange() async {
+        let activeTabID = UUID()
+        let inactiveTabID = UUID()
+        let activeSelection = StoredSelection(selectedPaths: ["/tmp/active.swift"])
+        let inactiveSelection = StoredSelection(selectedPaths: ["/tmp/agent.swift"], codemapAutoEnabled: false)
+        let manager = FakeMCPSelectionManager(
+            tabs: [
+                ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
+                ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveSelection)
+            ],
+            activeTabID: activeTabID
+        )
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: manager,
+            store: WorkspaceFileContextStore()
+        )
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let result = await MCPServerViewModel.persistMCPSelectionThroughCoordinator(
+            inactiveSelection,
+            for: inactiveTabID,
+            selectionCoordinator: coordinator
+        )
+
+        XCTAssertEqual(result, .unchanged)
+        XCTAssertEqual(manager.composeTab(with: inactiveTabID)?.selection, inactiveSelection)
+        XCTAssertTrue(changes.isEmpty)
+    }
+
+    @MainActor
+    func testMCPLogicalizeSelectionForPersistenceConvertsWorktreePhysicalPaths() {
+        let logicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/repo/project")
+        let physicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/tmp/worktrees/project-agent")
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: logicalRoot,
+                    physicalRoot: physicalRoot,
+                    binding: makeWorktreeBinding(logicalRoot: logicalRoot, physicalRoot: physicalRoot)
+                )
+            ]
+        )
+        let physicalSelection = StoredSelection(
+            selectedPaths: ["/tmp/worktrees/project-agent/Sources/App.swift"],
+            autoCodemapPaths: ["/tmp/worktrees/project-agent/Sources/Dependency.swift"],
+            slices: ["/tmp/worktrees/project-agent/Sources/Sliced.swift": [LineRange(start: 1, end: 4)]],
+            codemapAutoEnabled: false
+        )
+
+        let persisted = MCPServerViewModel.logicalizeSelectionForPersistence(
+            physicalSelection,
+            lookupContext: WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+        )
+
+        XCTAssertEqual(persisted.selectedPaths, ["/repo/project/Sources/App.swift"])
+        XCTAssertEqual(persisted.autoCodemapPaths, ["/repo/project/Sources/Dependency.swift"])
+        XCTAssertEqual(
+            persisted.slices["/repo/project/Sources/Sliced.swift"],
+            [LineRange(start: 1, end: 4)]
+        )
+    }
+
+    @MainActor
     func testSpawnSourceUsesResolvedTabContextSnapshot() {
         let context = makeTabContext(runID: UUID(), windowID: 11)
         let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
@@ -431,6 +652,30 @@ final class TabContextRoutingTests: XCTestCase {
         )
     }
 
+    private func makeTemporaryDirectory(named name: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TabContextRoutingTests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url.standardizedFileURL
+    }
+
+    private func makeWorktreeBinding(
+        logicalRoot: WorkspaceRootRef,
+        physicalRoot: WorkspaceRootRef
+    ) -> AgentSessionWorktreeBinding {
+        AgentSessionWorktreeBinding(
+            id: "binding-1",
+            repositoryID: "repo-1",
+            repoKey: "repo-key",
+            logicalRootPath: logicalRoot.fullPath,
+            logicalRootName: logicalRoot.name,
+            worktreeID: "wt-1",
+            worktreeRootPath: physicalRoot.fullPath,
+            source: "test"
+        )
+    }
+
     @MainActor
     private func makeTabContext(runID: UUID?, windowID: Int) -> MCPServerViewModel.TabContextSnapshot {
         MCPServerViewModel.TabContextSnapshot(
@@ -444,6 +689,34 @@ final class TabContextRoutingTests: XCTestCase {
             runID: runID,
             explicitlyBound: false
         )
+    }
+}
+
+@MainActor
+private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
+    var activeWorkspace: WorkspaceModel?
+
+    init(tabs: [ComposeTabState], activeTabID: UUID) {
+        activeWorkspace = WorkspaceModel(
+            name: "Test Workspace",
+            repoPaths: [],
+            composeTabs: tabs,
+            activeComposeTabID: activeTabID
+        )
+    }
+
+    func composeTab(with id: UUID) -> ComposeTabState? {
+        activeWorkspace?.composeTabs.first(where: { $0.id == id })
+    }
+
+    func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {}
+
+    func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
+        guard var workspace = activeWorkspace,
+              let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
+        else { return }
+        workspace.composeTabs[index] = tab
+        activeWorkspace = workspace
     }
 }
 

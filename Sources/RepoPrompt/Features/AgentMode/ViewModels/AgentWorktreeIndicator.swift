@@ -141,7 +141,7 @@ extension AgentWorktreeIndicator {
 
     /// Tooltip / help text describing the bound worktree.
     var tooltipText: String {
-        var parts = ["Worktree: \(label)"]
+        var parts = ["Agent execution worktree: \(label)"]
         if let branch, !branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             parts.append("branch \(branch)")
         }
