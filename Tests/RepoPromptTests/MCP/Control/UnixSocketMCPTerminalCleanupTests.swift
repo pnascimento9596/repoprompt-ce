@@ -49,7 +49,6 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                     && !snapshot.socketIsOwned
             }
             XCTAssertTrue(cleanupCompleted)
-            XCTAssertTrue(Self.isClosed(descriptors[0]))
             XCTAssertTrue(Self.peerObservedEOF(on: descriptors[1]))
 
             await connectedTransport.disconnect()
@@ -110,7 +109,6 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                     && !snapshot.socketIsOwned
             }
             XCTAssertTrue(cleanupCompleted)
-            XCTAssertTrue(Self.isClosed(descriptors[0]))
             XCTAssertTrue(Self.peerObservedEOF(on: descriptors[1]))
 
             await connectedTransport.disconnect()
@@ -409,7 +407,6 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
                     && !snapshot.socketIsOwned
             }
             XCTAssertTrue(cleanupCompleted)
-            XCTAssertTrue(isClosed(descriptors[0]))
             XCTAssertTrue(peerObservedEOF(on: descriptors[1]))
 
             await transport.disconnect()
@@ -512,6 +509,7 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
     }
 
     private static func isClosed(_ fd: Int32) -> Bool {
+        // Only use while the test still owns the descriptor; closed descriptor numbers can be reused.
         errno = 0
         return fcntl(fd, F_GETFD) == -1 && errno == EBADF
     }
