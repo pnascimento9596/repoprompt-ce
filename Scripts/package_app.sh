@@ -29,6 +29,15 @@ run(){
     "$@"
 }
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+remove_stale_artifact_manifests(){
+    local manifests=()
+    shopt -s nullglob
+    manifests=("$ROOT_DIR"/.build/release/*-artifact-manifest.json)
+    shopt -u nullglob
+    if (( ${#manifests[@]} )); then
+        run rm -f -- "${manifests[@]}"
+    fi
+}
 paths_same(){
     python3 - "$1" "$2" <<'PY'
 from pathlib import Path
@@ -39,8 +48,8 @@ right = Path(sys.argv[2])
 try:
     print("1" if left.samefile(right) else "0")
 except OSError:
-    left_resolved = str(left.resolve(strict=False)).lower()
-    right_resolved = str(right.resolve(strict=False)).lower()
+    left_resolved = left.resolve(strict=False)
+    right_resolved = right.resolve(strict=False)
     print("1" if left_resolved == right_resolved else "0")
 PY
 }
@@ -59,9 +68,13 @@ finish(){
 trap 'finish $?' EXIT
 
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+# Invalidate public-release manifests before metadata parsing, checks, or builds
+# so failed non-public packaging cannot leave stale release metadata behind.
+remove_stale_artifact_manifests
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"
 APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
+ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
@@ -215,14 +228,10 @@ else
 fi
 COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
-ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
 
 phase "Creating app bundle layout"
 run rm -rf "$APP_BUNDLE"
-if (( PUBLIC_UNIVERSAL_RELEASE )); then
-    run rm -f "$ARTIFACT_MANIFEST"
-fi
 if [[ "$(paths_same "$APP_BUNDLE" "$COMPAT_APP_BUNDLE")" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
 fi

@@ -38,7 +38,12 @@ def architectures(path: Path) -> list[str]:
     return sorted(set((result.stdout or "").split()))
 
 
-def signing_details(path: Path, *, allow_adhoc_without_requirement: bool = False) -> dict[str, Any]:
+def signing_details(
+    path: Path,
+    *,
+    allow_adhoc_without_requirement: bool = False,
+    require_leaf_certificate: bool = False,
+) -> dict[str, Any]:
     codesign = os.environ.get("CODESIGN", "codesign")
     details = run([codesign, "-dv", "--verbose=4", str(path)])
     if details.returncode != 0:
@@ -97,6 +102,8 @@ def signing_details(path: Path, *, allow_adhoc_without_requirement: bool = False
             fail(f"signed path did not expose a designated requirement: {path}")
         if team is not None or authorities or certificate_sha256 is not None:
             fail(f"certificate-backed signed path did not expose a designated requirement: {path}")
+    if certificate_sha256 is None and (require_leaf_certificate or team is not None or authorities):
+        fail(f"certificate-backed signed path did not expose an extractable leaf certificate: {path}")
     return {
         "identifier": (values.get("Identifier") or [None])[0],
         "team_identifier": team,
@@ -112,6 +119,7 @@ def executable_entry(
     relative: str,
     *,
     allow_adhoc_without_requirement: bool = False,
+    require_leaf_certificate: bool = False,
 ) -> dict[str, Any]:
     path = app / relative
     if not path.is_file() or path.is_symlink():
@@ -123,6 +131,7 @@ def executable_entry(
         "signing": signing_details(
             path,
             allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+            require_leaf_certificate=require_leaf_certificate,
         ),
     }
 
@@ -141,16 +150,19 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
         fail("Info.plist is missing CFBundleExecutable")
     signing_mode = info.get("RepoPromptSigningMode")
     allow_adhoc_without_requirement = signing_mode == "release-candidate-adhoc"
+    require_leaf_certificate = signing_mode in {"developer-id", "local-self-signed"}
     entries = [
         executable_entry(
             app,
             f"Contents/MacOS/{executable_name}",
             allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+            require_leaf_certificate=require_leaf_certificate,
         ),
         executable_entry(
             app,
             "Contents/MacOS/repoprompt-mcp",
             allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+            require_leaf_certificate=require_leaf_certificate,
         ),
     ]
     architecture_sets = {tuple(entry["architectures"]) for entry in entries}
@@ -166,6 +178,7 @@ def collect_manifest(app: Path, expected_architectures: list[str] | None) -> dic
     bundle_signing = signing_details(
         app,
         allow_adhoc_without_requirement=allow_adhoc_without_requirement,
+        require_leaf_certificate=require_leaf_certificate,
     )
     if signing_mode == "developer-id" and bundle_signing["entitlements_sha256"] is None:
         fail("Developer ID app did not expose parseable signed entitlements")
