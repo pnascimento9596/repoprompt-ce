@@ -31,7 +31,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -1403,6 +1403,7 @@ class DaemonState:
                     argv,
                     cwd=str(cwd),
                     env=env,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
@@ -1744,31 +1745,39 @@ def daemon_running(paths: Paths) -> bool:
         return False
 
 
+def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Optional[Dict[str, Any]], Optional[ConductorError]]:
+    try:
+        payload = request_daemon(paths, {"type": "status"}, timeout=1.0)
+    except ConductorError as exc:
+        return None, exc
+
+    protocol = payload.get("protocolVersion")
+    if protocol == PROTOCOL_VERSION:
+        return payload, None
+
+    active = payload.get("runningJobs") or []
+    queued = payload.get("queuedJobs") or []
+    if active or queued:
+        raise ConductorError(
+            f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) and jobs are active; "
+            "run './conductor daemon stop --force' after deciding it is safe"
+        )
+    request_daemon(paths, {"type": "stop", "force": True}, timeout=FORCE_STOP_RPC_TIMEOUT_SECONDS)
+    if not wait_until_stopped(paths, timeout=TERMINATE_GRACE_SECONDS + 5.0):
+        raise ConductorError(
+            f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) did not stop cleanly; "
+            "run './conductor daemon stop --force' after deciding it is safe"
+        )
+    return None, None
+
+
 def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
     ensure_state_dirs(paths)
     cleanup_stale_files(paths)
     contact_error: Optional[ConductorError] = None
-    try:
-        payload = request_daemon(paths, {"type": "status"}, timeout=1.0)
-    except ConductorError as exc:
-        contact_error = exc
-    else:
-        protocol = payload.get("protocolVersion")
-        if protocol == PROTOCOL_VERSION:
-            return payload
-        active = payload.get("runningJobs") or []
-        queued = payload.get("queuedJobs") or []
-        if active or queued:
-            raise ConductorError(
-                f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) and jobs are active; "
-                "run './conductor daemon stop --force' after deciding it is safe"
-            )
-        request_daemon(paths, {"type": "stop", "force": True}, timeout=FORCE_STOP_RPC_TIMEOUT_SECONDS)
-        if not wait_until_stopped(paths, timeout=TERMINATE_GRACE_SECONDS + 5.0):
-            raise ConductorError(
-                f"daemon protocol mismatch (daemon={protocol}, client={PROTOCOL_VERSION}) did not stop cleanly; "
-                "run './conductor daemon stop --force' after deciding it is safe"
-            )
+    payload, contact_error = compatible_daemon_status_or_stop_idle_mismatch(paths)
+    if payload is not None:
+        return payload
 
     live_pid = read_pid(paths.pid_path)
     if contact_error and live_pid and pid_alive(live_pid):
@@ -1785,13 +1794,21 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
     with paths.lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         cleanup_stale_files(paths)
-        if daemon_running(paths):
-            return request_daemon(paths, {"type": "status"}, timeout=1.0)
+        payload, locked_contact_error = compatible_daemon_status_or_stop_idle_mismatch(paths)
+        if payload is not None:
+            return payload
+        locked_live_pid = read_pid(paths.pid_path)
+        if locked_contact_error and locked_live_pid and pid_alive(locked_live_pid):
+            raise ConductorError(
+                f"daemon pid {locked_live_pid} is alive but the socket is unresponsive; "
+                "run './conductor daemon stop --force' before starting a replacement"
+            )
         script = Path(__file__).resolve()
         with paths.daemon_log_path.open("ab") as daemon_log:
             proc = subprocess.Popen(
                 [sys.executable, str(script), "__daemon", "--repo-root", str(paths.repo_root)],
                 cwd=str(paths.repo_root),
+                stdin=subprocess.DEVNULL,
                 stdout=daemon_log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -2447,6 +2464,7 @@ def run_operation_command(
             list(argv),
             cwd=str(cwd),
             env=env,
+            stdin=subprocess.DEVNULL,
             text=True,
             capture_output=True,
             timeout=timeout,

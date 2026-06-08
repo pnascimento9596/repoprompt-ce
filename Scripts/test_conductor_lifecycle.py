@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -71,6 +72,70 @@ class LifecycleTestCase(unittest.TestCase):
 
 
 class LifecycleQueueTests(LifecycleTestCase):
+    def test_protocol_version_bump_replaces_protocol_3_daemons(self) -> None:
+        self.assertEqual(conductor.PROTOCOL_VERSION, 4)
+
+    def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        old_payload = {
+            "protocolVersion": 3,
+            "runningJobs": [],
+            "queuedJobs": [],
+        }
+        new_payload = {"protocolVersion": conductor.PROTOCOL_VERSION}
+        requests: list[dict] = []
+
+        def fake_request(_paths: conductor.Paths, message: dict, timeout: float = 1.0) -> dict:
+            requests.append(message)
+            if message["type"] == "status" and len(requests) == 1:
+                return old_payload
+            if message["type"] == "stop":
+                return {}
+            if message["type"] == "status" and len(requests) == 3:
+                raise conductor.ConductorError("old daemon is stopped")
+            if message["type"] == "status":
+                return new_payload
+            raise AssertionError(f"unexpected daemon request: {message}")
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request), mock.patch.object(
+            conductor, "wait_until_stopped", return_value=True
+        ) as wait, mock.patch.object(conductor.subprocess, "Popen", return_value=fake_proc) as popen:
+            payload = conductor.ensure_daemon(state.paths)
+
+        self.assertEqual(payload, new_payload)
+        self.assertEqual(requests[0], {"type": "status"})
+        self.assertEqual(requests[1], {"type": "stop", "force": True})
+        wait.assert_called_once_with(state.paths, timeout=conductor.TERMINATE_GRACE_SECONDS + 5.0)
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_ensure_daemon_raises_for_locked_protocol_mismatch_with_active_jobs(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        requests: list[dict] = []
+
+        def fake_request(_paths: conductor.Paths, message: dict, timeout: float = 1.0) -> dict:
+            requests.append(message)
+            if len(requests) == 1:
+                raise conductor.ConductorError("down before start lock")
+            return {
+                "protocolVersion": 3,
+                "runningJobs": [{"ticket": "active"}],
+                "queuedJobs": [],
+            }
+
+        with mock.patch.object(conductor, "request_daemon", side_effect=fake_request), mock.patch.object(
+            conductor, "wait_until_stopped"
+        ) as wait, mock.patch.object(conductor.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(conductor.ConductorError, "protocol mismatch"):
+                conductor.ensure_daemon(state.paths)
+
+        self.assertEqual(requests, [{"type": "status"}, {"type": "status"}])
+        wait.assert_not_called()
+        popen.assert_not_called()
+
     def test_app_relaunch_cli_requires_delimiter_and_forwards_arguments(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -147,6 +212,133 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(env["CONFIRM_LOCAL_PRODUCTION_INSTALL"], "1")
         self.assertNotIn("LOCAL_SELF_SIGNED_CERTIFICATE_NAME", env)
         self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
+
+    def test_ensure_daemon_starts_daemon_with_devnull_stdin(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        down_before_start = conductor.ConductorError("down before start")
+        down_before_spawn = conductor.ConductorError("down before spawn")
+
+        with mock.patch.object(
+            conductor,
+            "request_daemon",
+            side_effect=[down_before_start, down_before_spawn, {"protocolVersion": conductor.PROTOCOL_VERSION}],
+        ), mock.patch.object(conductor.subprocess, "Popen", return_value=fake_proc) as popen:
+            payload = conductor.ensure_daemon(state.paths)
+
+        self.assertEqual(payload["protocolVersion"], conductor.PROTOCOL_VERSION)
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"].name, str(state.paths.daemon_log_path))
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+
+    def test_daemon_run_job_launches_process_with_devnull_stdin(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "job-devnull", "build", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        fake_stdout = mock.Mock()
+        fake_stdout.readline.side_effect = [b""]
+        fake_process = mock.Mock()
+        fake_process.pid = os.getpid()
+        fake_process.stdout = fake_stdout
+        fake_process.wait.return_value = 0
+
+        with mock.patch.object(conductor.subprocess, "Popen", return_value=fake_process) as popen, mock.patch.object(
+            state, "_schedule_locked"
+        ), mock.patch.object(state, "_refresh_output_summary"):
+            state._run_job(job.ticket)
+
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+        self.assertEqual(state.jobs[job.ticket].state, "completed")
+
+    def test_run_operation_command_uses_devnull_stdin(self) -> None:
+        completed = subprocess.CompletedProcess(["echo", "ok"], 0, "ok\n", "")
+        with mock.patch.object(conductor.subprocess, "run", return_value=completed) as run, contextlib.redirect_stdout(io.StringIO()):
+            code, stdout, stderr = conductor.run_operation_command("fixture", ["echo", "ok"], Path.cwd())
+
+        self.assertEqual((code, stdout, stderr), (0, "ok\n", ""))
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertTrue(run.call_args.kwargs["text"])
+
+    def test_release_local_install_job_succeeds_with_closed_parent_fd0(self) -> None:
+        child_code = textwrap.dedent(
+            f"""
+            import os
+            import sys
+            import tempfile
+            from pathlib import Path
+
+            sys.path.insert(0, {str(SCRIPT_DIR)!r})
+            import conductor
+
+            tmp = tempfile.TemporaryDirectory()
+            root = Path(tmp.name)
+            jobs_dir = root / "jobs"
+            scripts_dir = root / "Scripts"
+            jobs_dir.mkdir()
+            scripts_dir.mkdir()
+            installer = scripts_dir / "install_local_production.sh"
+            installer.write_text(
+                "#!" + {sys.executable!r} + "\\n"
+                "import os, sys\\n"
+                "fd_stat = os.fstat(0)\\n"
+                "devnull_stat = os.stat(os.devnull)\\n"
+                "if (fd_stat.st_dev, fd_stat.st_ino) != (devnull_stat.st_dev, devnull_stat.st_ino):\\n"
+                "    print('STDIN_NOT_DEVNULL')\\n"
+                "    sys.exit(44)\\n"
+                "print('STDIN_DEVNULL_OK')\\n",
+                encoding="utf-8",
+            )
+            installer.chmod(0o755)
+            paths = conductor.Paths(
+                repo_root=root,
+                repo_hash="test",
+                state_dir=root,
+                socket_path=root / "conductor.sock",
+                pid_path=root / "conductor.pid",
+                lock_path=root / "conductor.lock",
+                jobs_dir=jobs_dir,
+                daemon_log_path=root / "daemon.log",
+                daemon_meta_path=root / "daemon.json",
+                running_processes_path=root / "running.json",
+            )
+            state = conductor.DaemonState(paths)
+            state._schedule_locked = lambda: None
+            payload = state.enqueue(
+                {{
+                    "operation": "release",
+                    "args": {{"subcommand": "local-install"}},
+                    "env": {{"CONFIRM_LOCAL_PRODUCTION_INSTALL": "1"}},
+                }}
+            )
+            ticket = payload["ticket"]
+            saved_fd0 = os.dup(0)
+            try:
+                os.close(0)
+                state._run_job(ticket)
+            finally:
+                os.dup2(saved_fd0, 0)
+                os.close(saved_fd0)
+            job = state.jobs[ticket]
+            log = job.log_path.read_text(encoding="utf-8")
+            if job.state != "completed" or "STDIN_DEVNULL_OK" not in log:
+                print(f"job_state={{job.state}} exit={{job.exit_code}}")
+                print(log)
+                sys.exit(1)
+            print("CLOSED_FD_REGRESSION_OK")
+            tmp.cleanup()
+            """
+        )
+
+        result = subprocess.run([sys.executable, "-c", child_code], text=True, capture_output=True, timeout=10)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CLOSED_FD_REGRESSION_OK", result.stdout)
 
     def test_app_stop_supersedes_queued_live_app_but_not_build_only_work(self) -> None:
         tmp, state = self.make_state()
