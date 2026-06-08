@@ -109,6 +109,10 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         AgentModeViewModel.AgentMCPControlContext(
             sessionID: sessionID,
             activationID: UUID(),
+            registration: .init(sessionID: sessionID, generation: 0),
+            currentEpoch: nil,
+            preparedEpoch: nil,
+            pendingEpochTransition: nil,
             originatingConnectionID: nil,
             interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
             suppressUserNotifications: false,

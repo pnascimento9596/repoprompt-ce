@@ -463,6 +463,20 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func fileMentionPickerStyle() -> FileMentionPickerStyle {
+        FileMentionPickerStyle.normalized(rawValue: scalarPreferences.ui?.fileMentionPickerStyle)
+    }
+
+    func fileMentionPickerConfiguration() -> FileMentionPickerConfiguration {
+        fileMentionPickerStyle().configuration
+    }
+
+    func setFileMentionPickerStyle(_ style: FileMentionPickerStyle, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.fileMentionPickerStyle = style.rawValue
+        }
+    }
+
     func enableKeyboardShortcuts() -> Bool {
         scalarPreferences.ui?.enableKeyboardShortcuts ?? true
     }

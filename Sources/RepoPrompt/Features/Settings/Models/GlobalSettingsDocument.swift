@@ -165,6 +165,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var collapseLatestFileChanges: Bool?
         var showTooltips: Bool?
         var experimentalAttributedTextEditor: Bool?
+        var fileMentionPickerStyle: String?
         var enableKeyboardShortcuts: Bool?
         var fontScaleBodySize: Double?
 
@@ -174,6 +175,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             collapseLatestFileChanges: Bool? = nil,
             showTooltips: Bool? = nil,
             experimentalAttributedTextEditor: Bool? = nil,
+            fileMentionPickerStyle: String? = nil,
             enableKeyboardShortcuts: Bool? = nil,
             fontScaleBodySize: Double? = nil
         ) {
@@ -182,6 +184,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.collapseLatestFileChanges = collapseLatestFileChanges
             self.showTooltips = showTooltips
             self.experimentalAttributedTextEditor = experimentalAttributedTextEditor
+            self.fileMentionPickerStyle = fileMentionPickerStyle
             self.enableKeyboardShortcuts = enableKeyboardShortcuts
             self.fontScaleBodySize = fontScaleBodySize
         }

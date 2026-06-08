@@ -113,10 +113,14 @@ enum ConnectionStateSnapshot: Equatable {
 protocol MCPServerConnection: Actor {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
+    /// Immediately severs transport delivery for a tool execution that ignored cancellation.
+    /// This must not await handler/server shutdown.
+    func abortForExecutionWatchdog() async
     func notifyToolListChanged() async
     func connectionState() -> ConnectionStateSnapshot
     func isViableForRetention() -> Bool
     func secondsSinceLastActivity() async -> TimeInterval
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot?
     /// Whether this is a legacy filesystem-backed connection (deprecated)
     nonisolated var isFilesystemBacked: Bool { get }
     /// Legacy: connection folder URL for filesystem connections
@@ -746,6 +750,13 @@ actor ServerNetworkManager {
             let windowID: Int?
             let state: String?
             let reason: String?
+            let transportIngress: MCPTransportIngressSnapshot?
+        }
+
+        private struct DebugRetainedTransportIngress {
+            let snapshot: MCPTransportIngressSnapshot
+            let clientName: String?
+            let sessionToken: String?
         }
 
         private struct DebugRestartStatus {
@@ -758,11 +769,20 @@ actor ServerNetworkManager {
         private var debugConnectionHistory: [DebugConnectionEvent] = []
         private var debugConnectionHistorySeq: UInt64 = 0
         private var debugRestartStatesByID: [UUID: DebugRestartStatus] = [:]
+        private var debugRetainedTransportIngressByConnectionID: [UUID: DebugRetainedTransportIngress] = [:]
+        private var debugRetainedTransportIngressOrder: [UUID] = []
+        private var debugRecordedTransportTerminalConnectionIDs: Set<UUID> = []
         private let debugConnectionHistoryLimit = 1000
+        private let debugRetainedTransportIngressLimit = 100
         private let debugRestartStatusLimit = 50
+        private var debugResolvedToolOperationOverrides: [String: @Sendable () async throws -> Value] = [:]
+        private var debugExecutionWatchdogAbortTargets: [UUID: any MCPServerConnection] = [:]
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:]
+    private var connectionsBeingRemoved: Set<UUID> = []
+    private var executionWatchdogTerminalConnections: Set<UUID> = []
+    private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -785,6 +805,16 @@ actor ServerNetworkManager {
         guard rawJSON else { return CallTool.Result.err(message) }
         let value: Value = .object([
             "is_error": .bool(true),
+            "error": .string(message)
+        ])
+        return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+    }
+
+    static func executionContractToolErrorResult(rawJSON: Bool, code: String, message: String) -> CallTool.Result {
+        guard rawJSON else { return CallTool.Result.err("\(code): \(message)") }
+        let value: Value = .object([
+            "is_error": .bool(true),
+            "code": .string(code),
             "error": .string(message)
         ])
         return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
@@ -2470,7 +2500,7 @@ actor ServerNetworkManager {
         let now = Date()
         if now.timeIntervalSince(lastKillSignalCleanupAt) >= killSignalCleanupInterval {
             lastKillSignalCleanupAt = now
-            MCPKillSignal.cleanupStaleSignals()
+            MCPKillSignal.cleanupStaleSignals(in: MCPFilesystemConstants.identity.killSignalsDirectoryURL())
         }
     }
 
@@ -2584,20 +2614,6 @@ actor ServerNetworkManager {
         lastBootstrapHealthCheckAt = now
 
         let socketPath = resolvedBootstrapSocketURL().path
-        let exists = FileManager.default.fileExists(atPath: socketPath)
-
-        if !exists {
-            log.warning("Bootstrap socket path missing: \(socketPath). Restarting listener.")
-            restartBootstrapSocketServer(reason: "socket_path_missing", lifecycleGeneration: healthCheckLifecycleGeneration)
-            return
-        }
-
-        if !isUnixDomainSocket(atPath: socketPath) {
-            log.warning("Bootstrap socket path is not a socket: \(socketPath). Restarting listener.")
-            restartBootstrapSocketServer(reason: "socket_path_not_socket", lifecycleGeneration: healthCheckLifecycleGeneration)
-            return
-        }
-
         guard let server = bootstrapSocketServer,
               bootstrapSocketServerLifecycleGeneration == healthCheckLifecycleGeneration
         else {
@@ -2611,6 +2627,12 @@ actor ServerNetworkManager {
 
         let diagnostics = await server.diagnostics()
         guard isCurrentBootstrapListener(server, lifecycleGeneration: healthCheckLifecycleGeneration) else { return }
+        if !diagnostics.ownsSocketPath {
+            log.warning("Bootstrap listener no longer owns socket path \(socketPath) (status=\(String(describing: diagnostics.socketPathStatus))); stopping orphan and restarting with backoff.")
+            restartBootstrapSocketServer(reason: "socket_path_ownership_lost", lifecycleGeneration: healthCheckLifecycleGeneration)
+            return
+        }
+
         if !diagnostics.listenFDValid {
             log.warning("Bootstrap listen FD invalid; restarting.")
             restartBootstrapSocketServer(reason: "listen_fd_invalid", lifecycleGeneration: healthCheckLifecycleGeneration)
@@ -2634,14 +2656,6 @@ actor ServerNetworkManager {
     private func bootstrapBackoffDelay(for failures: Int) -> TimeInterval {
         let capped = min(failures, 4)
         return min(10.0, pow(2.0, Double(capped)))
-    }
-
-    private func isUnixDomainSocket(atPath path: String) -> Bool {
-        var info = stat()
-        if lstat(path, &info) != 0 {
-            return false
-        }
-        return (info.st_mode & S_IFMT) == S_IFSOCK
     }
 
     private func restartBootstrapSocketServer(
@@ -3574,7 +3588,7 @@ actor ServerNetworkManager {
                 markClientUserKilled: false
             )
         case .idleTimeout:
-            // Hygiene cleanup - allow clean reconnects
+            // Hygiene cleanup - allow clean reconnects.
             .softDisconnect
         case .connectionReplaced:
             // Default to hard behavior; caller can override for same-session replacement
@@ -3709,7 +3723,8 @@ actor ServerNetworkManager {
                 try MCPKillSignal.writeKillSignal(
                     sessionToken: token,
                     reason: reason,
-                    message: message
+                    message: message,
+                    directory: MCPFilesystemConstants.identity.killSignalsDirectoryURL()
                 )
                 connectionLog("Wrote kill signal for session \(token.prefix(8))...")
             } catch {
@@ -3738,7 +3753,7 @@ actor ServerNetworkManager {
         // Periodic cleanup of expired entries
         cleanupExpiredKilledSessions()
         cleanupExpiredUserKilledClients()
-        MCPKillSignal.cleanupStaleSignals()
+        MCPKillSignal.cleanupStaleSignals(in: MCPFilesystemConstants.identity.killSignalsDirectoryURL())
     }
 
     /// Soft-disconnects a connection without kill signals or cooldowns.
@@ -3829,7 +3844,76 @@ actor ServerNetworkManager {
         await terminateConnection(oldID, reason: .connectionReplaced, message: message, semanticsOverride: hardSemantics)
     }
 
+    func recordTransportIngressTerminal(
+        connectionID: UUID,
+        clientName: String?,
+        sessionToken: String?,
+        snapshot: MCPTransportIngressSnapshot
+    ) {
+        guard snapshot.terminalCause == .receiveBufferOverflow else { return }
+        log.error(
+            "MCP connection \(connectionID) ingress terminated: cause=\(MCPTransportTerminalCause.receiveBufferOverflow.rawValue) capacity=\(snapshot.receiveBufferCapacity) highWaterMark=\(snapshot.receiveBufferHighWaterMark)"
+        )
+        #if DEBUG
+            let retained = DebugRetainedTransportIngress(
+                snapshot: snapshot,
+                clientName: clientName,
+                sessionToken: sessionToken
+            )
+            debugRetainedTransportIngressByConnectionID[connectionID] = retained
+            debugRetainedTransportIngressOrder.removeAll { $0 == connectionID }
+            debugRetainedTransportIngressOrder.append(connectionID)
+            while debugRetainedTransportIngressOrder.count > debugRetainedTransportIngressLimit {
+                let expiredID = debugRetainedTransportIngressOrder.removeFirst()
+                debugRetainedTransportIngressByConnectionID.removeValue(forKey: expiredID)
+                debugRecordedTransportTerminalConnectionIDs.remove(expiredID)
+            }
+            if debugRecordedTransportTerminalConnectionIDs.insert(connectionID).inserted {
+                debugRecordConnectionEvent(
+                    "transport_terminal",
+                    connectionID: connectionID,
+                    reason: MCPTransportTerminalCause.receiveBufferOverflow.rawValue,
+                    clientName: clientName,
+                    sessionToken: sessionToken,
+                    transportIngress: snapshot
+                )
+            }
+        #endif
+    }
+
+    private func abortConnectionForExecutionWatchdog(_ id: UUID) async {
+        guard executionWatchdogTerminalConnections.insert(id).inserted else { return }
+        connectionLog("Execution watchdog marked connection terminal: \(id)")
+        #if DEBUG
+            debugRecordConnectionEvent(
+                "tool_execution_watchdog_abort",
+                connectionID: id,
+                reason: "tool_execution_watchdog"
+            )
+        #endif
+
+        let connection: (any MCPServerConnection)? = if let registeredConnection = connections[id] {
+            registeredConnection
+        } else {
+            #if DEBUG
+                debugExecutionWatchdogAbortTargets[id]
+            #else
+                nil
+            #endif
+        }
+        guard let connection else { return }
+        await connection.abortForExecutionWatchdog()
+        Task { [weak self] in
+            await self?.removeConnection(id)
+        }
+    }
+
     func removeConnection(_ id: UUID) async {
+        guard !connectionsBeingRemoved.contains(id) else {
+            connectionLog("removeConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
+
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
         if let reservation = bootstrapReservations.removeValue(forKey: id) {
@@ -3847,6 +3931,9 @@ actor ServerNetworkManager {
             connectionLog("removeConnection: \(id) already removed; ignoring duplicate call")
             return
         }
+
+        connectionsBeingRemoved.insert(id)
+        defer { connectionsBeingRemoved.remove(id) }
 
         connectionLog("Removing connection: \(id)")
 
@@ -4849,7 +4936,8 @@ actor ServerNetworkManager {
                 state: String? = nil,
                 clientName overrideClientName: String? = nil,
                 sessionToken overrideSessionToken: String? = nil,
-                windowID overrideWindowID: Int? = nil
+                windowID overrideWindowID: Int? = nil,
+                transportIngress: MCPTransportIngressSnapshot? = nil
             ) {
                 debugConnectionHistorySeq &+= 1
                 let resolvedClientName = overrideClientName ?? connectionID.flatMap { clientIdentifier(forConnection: $0) }
@@ -4866,12 +4954,26 @@ actor ServerNetworkManager {
                     sessionFingerprint: debugSessionFingerprint(forToken: resolvedSessionToken),
                     windowID: overrideWindowID ?? connectionID.flatMap { connectionWindowMap[$0] },
                     state: resolvedState,
-                    reason: reason
+                    reason: reason,
+                    transportIngress: transportIngress
                 )
                 debugConnectionHistory.append(entry)
                 if debugConnectionHistory.count > debugConnectionHistoryLimit {
                     debugConnectionHistory.removeFirst(debugConnectionHistory.count - debugConnectionHistoryLimit)
                 }
+            }
+
+            private nonisolated func debugTransportIngressObject(
+                _ snapshot: MCPTransportIngressSnapshot
+            ) -> [String: Any] {
+                [
+                    "receive_capacity": snapshot.receiveBufferCapacity,
+                    "accepted_frames": snapshot.acceptedFrameCount,
+                    "dropped_frames": snapshot.droppedFrameCount,
+                    "receive_high_water_mark": snapshot.receiveBufferHighWaterMark,
+                    "terminal": snapshot.isTerminal,
+                    "terminal_cause": snapshot.terminalCause?.rawValue ?? NSNull()
+                ]
             }
 
             private func debugHistoryObject(_ event: DebugConnectionEvent) -> [String: Any] {
@@ -4887,7 +4989,8 @@ actor ServerNetworkManager {
                     "session_fingerprint": event.sessionFingerprint ?? NSNull(),
                     "window_id": event.windowID ?? NSNull(),
                     "state": event.state ?? NSNull(),
-                    "reason": event.reason ?? NSNull()
+                    "reason": event.reason ?? NSNull(),
+                    "transport_ingress": event.transportIngress.map(debugTransportIngressObject) ?? NSNull()
                 ]
             }
 
@@ -5055,6 +5158,48 @@ actor ServerNetworkManager {
                 ]
             }
 
+            func debugTransportIngressSnapshotPayload(
+                currentConnectionID: UUID,
+                requestedConnectionID: UUID?
+            ) async -> [String: Any] {
+                let targetID = requestedConnectionID ?? currentConnectionID
+                if let connection = connections[targetID],
+                   let snapshot = await connection.transportIngressSnapshot()
+                {
+                    return [
+                        "ok": true,
+                        "op": "transport_snapshot",
+                        "current_connection_id": currentConnectionID.uuidString,
+                        "requested_connection_id": targetID.uuidString,
+                        "present": true,
+                        "active": true,
+                        "ingress": debugTransportIngressObject(snapshot)
+                    ]
+                }
+                if let retained = debugRetainedTransportIngressByConnectionID[targetID] {
+                    return [
+                        "ok": true,
+                        "op": "transport_snapshot",
+                        "current_connection_id": currentConnectionID.uuidString,
+                        "requested_connection_id": targetID.uuidString,
+                        "present": true,
+                        "active": false,
+                        "client_name": retained.clientName ?? NSNull(),
+                        "session_fingerprint": debugSessionFingerprint(forToken: retained.sessionToken) ?? NSNull(),
+                        "ingress": debugTransportIngressObject(retained.snapshot)
+                    ]
+                }
+                return [
+                    "ok": true,
+                    "op": "transport_snapshot",
+                    "current_connection_id": currentConnectionID.uuidString,
+                    "requested_connection_id": targetID.uuidString,
+                    "present": false,
+                    "active": false,
+                    "ingress": NSNull()
+                ]
+            }
+
             func debugConnectionSnapshotPayload(
                 currentConnectionID: UUID,
                 requestedConnectionID: UUID?,
@@ -5145,6 +5290,9 @@ actor ServerNetworkManager {
             func debugClearConnectionHistoryPayload() -> [String: Any] {
                 let removed = debugConnectionHistory.count
                 debugConnectionHistory.removeAll()
+                debugRetainedTransportIngressByConnectionID.removeAll()
+                debugRetainedTransportIngressOrder.removeAll()
+                debugRecordedTransportTerminalConnectionIDs.removeAll()
                 return [
                     "ok": true,
                     "op": "clear_connection_history",
@@ -5881,8 +6029,47 @@ actor ServerNetworkManager {
         }
 
         func debugRemoveConnection(_ id: UUID) async {
+            #if DEBUG
+                debugExecutionWatchdogAbortTargets.removeValue(forKey: id)
+            #endif
             await removeConnection(id)
         }
+
+        #if DEBUG
+            func debugRegisterConnectionForSocketFixture(
+                connectionID: UUID,
+                connection: any MCPServerConnection,
+                clientName: String,
+                sessionToken: String
+            ) {
+                _ = clientName
+                _ = sessionToken
+                debugExecutionWatchdogAbortTargets[connectionID] = connection
+            }
+
+            func debugSetToolExecutionWatchdogEnvironment(_ environment: MCPToolExecutionWatchdogEnvironment) {
+                toolExecutionWatchdogEnvironment = environment
+            }
+
+            func debugResetToolExecutionWatchdogEnvironment() {
+                toolExecutionWatchdogEnvironment = .continuous()
+            }
+
+            func debugSetResolvedToolOperationOverride(
+                toolName: String,
+                operation: (@Sendable () async throws -> Value)?
+            ) {
+                if let operation {
+                    debugResolvedToolOperationOverrides[toolName] = operation
+                } else {
+                    debugResolvedToolOperationOverrides.removeValue(forKey: toolName)
+                }
+            }
+
+            func debugIsExecutionWatchdogTerminal(connectionID: UUID) -> Bool {
+                executionWatchdogTerminalConnections.contains(connectionID)
+            }
+        #endif
 
         func debugMarkActiveToolOwner(windowID: Int, connectionID: UUID, toolName: String) {
             markActiveToolOwner(windowID: windowID, connectionID: connectionID, toolName: toolName)
@@ -6548,6 +6735,7 @@ actor ServerNetworkManager {
             guard let self else { return ListTools.Result(tools: []) }
 
             connectionLog("Handling ListTools request for \(connectionID)")
+            let clientIdentifier = await clientIdentifier(forConnection: connectionID)
 
             // Safety net: ensure tool catalog is ready before returning list.
             // The primary readiness wait happens during handshake, but this catches edge cases.
@@ -6667,7 +6855,10 @@ actor ServerNetworkManager {
                                 name: tool.name,
                                 description: description,
                                 inputSchema: schemaValue,
-                                annotations: tool.annotations
+                                annotations: CodexMCPToolAnnotationProjection.project(
+                                    tool.annotations,
+                                    clientIdentifier: clientIdentifier
+                                )
                             )
                         )
                     }
@@ -6971,6 +7162,16 @@ actor ServerNetworkManager {
                 )
                 return await limiter.withPermit {
                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState)
+                    guard !Task.isCancelled,
+                          await !(self.executionWatchdogTerminalConnections.contains(connectionID))
+                    else {
+                        connectionLog("tools/call \(toolName): rejected after limiter because connection is terminal or cancelled")
+                        return Self.executionContractToolErrorResult(
+                            rawJSON: capturedRawJSON,
+                            code: "tool_execution_connection_terminal",
+                            message: "The MCP connection was closed after an earlier tool failed to stop."
+                        )
+                    }
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPToolCall.limiterAcquired,
                         correlation: lifecycleCorrelation,
@@ -7305,34 +7506,117 @@ actor ServerNetworkManager {
                                     }
                                 }
 
-                                @Sendable func dispatchResolvedProvider(_ operation: @Sendable () async throws -> Value) async throws -> Value {
+                                @Sendable func dispatchResolvedProvider(_ operation: @escaping @Sendable () async throws -> Value) async throws -> Value {
+                                    guard let contract = MCPToolExecutionContractCatalog.contract(for: toolName) else {
+                                        throw MCPToolExecutionDispatchError.missingContract(toolName: toolName)
+                                    }
+
+                                    let environment = await self.toolExecutionWatchdogEnvironment
+                                    let traceOrigin = await environment.now()
+                                    @Sendable func emitExecutionTrace(
+                                        _ phase: MCPToolExecutionTraceEvent.Phase,
+                                        cancellationRequested: Bool? = nil,
+                                        cancellationOutcome: String? = nil,
+                                        graceOutcome: String? = nil,
+                                        escalationReason: String? = nil
+                                    ) async {
+                                        let now = await environment.now()
+                                        MCPToolExecutionTracer.emit(MCPToolExecutionTraceEvent(
+                                            toolName: toolName,
+                                            connectionID: connectionID,
+                                            invocationID: invocationID,
+                                            runID: observerRunIDForCallbacksFinal,
+                                            contractKind: contract.kind,
+                                            executionDeadlineSeconds: contract.deadline?.mcpSeconds,
+                                            cleanupGraceSeconds: contract.cancellationGrace?.mcpSeconds,
+                                            phase: phase,
+                                            elapsedMilliseconds: max(0, now.mcpMilliseconds - traceOrigin.mcpMilliseconds),
+                                            cancellationRequested: cancellationRequested,
+                                            cancellationOutcome: cancellationOutcome,
+                                            graceOutcome: graceOutcome,
+                                            escalationReason: escalationReason
+                                        ))
+                                    }
+
+                                    await emitExecutionTrace(.contractSelected)
+                                    await emitExecutionTrace(.started)
                                     EditFlowPerf.lifecycleEvent(
                                         EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderBegan,
                                         correlation: lifecycleCorrelation,
                                         EditFlowPerf.Dimensions(toolName: toolName)
                                     )
-                                    do {
-                                        let value = try await EditFlowPerf.measure(
-                                            EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                            EditFlowPerf.Dimensions(toolName: toolName),
-                                            operation: operation
-                                        )
-                                        EditFlowPerf.lifecycleEvent(
-                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
-                                            correlation: lifecycleCorrelation,
-                                            EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
-                                        )
-                                        return value
-                                    } catch {
-                                        EditFlowPerf.lifecycleEvent(
-                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
-                                            correlation: lifecycleCorrelation,
-                                            EditFlowPerf.Dimensions(
-                                                toolName: toolName,
-                                                outcome: error is CancellationError ? "cancelled" : "error"
+
+                                    let tracedOperation: @Sendable () async throws -> Value = {
+                                        do {
+                                            let value = try await EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                EditFlowPerf.Dimensions(toolName: toolName),
+                                                operation: operation
                                             )
-                                        )
-                                        throw error
+                                            await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                                correlation: lifecycleCorrelation,
+                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
+                                            )
+                                            return value
+                                        } catch {
+                                            let outcome = MCPToolExecutionCancelledError.matches(error) ? "cancelled" : "error"
+                                            await emitExecutionTrace(.handlerCompleted, cancellationOutcome: outcome)
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                                correlation: lifecycleCorrelation,
+                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
+                                            )
+                                            throw error
+                                        }
+                                    }
+
+                                    switch contract {
+                                    case let .bounded(deadline, cancellationGrace):
+                                        do {
+                                            return try await MCPToolExecutionWatchdog.execute(
+                                                deadline: deadline,
+                                                cancellationGrace: cancellationGrace,
+                                                environment: environment,
+                                                onEvent: { event in
+                                                    switch event {
+                                                    case .deadlineExpired:
+                                                        await emitExecutionTrace(.deadlineExpired)
+                                                    case .cancellationRequested:
+                                                        await emitExecutionTrace(.cancellationRequested, cancellationRequested: true)
+                                                    case let .settledDuringGrace(settlement):
+                                                        await emitExecutionTrace(
+                                                            .settledDuringGrace,
+                                                            cancellationRequested: true,
+                                                            cancellationOutcome: settlement.rawValue,
+                                                            graceOutcome: "settled"
+                                                        )
+                                                    case .cleanupGraceExpired:
+                                                        await emitExecutionTrace(
+                                                            .cleanupGraceExpired,
+                                                            cancellationRequested: true,
+                                                            graceOutcome: "expired",
+                                                            escalationReason: "handler_ignored_cancellation"
+                                                        )
+                                                    }
+                                                },
+                                                operation: tracedOperation
+                                            )
+                                        } catch MCPToolExecutionWatchdogError.cleanupUnresponsive {
+                                            await emitExecutionTrace(
+                                                .connectionForceDisconnectRequested,
+                                                cancellationRequested: true,
+                                                graceOutcome: "expired",
+                                                escalationReason: "handler_ignored_cancellation"
+                                            )
+                                            throw MCPToolExecutionWatchdogError.cleanupUnresponsive
+                                        }
+                                    case .longSynchronousCancellable,
+                                         .lifecycleManagedCancellable,
+                                         .interactiveCancellable,
+                                         .workspaceLifecycleCancellable:
+                                        return try await tracedOperation()
                                     }
                                 }
 
@@ -7342,12 +7626,87 @@ actor ServerNetworkManager {
                                         correlation: lifecycleCorrelation,
                                         EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
                                     )
+                                    MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                                        layer: "app_tool_handler",
+                                        phase: "handler_result_ready",
+                                        connectionID: connectionID.uuidString,
+                                        method: "tools/call",
+                                        tool: toolName,
+                                        invocationID: invocationID.uuidString,
+                                        lifecycleState: outcome
+                                    ))
                                     return EditFlowPerf.measure(
                                         EditFlowPerf.Stage.MCPToolCall.handlerResultHandoff,
                                         EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
                                     ) {
                                         result
                                     }
+                                }
+
+                                @Sendable func executionContractFailureResult(
+                                    for error: Error,
+                                    context: String
+                                ) async -> CallTool.Result? {
+                                    let code: String
+                                    let message: String
+                                    let outcome: String
+                                    let shouldForceDisconnect: Bool
+
+                                    switch error {
+                                    case let MCPToolExecutionDispatchError.missingContract(missingToolName):
+                                        code = "tool_execution_contract_missing"
+                                        message = "No declared execution contract exists for MCP tool '\(missingToolName)'."
+                                        outcome = "executionContractMissing"
+                                        shouldForceDisconnect = false
+                                    case let MCPToolExecutionWatchdogError.executionTimedOut(settlement):
+                                        code = "tool_execution_timeout"
+                                        message = "Tool '\(toolName)' exceeded its \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds)-second execution contract and settled as \(settlement.rawValue) during cancellation grace."
+                                        outcome = "executionTimeout"
+                                        shouldForceDisconnect = false
+                                    case MCPToolExecutionWatchdogError.cleanupUnresponsive:
+                                        code = "tool_execution_cleanup_unresponsive"
+                                        message = "Tool '\(toolName)' exceeded its \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds)-second execution contract and did not stop during cancellation grace. The MCP connection was force-disconnected."
+                                        outcome = "executionCleanupUnresponsive"
+                                        shouldForceDisconnect = true
+                                    default:
+                                        return nil
+                                    }
+
+                                    log.error("MCP execution contract failure tool=\(toolName) context=\(context) code=\(code)")
+                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object([
+                                        "code": .string(code),
+                                        "error": .string(message),
+                                        "tool": .string(toolName)
+                                    ]))
+                                    if let runID = await self.toolTrackingRunIDForCompletion(
+                                        callTimeRunID: observerRunIDForCallbacksFinal,
+                                        connectionID: connectionID,
+                                        toolName: toolName,
+                                        invocationID: invocationID,
+                                        context: "\(context) execution contract failure"
+                                    ) {
+                                        _ = await self.fireToolCompletedObservers(
+                                            runID: runID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: nil,
+                                            resultJSON: errorJSON,
+                                            isError: true
+                                        )
+                                    }
+
+                                    let result = Self.executionContractToolErrorResult(
+                                        rawJSON: capturedRawJSON,
+                                        code: code,
+                                        message: message
+                                    )
+                                    if shouldForceDisconnect {
+                                        await self.abortConnectionForExecutionWatchdog(connectionID)
+                                        // The transport is already severed. Deliberately skip handlerResult so
+                                        // execution-completion tracing cannot be mistaken for response delivery.
+                                        return result
+                                    }
+                                    return handlerResult(result, outcome: outcome)
                                 }
 
                                 let serviceToolLookupState = EditFlowPerf.begin(
@@ -7432,6 +7791,15 @@ actor ServerNetworkManager {
                                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
                                     endPermitPreDispatchEnvelopeIfNeeded()
 
+                                    let resolvedOperation: @Sendable () async throws -> Value = {
+                                        #if DEBUG
+                                            if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
+                                                return try await operation()
+                                            }
+                                        #endif
+                                        return try await toolDef.callAsFunction(effectiveArgs)
+                                    }
+
                                     // Now dispatch. If window-scoped, wrap in ownership scope (fallback to service window).
                                     if let wsSvc, shouldTrackToolOwnership {
                                         let ownershipWindowID = chosenID ?? wsSvc.windowID
@@ -7445,9 +7813,7 @@ actor ServerNetworkManager {
                                                     EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                     EditFlowPerf.Dimensions(toolName: toolName)
                                                 ) {
-                                                    try await dispatchResolvedProvider {
-                                                        try await toolDef.callAsFunction(effectiveArgs)
-                                                    }
+                                                    try await dispatchResolvedProvider(resolvedOperation)
                                                 }
                                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                     EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -7512,6 +7878,12 @@ actor ServerNetworkManager {
                                                 )
                                             }
                                         } catch {
+                                            if let failure = await executionContractFailureResult(
+                                                for: error,
+                                                context: "window-scoped"
+                                            ) {
+                                                return failure
+                                            }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
                                                 EditFlowPerf.Dimensions(toolName: toolName, outcome: "dispatchError")
@@ -7558,9 +7930,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                             ) {
-                                                try await dispatchResolvedProvider {
-                                                    try await toolDef.callAsFunction(effectiveArgs)
-                                                }
+                                                try await dispatchResolvedProvider(resolvedOperation)
                                             }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
@@ -7622,6 +7992,12 @@ actor ServerNetworkManager {
                                                 outcome: "success"
                                             )
                                         } catch {
+                                            if let failure = await executionContractFailureResult(
+                                                for: error,
+                                                context: "global"
+                                            ) {
+                                                return failure
+                                            }
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
                                                 EditFlowPerf.Dimensions(toolName: toolName, outcome: "dispatchError")
@@ -8281,6 +8657,24 @@ actor ServerNetworkManager {
         return await limiter.activeCount() > 0
     }
 
+    #if DEBUG
+        func connectionLimiterSnapshotForTesting(
+            connectionID: UUID
+        ) async -> AsyncLimiter.DebugSnapshot? {
+            guard let limiter = callLimiters[connectionID] else { return nil }
+            return await limiter.debugSnapshot()
+        }
+
+        func setConnectionLimiterStateObserverForTesting(
+            connectionID: UUID,
+            observer: ((AsyncLimiter.DebugSnapshot) -> Void)?
+        ) async -> Bool {
+            guard let limiter = callLimiters[connectionID] else { return false }
+            await limiter.setDebugStateObserver(observer)
+            return true
+        }
+    #endif
+
     private func oldestEvictableConnectionID() async -> UUID? {
         let threshold = pressureEvictIdleSeconds
         guard threshold > 0 else { return nil }
@@ -8468,6 +8862,16 @@ actor AsyncLimiter {
     /// Tracks the number of tasks currently inside withPermit (including queued ones)
     private var inFlight: Int = 0
 
+    #if DEBUG
+        struct DebugSnapshot: Equatable {
+            let permits: Int
+            let waiterCount: Int
+            let inFlight: Int
+        }
+
+        private var debugStateObserver: ((DebugSnapshot) -> Void)?
+    #endif
+
     init(limit: Int) {
         self.limit = max(1, limit)
         permits = max(1, limit)
@@ -8477,9 +8881,13 @@ actor AsyncLimiter {
     private func acquirePermit() async {
         if permits > 0 {
             permits -= 1
+            notifyDebugStateChanged()
             return
         }
-        await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation {
+            waiters.append($0)
+            notifyDebugStateChanged()
+        }
         // When resumed, the caller now has a permit (recycled from a release)
     }
 
@@ -8492,6 +8900,7 @@ actor AsyncLimiter {
         } else {
             permits = min(permits + 1, limit)
         }
+        notifyDebugStateChanged()
     }
 
     /// Number of in-flight operations (0 means idle).
@@ -8500,12 +8909,43 @@ actor AsyncLimiter {
         inFlight
     }
 
+    #if DEBUG
+        func debugSnapshot() -> DebugSnapshot {
+            makeDebugSnapshot()
+        }
+
+        func setDebugStateObserver(
+            _ observer: ((DebugSnapshot) -> Void)?
+        ) {
+            debugStateObserver = observer
+            observer?(makeDebugSnapshot())
+        }
+
+        private func makeDebugSnapshot() -> DebugSnapshot {
+            DebugSnapshot(
+                permits: permits,
+                waiterCount: waiters.count,
+                inFlight: inFlight
+            )
+        }
+
+        private func notifyDebugStateChanged() {
+            debugStateObserver?(makeDebugSnapshot())
+        }
+    #else
+        private func notifyDebugStateChanged() {}
+    #endif
+
     /// Executes an operation with a permit, limiting concurrency.
     func withPermit<T>(
         _ op: @Sendable () async throws -> T
     ) async rethrows -> T {
         inFlight += 1
-        defer { inFlight -= 1 }
+        notifyDebugStateChanged()
+        defer {
+            inFlight -= 1
+            notifyDebugStateChanged()
+        }
         await acquirePermit()
         defer { releasePermit() }
         return try await op()

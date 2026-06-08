@@ -221,10 +221,20 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
 
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
         let tabIDForCleanup = finalTabID
+        let mcpControlToken = try await MainActor.run {
+            try contextBuilderVM.beginMCPControlledRun(
+                forTabID: finalTabID,
+                responseType: responseType?.rawValue,
+                planModelName: nil
+            )
+        }
 
         return try await AsyncScope.withCleanup({}, cleanup: {
             await MainActor.run {
-                contextBuilderVM.clearMCPControlledRun(forTabID: tabIDForCleanup)
+                contextBuilderVM.clearMCPControlledRun(
+                    forTabID: tabIDForCleanup,
+                    controlToken: mcpControlToken
+                )
             }
         }) {
             let wantsResponse = responseType?.wantsResponse ?? false
@@ -290,7 +300,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         agentOverride: preferredAgent,
                         modelOverrideRaw: preferredModelRaw,
                         responseType: responseType?.rawValue,
-                        planModelName: planModelName
+                        planModelName: planModelName,
+                        mcpControlToken: mcpControlToken
                     )
                 }
 
@@ -476,13 +487,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             return try await operation()
         }
 
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
+        let heartbeatTask = Task {
+            do {
                 while !Task.isCancelled {
                     try await Task.sleep(for: interval)
+                    try Task.checkCancellation()
                     await ServerNetworkManager.shared.sendProgress(
                         for: connectionID,
                         tool: tool,
@@ -491,11 +500,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         message: message
                     )
                 }
-                throw CancellationError()
+            } catch {
+                // Cancellation is the expected completion path.
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
         }
+        defer { heartbeatTask.cancel() }
+        return try await operation()
     }
 }

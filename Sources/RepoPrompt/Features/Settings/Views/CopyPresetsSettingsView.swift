@@ -347,7 +347,8 @@ private struct CopyPresetRow: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
-            .help(isShown ? "Shown in quick menu" : "Hidden from quick menu")
+            .hoverTooltip(isShown ? "Shown in quick menu" : "Hidden from quick menu")
+            .accessibilityLabel("Show \(preset.name) in quick menu")
 
             // 2) Title area: icon inline with name, then Built-in/Custom badge, then compact readable chips
             VStack(alignment: .leading, spacing: 2) {

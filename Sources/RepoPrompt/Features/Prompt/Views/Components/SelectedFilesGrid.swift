@@ -158,7 +158,8 @@ struct SelectedFilesGrid: View {
             }
             .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
             .disabled(entries.isEmpty)
-            .help(entries.isEmpty ? "No files to clear" : "Remove all selected files and codemaps")
+            .hoverTooltip(entries.isEmpty ? "No files to clear" : "Remove all selected files and codemaps")
+            .accessibilityHint(entries.isEmpty ? "No files to clear" : "Remove all selected files and codemaps")
         }
     }
 

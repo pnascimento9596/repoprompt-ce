@@ -392,7 +392,38 @@ public extension VCSService {
         let backend = await backend(forRepoRoot: repoURL)
         return try await backend.getLocalBranches(at: repoURL, limit: limit)
     }
+}
 
+extension VCSService {
+    func gitBranchSwitchOptions(at repoURL: URL) async throws -> GitBranchSwitchOptions {
+        let resolved = try await requireGitBranchSwitchRepo(repoURL, operation: "branch_switch_options")
+        return try await gitBackend().gitBranchSwitchOptions(at: resolved.rootURL)
+    }
+
+    func preflightGitBranchSwitch(branchName: String, at repoURL: URL) async throws -> GitBranchSwitchPreflight {
+        let resolved = try await requireGitBranchSwitchRepo(repoURL, operation: "branch_switch_preflight")
+        return try await gitBackend().preflightGitBranchSwitch(branchName: branchName, at: resolved.rootURL)
+    }
+
+    func switchGitBranch(_ request: GitBranchSwitchRequest, at repoURL: URL) async throws -> GitBranchSwitchResult {
+        let resolved = try await requireGitBranchSwitchRepo(repoURL, operation: "branch_switch")
+        let result = try await gitBackend().switchGitBranch(request, at: resolved.rootURL)
+        invalidateCache(for: resolved.rootURL)
+        return result
+    }
+
+    private func requireGitBranchSwitchRepo(_ repoURL: URL, operation: String) async throws -> VCSResolvedRepo {
+        guard let resolved = await resolveRepo(from: repoURL) else {
+            throw VCSError.notARepository(path: repoURL.path)
+        }
+        guard resolved.backendKind == .git else {
+            throw VCSError.unsupportedOperation(operation: operation, backend: resolved.backendKind)
+        }
+        return resolved
+    }
+}
+
+public extension VCSService {
     /// Get the working status.
     func getWorkingStatus(at repoURL: URL) async throws -> VCSWorkingStatus {
         let backend = await backend(forRepoRoot: repoURL)
@@ -518,10 +549,10 @@ public extension VCSService {
         guard let layout = gitRepositoryLayout(forRepoRoot: repoURL) else {
             return nil
         }
-        let mainWorktreeRoot = layout.commonDir.deletingLastPathComponent()
+        let isMain = !layout.isLinkedWorktree
         let identity = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: layout.commonDir,
-            mainWorktreeRoot: mainWorktreeRoot
+            mainWorktreeRoot: layout.knownMainWorktreeRoot
         )
         let branch = try? await gitBackend().getCurrentBranch(at: repoURL)
         let head = try? await gitBackend().getHeadID(at: repoURL)
@@ -529,7 +560,7 @@ public extension VCSService {
         let worktreeID = GitWorktreeIdentity.worktreeID(
             repositoryID: identity.repositoryID,
             gitDir: layout.gitDir,
-            isMain: !layout.isWorktree,
+            isMain: isMain,
             path: layout.workTreeRoot
         )
         return GitWorktreeContextSummary(
@@ -539,6 +570,7 @@ public extension VCSService {
             worktreeID: worktreeID,
             worktreePath: repoRootPath,
             worktreeName: worktreeName,
+            isMain: isMain,
             branch: branch,
             head: head,
             isDetached: branch == nil && head != nil

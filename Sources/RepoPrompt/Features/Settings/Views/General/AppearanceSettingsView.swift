@@ -50,6 +50,13 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var fileMentionPickerStyleBinding: Binding<FileMentionPickerStyle> {
+        Binding(
+            get: { globalSettings.fileMentionPickerStyle() },
+            set: { globalSettings.setFileMentionPickerStyle($0) }
+        )
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
@@ -130,18 +137,38 @@ struct AppearanceSettingsView: View {
                     title: "Text Editing",
                     description: "Configure text editing behavior"
                 ) {
-                    SettingToggle(
-                        title: "Enable Spell Checking in Instructions",
-                        description: "Check for spelling mistakes in the instructions text area",
-                        isOn: $promptViewModel.spellCheckInstructions
-                    )
+                    VStack(alignment: .leading, spacing: 8) {
+                        SettingToggle(
+                            title: "Enable Spell Checking in Instructions",
+                            description: "Check for spelling mistakes in the instructions text area",
+                            isOn: $promptViewModel.spellCheckInstructions
+                        )
 
-                    // Experimental toggle for the @-mention menu
-                    SettingToggle(
-                        title: "Enable @-Mention Menu (Experimental)",
-                        description: "Allows you to tag files directly in the compose prompt box using \"@file\" suggestions.",
-                        isOn: experimentalAttributedTextEditorBinding
-                    )
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("@ File Picker Style")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+
+                            Picker("@ File Picker Style", selection: fileMentionPickerStyleBinding) {
+                                ForEach(FileMentionPickerStyle.allCases) { style in
+                                    Text(style.displayName).tag(style)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: fontPreset.scaledClamped(240, max: 320), alignment: .leading)
+
+                            Text("Choose Compact or Expanded density for file @ mention suggestions.")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                .foregroundColor(.secondary)
+                        }
+
+                        // Experimental toggle for the @-mention menu
+                        SettingToggle(
+                            title: "Enable @-Mention Menu (Experimental)",
+                            description: "Allows you to tag files directly in the compose prompt box using \"@file\" suggestions.",
+                            isOn: experimentalAttributedTextEditorBinding
+                        )
+                    }
                 }
                 .padding(.horizontal, fontPreset.scaledClamped(16, max: 24))
                 .padding(.bottom, fontPreset.scaledClamped(16, max: 24))

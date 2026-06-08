@@ -286,7 +286,8 @@ struct ContextBuilderPromptsOverlay: View {
                     .foregroundColor(.secondary)
             }
             .buttonStyle(.plain)
-            .help("Close")
+            .hoverTooltip("Close")
+            .accessibilityLabel("Close")
         }
     }
 
@@ -415,7 +416,8 @@ struct ContextBuilderPromptRow: View {
                 Image(systemName: "pin.fill")
                     .font(.caption2)
                     .foregroundColor(.orange)
-                    .help("Pinned - auto-selected in new tabs")
+                    .hoverTooltip("Pinned - auto-selected in new tabs")
+                    .accessibilityLabel("Pinned, auto-selected in new tabs")
             }
 
             Text(prompt.title)
@@ -439,7 +441,8 @@ struct ContextBuilderPromptRow: View {
                         .onHover { hovering in
                             hoveringButton = hovering ? "pin" : nil
                         }
-                        .help(prompt.isPinned ? "Unpin from new tabs" : "Pin to auto-select in new tabs")
+                        .hoverTooltip(prompt.isPinned ? "Unpin from new tabs" : "Pin to auto-select in new tabs")
+                        .accessibilityLabel(prompt.isPinned ? "Unpin from new tabs" : "Pin to auto-select in new tabs")
                     }
 
                     if showsCopyAction {
@@ -641,6 +644,8 @@ struct ContextBuilderPromptsButton: View {
             )
         }
         .buttonStyle(.plain)
-        .help(selectedCount > 0 ? "\(selectedCount) prompt\(selectedCount == 1 ? "" : "s") selected" : "Add custom prompts")
+        .hoverTooltip(selectedCount > 0 ? "\(selectedCount) prompt\(selectedCount == 1 ? "" : "s") selected" : "Add custom prompts")
+        .accessibilityLabel("Context Builder prompts")
+        .accessibilityHint(selectedCount > 0 ? "\(selectedCount) prompt\(selectedCount == 1 ? "" : "s") selected" : "Add custom prompts")
     }
 }

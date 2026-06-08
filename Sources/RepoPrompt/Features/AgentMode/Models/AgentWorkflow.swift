@@ -155,11 +155,22 @@ public enum AgentWorkflow: String, Codable, CaseIterable, Sendable, Identifiable
     }
 
     /// Creates an `AgentWorkflowDefinition` for this built-in workflow.
+    ///
+    /// Built-in definitions include the full workflow prompt template, which can be
+    /// large. SwiftUI empty-state views ask for workflow metadata during body/layout
+    /// updates, so keep these definitions cached instead of re-rendering templates on
+    /// every view pass.
     var definition: AgentWorkflowDefinition {
-        AgentWorkflowDefinition(builtIn: self)
+        Self.cachedDefinitionsByRawValue[rawValue] ?? AgentWorkflowDefinition(builtIn: self)
     }
 
     static let displayOrder: [AgentWorkflow] = [.orchestrate, .deepPlan, .optimize, .build, .review, .refactor, .investigate, .oracleExport]
+
+    private static let cachedDefinitionsByRawValue: [String: AgentWorkflowDefinition] = Dictionary(
+        uniqueKeysWithValues: allCases.map { workflow in
+            (workflow.rawValue, AgentWorkflowDefinition(builtIn: workflow))
+        }
+    )
 
     static func builtInSections(hiddenBuiltInIDs: Set<String>) -> BuiltInSections {
         let visibleBuiltIns = displayOrder

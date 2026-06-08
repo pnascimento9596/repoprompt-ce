@@ -97,6 +97,10 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.mapPath), artifacts.mapPath)
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifacts.sidecarPath), artifacts.sidecarPath)
         let result = try await VCSService().applyGitWorktreeMerge(.init(preview: preview))
+        if result.status != .completed {
+            await GitWorktreeTestSupport.assertApplyStatus(result, equals: .completed, preview: preview)
+            return
+        }
 
         XCTAssertEqual(result.status, .completed)
         XCTAssertNotNil(result.mergeCommit)
@@ -108,6 +112,7 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
 
         let dirty = try GitMergeFixture()
         defer { dirty.cleanup() }
+        try dirty.runGit(["config", "status.showUntrackedFiles", "no"], cwd: dirty.source)
         try "dirty\n".write(to: dirty.source.appendingPathComponent("Dirty.txt"), atomically: true, encoding: .utf8)
         let dirtyPreview = try await dirty.preview(publishArtifacts: false)
         XCTAssertTrue(dirtyPreview.inspection.isBlocked)
@@ -248,19 +253,30 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
         try FileManager.default.createDirectory(at: mutexDir, withIntermediateDirectories: true)
         let lockPath = mutexDir.appendingPathComponent("worktree.lock").path
         let readyPath = fixture.sandbox.appendingPathComponent("cross-process-lock-ready").path
+        let releasePath = fixture.sandbox.appendingPathComponent("cross-process-lock-release").path
         let script = """
         import fcntl, os, sys, time
-        fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+        lock_path, ready_path, release_path = sys.argv[1], sys.argv[2], sys.argv[3]
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        print(f"holder pid={os.getpid()} opening {lock_path}", flush=True)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        with open(sys.argv[2], "w", encoding="utf-8") as ready:
-            ready.write("ready")
-        time.sleep(0.6)
+        print("holder acquired flock", flush=True)
+        with open(ready_path, "w", encoding="utf-8") as ready:
+            ready.write(f"pid={os.getpid()} lock={lock_path}\\n")
+        deadline = time.monotonic() + 20
+        while not os.path.exists(release_path):
+            if time.monotonic() >= deadline:
+                print(f"timed out waiting for release file {release_path}", file=sys.stderr, flush=True)
+                sys.exit(42)
+            time.sleep(0.05)
+        print("holder saw release file", flush=True)
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+        print("holder released flock", flush=True)
         """
         let holder = Process()
         holder.executableURL = python
-        holder.arguments = ["-c", script, lockPath, readyPath]
+        holder.arguments = ["-c", script, lockPath, readyPath, releasePath]
         let output = Pipe()
         holder.standardOutput = output
         holder.standardError = output
@@ -272,17 +288,29 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
             }
         }
 
-        let readyDeadline = Date().addingTimeInterval(2)
-        while !FileManager.default.fileExists(atPath: readyPath), Date() < readyDeadline {
+        let readyDeadline = ContinuousClock.now + .seconds(10)
+        while !FileManager.default.fileExists(atPath: readyPath), ContinuousClock.now < readyDeadline {
             if !holder.isRunning {
-                let data = output.fileHandleForReading.readDataToEndOfFile()
-                let text = String(decoding: data, as: UTF8.self)
+                let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
                 throw XCTSkip("Unable to start cross-process flock holder: \(text)")
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(for: .milliseconds(50))
         }
         guard FileManager.default.fileExists(atPath: readyPath) else {
-            XCTFail("Timed out waiting for cross-process flock holder")
+            holder.terminate()
+            holder.waitUntilExit()
+            let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            XCTFail("""
+            Timed out waiting for cross-process flock holder readiness.
+            lock_path: \(lockPath)
+            ready_path: \(readyPath)
+            release_path: \(releasePath)
+            holder_running_after_timeout: \(holder.isRunning)
+            holder_status: \(holder.terminationStatus)
+            lock_exists: \(FileManager.default.fileExists(atPath: lockPath))
+            holder_output:
+            \(text)
+            """)
             return
         }
 
@@ -293,25 +321,61 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
                 await order.append("swift-enter")
             }
         }
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await Task.sleep(for: .milliseconds(200))
         let beforeRelease = await order.snapshot()
         XCTAssertEqual(beforeRelease, [], "Swift lock entered while another process held the common Git dir lock")
 
-        let exitDeadline = Date().addingTimeInterval(2)
-        while holder.isRunning, Date() < exitDeadline {
-            try await Task.sleep(nanoseconds: 50_000_000)
+        try "release\n".write(to: URL(fileURLWithPath: releasePath), atomically: true, encoding: .utf8)
+        let exitDeadline = ContinuousClock.now + .seconds(10)
+        while holder.isRunning, ContinuousClock.now < exitDeadline {
+            try await Task.sleep(for: .milliseconds(50))
         }
         guard !holder.isRunning else {
             holder.terminate()
             holder.waitUntilExit()
-            _ = try? await waiter.value
-            XCTFail("Timed out waiting for cross-process flock holder to release the lock")
+            waiter.cancel()
+            XCTFail("""
+            Timed out waiting for cross-process flock holder to release after writing release file.
+            lock_path: \(lockPath)
+            ready_path: \(readyPath)
+            release_path: \(releasePath)
+            ready_contents: \((try? String(contentsOfFile: readyPath, encoding: .utf8)) ?? "<unreadable>")
+            release_exists: \(FileManager.default.fileExists(atPath: releasePath))
+            observed_order_before_release: \(beforeRelease)
+            lock_exists: \(FileManager.default.fileExists(atPath: lockPath))
+            """)
             return
         }
-        XCTAssertEqual(holder.terminationStatus, 0)
-        try await waiter.value
+        let holderOutput = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(holder.terminationStatus, 0, holderOutput)
+
+        let waiterCompleted = try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                try await waiter.value
+                return true
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(10))
+                return false
+            }
+            let completed = try await group.next() ?? false
+            group.cancelAll()
+            return completed
+        }
+        guard waiterCompleted else {
+            waiter.cancel()
+            await XCTFail("""
+            Swift lock waiter did not enter after holder released the cross-process flock.
+            lock_path: \(lockPath)
+            holder_output:
+            \(holderOutput)
+            observed_order_before_release: \(beforeRelease)
+            observed_order_after_timeout: \(order.snapshot())
+            """)
+            return
+        }
         let afterRelease = await order.snapshot()
-        XCTAssertEqual(afterRelease, ["swift-enter"])
+        XCTAssertEqual(afterRelease, ["swift-enter"], holderOutput)
     }
 }
 
@@ -374,9 +438,18 @@ private struct GitMergeFixture {
     }
 
     func endpoint(for path: URL, using git: GitService) async throws -> GitWorktreeMergeEndpoint {
-        let worktrees = try await git.listWorktrees(at: repo)
-        let standardized = path.standardizedFileURL.path
-        let descriptor = try XCTUnwrap(worktrees.first { $0.path == standardized })
+        let expectedHead = try gitOutput(["rev-parse", "HEAD"], cwd: path)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let branch = try gitOutput(["branch", "--show-current"], cwd: path)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedBranch = branch.isEmpty ? nil : branch
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: repo,
+            path: path,
+            expectedBranch: expectedBranch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await git.listWorktrees(at: repo) }
+        )
         return try GitWorktreeMergeEndpoint(descriptor: descriptor)
     }
 
@@ -413,29 +486,23 @@ private struct GitMergeFixture {
     }
 
     private static func gitOutput(_ arguments: [String], cwd: URL) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
         environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0 else {
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: "GitWorktreeMergeGitServiceTests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(text)"]
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
-        return text
+        return result.outputText
     }
 }

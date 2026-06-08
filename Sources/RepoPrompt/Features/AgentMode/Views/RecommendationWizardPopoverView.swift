@@ -540,7 +540,8 @@ private struct IntroStepView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Dismiss this recommendation")
+                .hoverTooltip("Dismiss this recommendation")
+                .accessibilityLabel("Dismiss this recommendation")
             }
         }
         .opacity(isMuted ? 0.7 : 1)

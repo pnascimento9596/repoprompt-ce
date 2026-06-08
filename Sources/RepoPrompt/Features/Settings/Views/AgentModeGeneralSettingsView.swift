@@ -220,7 +220,7 @@ struct AgentModeGeneralSettingsView: View {
             Capsule()
                 .fill(connected ? Color.green.opacity(0.12) : Color.secondary.opacity(0.08))
         )
-        .help(
+        .hoverTooltip(
             connected
                 ? "\(provider.displayName) is connected. Open CLI Providers to review auth, installs, or models."
                 : "\(provider.displayName) is not connected. Open CLI Providers to configure it."

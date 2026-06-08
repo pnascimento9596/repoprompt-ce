@@ -91,7 +91,7 @@ struct UpdateAvailableToolbarPill: View {
             .buttonStyle(.plain)
             .padding(.trailing, 8)
             .disabled(!canCheckForUpdates)
-            .help(helpText(displayVersion: displayVersion, canCheckForUpdates: canCheckForUpdates))
+            .hoverTooltip(helpText(displayVersion: displayVersion, canCheckForUpdates: canCheckForUpdates), .bottom)
             .accessibilityLabel(accessibilityLabel(displayVersion: displayVersion))
             .accessibilityHint(accessibilityHint(canCheckForUpdates: canCheckForUpdates))
         }

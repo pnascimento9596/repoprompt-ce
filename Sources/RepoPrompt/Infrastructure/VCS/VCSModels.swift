@@ -96,8 +96,21 @@ public struct VCSUncommittedFile: Equatable, Sendable {
 
 // MARK: - VCS Branch/Tag Types
 
+/// Describes a local branch that is already checked out by another Git worktree.
+public struct VCSBranchWorktreeOccupancy: Sendable, Equatable, Hashable {
+    public let worktreePath: String
+    public let worktreeName: String?
+    public let worktreeID: String?
+
+    public init(worktreePath: String, worktreeName: String? = nil, worktreeID: String? = nil) {
+        self.worktreePath = worktreePath
+        self.worktreeName = worktreeName
+        self.worktreeID = worktreeID
+    }
+}
+
 /// Represents a branch (git) or bookmark (jujutsu).
-public struct VCSBranch: Sendable {
+public struct VCSBranch: Identifiable, Sendable, Equatable {
     /// The name of the branch/bookmark.
     public let name: String
 
@@ -107,10 +120,90 @@ public struct VCSBranch: Sendable {
     /// The date of the last commit on this branch (if available).
     public let lastCommitDate: Date?
 
-    public init(name: String, isCurrent: Bool, lastCommitDate: Date? = nil) {
+    /// The other worktree currently occupying this branch, if any.
+    public let checkedOutWorktree: VCSBranchWorktreeOccupancy?
+
+    public var id: String {
+        name
+    }
+
+    public var isCheckedOutInAnotherWorktree: Bool {
+        checkedOutWorktree != nil
+    }
+
+    public var checkedOutWorktreeLabel: String? {
+        guard let checkedOutWorktree else { return nil }
+        if let name = checkedOutWorktree.worktreeName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty
+        {
+            return name
+        }
+        let fallback = URL(fileURLWithPath: checkedOutWorktree.worktreePath).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? nil : fallback
+    }
+
+    public init(
+        name: String,
+        isCurrent: Bool,
+        lastCommitDate: Date? = nil,
+        checkedOutWorktree: VCSBranchWorktreeOccupancy? = nil
+    ) {
         self.name = name
         self.isCurrent = isCurrent
         self.lastCommitDate = lastCommitDate
+        self.checkedOutWorktree = checkedOutWorktree
+    }
+}
+
+public enum VCSBranchSortOrder: String, CaseIterable, Identifiable, Sendable, Equatable {
+    case recent
+    case name
+
+    public var id: String {
+        rawValue
+    }
+
+    public var displayName: String {
+        switch self {
+        case .recent:
+            "Recent"
+        case .name:
+            "Name"
+        }
+    }
+}
+
+public extension [VCSBranch] {
+    func sortedForDisplay(by order: VCSBranchSortOrder) -> [VCSBranch] {
+        switch order {
+        case .recent:
+            sortedByRecentBranchActivity()
+        case .name:
+            sortedByBranchName()
+        }
+    }
+
+    private func sortedByRecentBranchActivity() -> [VCSBranch] {
+        sorted { lhs, rhs in
+            if lhs.isCurrent != rhs.isCurrent { return lhs.isCurrent }
+            switch (lhs.lastCommitDate, rhs.lastCommitDate) {
+            case let (left?, right?) where left != right:
+                return left > right
+            case (.some, nil):
+                return true
+            case (nil, .some):
+                return false
+            default:
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+        }
+    }
+
+    private func sortedByBranchName() -> [VCSBranch] {
+        sorted { lhs, rhs in
+            lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
     }
 }
 

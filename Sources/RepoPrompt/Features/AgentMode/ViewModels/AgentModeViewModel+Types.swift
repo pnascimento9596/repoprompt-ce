@@ -1,5 +1,17 @@
 import Foundation
 
+struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
+    let tabID: UUID
+    let sessionID: UUID
+    let generation: UUID
+
+    init(tabID: UUID, sessionID: UUID, generation: UUID = UUID()) {
+        self.tabID = tabID
+        self.sessionID = sessionID
+        self.generation = generation
+    }
+}
+
 enum AgentSidebarThreadKey: Hashable, Equatable {
     case session(UUID)
     case tab(UUID)
@@ -45,6 +57,52 @@ extension AgentModeViewModel {
         case full
         case transcriptRuntime
         case runtimeMetrics
+    }
+
+    struct AssistantPresentationRequest: Equatable {
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier
+        let persistentBinding: AgentPersistentSessionBindingIdentity?
+        let bindingTransitionGeneration: UInt64
+        let sourceItemsRevision: Int
+        let flushGeneration: UInt64
+    }
+
+    struct PersistentBindingTransitionToken: Equatable {
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier
+        let binding: AgentPersistentSessionBindingIdentity?
+        let transitionGeneration: UInt64
+        let sourceItemsRevision: Int
+    }
+
+    struct PersistedHydrationCommitToken: Equatable {
+        let transition: PersistentBindingTransitionToken
+        let requestedSessionID: UUID
+    }
+
+    struct SessionSaveCommitToken: Equatable {
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier
+        let workspaceID: UUID
+        let binding: AgentPersistentSessionBindingIdentity
+        let bindingTransitionGeneration: UInt64
+        let sourceItemsRevision: Int
+        let persistenceMutationGeneration: UInt64
+        let saveRequestGeneration: UInt64
+    }
+
+    enum PersistentBindingResolution: Equatable {
+        case unique(tabID: UUID)
+        case notFound
+        case ambiguous(tabIDs: [UUID])
+    }
+
+    enum PersistentBindingMutationError: Error, Equatable {
+        case staleTransition
+        case blockedByOwnership
+        case ambiguous
+        case tabNotFound
     }
 
     /// Reason tag emitted by sidebar forced-refresh call sites. Used purely for
@@ -128,9 +186,19 @@ extension AgentModeViewModel {
     /// provider binding layer's top-level permission profile model.
     typealias AgentPermissionProfile = AgentProviderPermissionProfile
 
+    struct AgentRunEpochTransitionIntent: Equatable {
+        let token: UUID
+        let kind: AgentRunEpochTransitionKind
+        let expectedCurrentEpoch: AgentRunTurnEpoch?
+    }
+
     struct AgentMCPControlContext: Equatable {
         let sessionID: UUID
         let activationID: UUID
+        let registration: AgentRunSessionStore.Registration
+        var currentEpoch: AgentRunTurnEpoch?
+        var preparedEpoch: AgentRunTurnEpoch?
+        var pendingEpochTransition: AgentRunEpochTransitionIntent?
         let originatingConnectionID: UUID?
         let interactionTransport: AgentInteractionTransport
         let suppressUserNotifications: Bool
@@ -650,12 +718,25 @@ extension AgentModeViewModel {
         let path: String
         let name: String?
         let branch: String?
+        let head: String?
+        let isDetached: Bool
         let label: String
         let colorHex: String?
+        let isLocked: Bool
+        let lockReason: String?
         let isPrunable: Bool
+        let prunableReason: String?
 
         var id: String {
-            worktreeID
+            presentationID
+        }
+
+        /// Stable SwiftUI identity for picker presentation. Selection semantics
+        /// remain repositoryID + worktreeID; this ID also includes the normalized
+        /// path so malformed duplicate Git records cannot collide in ForEach.
+        var presentationID: String {
+            let checkoutPath = CheckoutPathIdentity.canonicalPathOrOriginal(path)
+            return "\(repositoryID)::\(worktreeID)::\(checkoutPath)"
         }
     }
 

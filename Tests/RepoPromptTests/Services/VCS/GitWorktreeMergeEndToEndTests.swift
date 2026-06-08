@@ -11,6 +11,10 @@ final class GitWorktreeMergeEndToEndTests: XCTestCase {
         let abortPreview = try await abortFixture.preview(publishArtifacts: false)
         let reloadedApplyingOperation = AgentWorktreeMergeCoordinator.makeOperation(preview: abortPreview, status: .applying)
         let conflict = try await VCSService().applyGitWorktreeMerge(.init(preview: abortPreview))
+        if conflict.status != .conflicted {
+            await GitWorktreeTestSupport.assertApplyStatus(conflict, equals: .conflicted, preview: abortPreview)
+            return
+        }
 
         XCTAssertEqual(conflict.status, .conflicted)
         XCTAssertEqual(conflict.conflictFiles, ["Common.txt"])
@@ -35,6 +39,10 @@ final class GitWorktreeMergeEndToEndTests: XCTestCase {
 
         let continuePreview = try await continueFixture.preview(publishArtifacts: false)
         let continueConflict = try await VCSService().applyGitWorktreeMerge(.init(preview: continuePreview))
+        if continueConflict.status != .conflicted {
+            await GitWorktreeTestSupport.assertApplyStatus(continueConflict, equals: .conflicted, preview: continuePreview)
+            return
+        }
         XCTAssertEqual(continueConflict.status, .conflicted)
 
         try "resolved\n".write(to: continueFixture.repo.appendingPathComponent("Common.txt"), atomically: true, encoding: .utf8)
@@ -97,9 +105,18 @@ private struct Fixture {
     }
 
     func endpoint(for path: URL, using git: GitService) async throws -> GitWorktreeMergeEndpoint {
-        let worktrees = try await git.listWorktrees(at: repo)
-        let standardized = path.standardizedFileURL.path
-        let descriptor = try XCTUnwrap(worktrees.first { $0.path == standardized })
+        let expectedHead = try gitOutput(["rev-parse", "HEAD"], cwd: path)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let branch = try gitOutput(["branch", "--show-current"], cwd: path)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let expectedBranch = branch.isEmpty ? nil : branch
+        let descriptor = try await GitWorktreeTestSupport.waitForStableDescriptor(
+            repo: repo,
+            path: path,
+            expectedBranch: expectedBranch,
+            expectedHead: expectedHead,
+            listDescriptors: { try await git.listWorktrees(at: repo) }
+        )
         return try GitWorktreeMergeEndpoint(descriptor: descriptor)
     }
 
@@ -135,29 +152,23 @@ private struct Fixture {
     }
 
     private static func gitOutput(_ arguments: [String], cwd: URL) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
         environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0 else {
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: "GitWorktreeMergeEndToEndTests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(text)"]
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
-        return text
+        return result.outputText
     }
 }

@@ -999,7 +999,8 @@ struct CLIProvidersSettingsView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(PlainButtonStyle())
-                .help("Open the Kimi Code console to create or manage a Kimi API key")
+                .hoverTooltip("Open the Kimi Code console to create or manage a Kimi API key")
+                .accessibilityLabel("Open the Kimi Code console to create or manage a Kimi API key")
                 Spacer()
                 if isSavingKimiSecret {
                     ProgressView()
@@ -1077,7 +1078,7 @@ struct CLIProvidersSettingsView: View {
                 .foregroundColor(.accentColor)
             }
             .buttonStyle(PlainButtonStyle())
-            .help("Open \(provider)'s pricing page")
+            .hoverTooltip("Open \(provider)'s pricing page")
             Spacer(minLength: 0)
         }
         .fixedSize(horizontal: false, vertical: true)

@@ -54,8 +54,19 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
     @Published private(set) var snapshot: ContextSnapshot = .init()
     @Published private(set) var latestContextBuilderResult: ToolResultDTOs.ContextBuilderDTO?
 
-    private var latestWorkspaceContext: ToolResultDTOs.PromptContextDTO?
-    private var latestManageSelection: ToolResultDTOs.SelectionReply?
+    private struct SelectionToolMetrics: Equatable {
+        let fileCount: Int
+        let tokens: Int?
+        let timestamp: Date
+    }
+
+    private struct TimestampedToolResult<Value: Equatable>: Equatable {
+        let value: Value
+        let timestamp: Date
+    }
+
+    private var latestWorkspaceContext: TimestampedToolResult<ToolResultDTOs.PromptContextDTO>?
+    private var latestManageSelection: TimestampedToolResult<ToolResultDTOs.SelectionReply>?
     private var observedReadFiles: Set<String> = []
     private var processedItemIDs: Set<UUID> = []
     private var activeTranscriptFirstItemID: UUID?
@@ -82,16 +93,22 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             meaningfulChange = true
         }
 
-        let nextWorkspaceContext = transcriptSnapshot.latestWorkspaceContextItem.flatMap {
-            ToolJSON.decodeResult(ToolResultDTOs.PromptContextDTO.self, from: $0.toolResultJSON)
+        let nextWorkspaceContextItem = transcriptSnapshot.latestWorkspaceContextItem
+        let nextWorkspaceContext = nextWorkspaceContextItem.flatMap { item in
+            ToolJSON.decodeResult(ToolResultDTOs.PromptContextDTO.self, from: item.toolResultJSON).map {
+                TimestampedToolResult(value: $0, timestamp: item.timestamp)
+            }
         }
         if nextWorkspaceContext != latestWorkspaceContext {
             latestWorkspaceContext = nextWorkspaceContext
             meaningfulChange = true
         }
 
-        let nextManageSelection = transcriptSnapshot.latestManageSelectionItem.flatMap {
-            ToolJSON.decodeResult(ToolResultDTOs.SelectionReply.self, from: $0.toolResultJSON)
+        let nextManageSelectionItem = transcriptSnapshot.latestManageSelectionItem
+        let nextManageSelection = nextManageSelectionItem.flatMap { item in
+            ToolJSON.decodeResult(ToolResultDTOs.SelectionReply.self, from: item.toolResultJSON).map {
+                TimestampedToolResult(value: $0, timestamp: item.timestamp)
+            }
         }
         if nextManageSelection != latestManageSelection {
             latestManageSelection = nextManageSelection
@@ -121,7 +138,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         next.observedReadFileCount = observedReadFiles.count
         next.estimatedTranscriptTokens = transcriptSnapshot.estimatedTranscriptTokens
 
-        let toolTotalTokens = latestWorkspaceContext?.tokenStats?.total ?? latestManageSelection?.tokenStats?.total
+        let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
         next.tokenStatsTotal = toolTotalTokens
 
         if let codexUsage {
@@ -139,9 +156,9 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             next.usageSource = .unavailable
         }
 
-        let transcriptSelectionFiles = latestWorkspaceContext?.selection?.files.count ?? latestManageSelection?.files?.count
-        let selectionFiles = liveSelectedFileCount ?? transcriptSelectionFiles
-        let selectionTokens = latestWorkspaceContext?.selection?.totalTokens ?? latestManageSelection?.totalTokens
+        let selectionToolMetrics = latestToolSelectionMetrics()
+        let selectionFiles = liveSelectedFileCount ?? selectionToolMetrics?.fileCount
+        let selectionTokens = selectionToolMetrics?.tokens
         next.selectionTokens = selectionTokens
 
         if let selectionFiles {
@@ -185,7 +202,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         let transcriptChars = items.reduce(0) { $0 + $1.text.count }
         next.estimatedTranscriptTokens = transcriptChars > 0 ? transcriptChars / 4 : nil
 
-        let toolTotalTokens = latestWorkspaceContext?.tokenStats?.total ?? latestManageSelection?.tokenStats?.total
+        let toolTotalTokens = latestWorkspaceContext?.value.tokenStats?.total ?? latestManageSelection?.value.tokenStats?.total
         next.tokenStatsTotal = toolTotalTokens
 
         if let codexUsage {
@@ -203,9 +220,9 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             next.usageSource = .unavailable
         }
 
-        let transcriptSelectionFiles = latestWorkspaceContext?.selection?.files.count ?? latestManageSelection?.files?.count
-        let selectionFiles = liveSelectedFileCount ?? transcriptSelectionFiles
-        let selectionTokens = latestWorkspaceContext?.selection?.totalTokens ?? latestManageSelection?.totalTokens
+        let selectionToolMetrics = latestToolSelectionMetrics()
+        let selectionFiles = liveSelectedFileCount ?? selectionToolMetrics?.fileCount
+        let selectionTokens = selectionToolMetrics?.tokens
         next.selectionTokens = selectionTokens
 
         if let selectionFiles {
@@ -224,6 +241,38 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
 
         if snapshot != next {
             snapshot = next
+        }
+    }
+
+    private func latestToolSelectionMetrics() -> SelectionToolMetrics? {
+        let workspaceMetrics = latestWorkspaceContext.flatMap { result -> SelectionToolMetrics? in
+            guard let selection = result.value.selection else { return nil }
+            return SelectionToolMetrics(
+                fileCount: selection.files.count,
+                tokens: selection.totalTokens,
+                timestamp: result.timestamp
+            )
+        }
+        let manageSelectionMetrics = latestManageSelection.flatMap { result -> SelectionToolMetrics? in
+            guard let files = result.value.files else { return nil }
+            return SelectionToolMetrics(
+                fileCount: files.count,
+                tokens: result.value.totalTokens,
+                timestamp: result.timestamp
+            )
+        }
+
+        switch (workspaceMetrics, manageSelectionMetrics) {
+        case let (workspaceMetrics?, manageSelectionMetrics?):
+            return manageSelectionMetrics.timestamp >= workspaceMetrics.timestamp
+                ? manageSelectionMetrics
+                : workspaceMetrics
+        case let (workspaceMetrics?, nil):
+            return workspaceMetrics
+        case let (nil, manageSelectionMetrics?):
+            return manageSelectionMetrics
+        case (nil, nil):
+            return nil
         }
     }
 
@@ -264,12 +313,12 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         switch normalized {
         case "workspace_context":
             if let dto = ToolJSON.decodeResult(ToolResultDTOs.PromptContextDTO.self, from: item.toolResultJSON) {
-                latestWorkspaceContext = dto
+                latestWorkspaceContext = TimestampedToolResult(value: dto, timestamp: item.timestamp)
                 lastUpdatedAt = item.timestamp
             }
         case "manage_selection":
             if let dto = ToolJSON.decodeResult(ToolResultDTOs.SelectionReply.self, from: item.toolResultJSON) {
-                latestManageSelection = dto
+                latestManageSelection = TimestampedToolResult(value: dto, timestamp: item.timestamp)
                 lastUpdatedAt = item.timestamp
             }
         case "context_builder":

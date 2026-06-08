@@ -139,6 +139,9 @@ struct ResizableTextFieldFeatures {
     var fileTagStore: WorkspaceFileContextStore?
     var fileTagSearchService: WorkspaceSearchService?
     var fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?
+    var fileTagLookupContextIdentity: AnyHashable?
+    var fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)?
+    var fileTagPickerConfiguration: FileMentionPickerConfiguration = .compact
     var onFileTagCommitted: ((MentionSuggestion) -> Void)?
     var enableSlashSkillOverlay: Bool = false
     var slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
@@ -149,6 +152,9 @@ struct ResizableTextFieldFeatures {
         fileTagStore: WorkspaceFileContextStore?,
         fileTagSearchService: WorkspaceSearchService?,
         fileTagSelectionCoordinator: WorkspaceSelectionCoordinator?,
+        fileTagLookupContextIdentity: AnyHashable? = nil,
+        fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)? = nil,
+        fileMentionPickerConfiguration: FileMentionPickerConfiguration = .compact,
         onFileTagCommitted: ((MentionSuggestion) -> Void)?,
         slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
     ) -> ResizableTextFieldFeatures {
@@ -157,6 +163,9 @@ struct ResizableTextFieldFeatures {
             fileTagStore: fileTagStore,
             fileTagSearchService: fileTagSearchService,
             fileTagSelectionCoordinator: fileTagSelectionCoordinator,
+            fileTagLookupContextIdentity: fileTagLookupContextIdentity,
+            fileTagLookupContextProvider: fileTagLookupContextProvider,
+            fileTagPickerConfiguration: fileMentionPickerConfiguration,
             onFileTagCommitted: onFileTagCommitted,
             enableSlashSkillOverlay: true,
             slashSkillSuggestionsProvider: slashSkillSuggestionsProvider
@@ -331,7 +340,10 @@ struct CustomTextField: NSViewRepresentable {
             enabled: features.enableFileTagOverlay,
             store: features.fileTagStore,
             searchService: features.fileTagSearchService,
-            selectionCoordinator: features.fileTagSelectionCoordinator
+            selectionCoordinator: features.fileTagSelectionCoordinator,
+            lookupContextIdentity: features.fileTagLookupContextIdentity,
+            lookupContextProvider: features.fileTagLookupContextProvider,
+            configuration: features.fileTagPickerConfiguration
         )
         context.coordinator.configureSlashSkillSupport(
             textView: textView,
@@ -365,7 +377,10 @@ struct CustomTextField: NSViewRepresentable {
             enabled: features.enableFileTagOverlay,
             store: features.fileTagStore,
             searchService: features.fileTagSearchService,
-            selectionCoordinator: features.fileTagSelectionCoordinator
+            selectionCoordinator: features.fileTagSelectionCoordinator,
+            lookupContextIdentity: features.fileTagLookupContextIdentity,
+            lookupContextProvider: features.fileTagLookupContextProvider,
+            configuration: features.fileTagPickerConfiguration
         )
         context.coordinator.configureSlashSkillSupport(
             textView: textView,
@@ -532,14 +547,20 @@ struct CustomTextField: NSViewRepresentable {
             enabled: Bool,
             store: WorkspaceFileContextStore?,
             searchService: WorkspaceSearchService?,
-            selectionCoordinator: WorkspaceSelectionCoordinator?
+            selectionCoordinator: WorkspaceSelectionCoordinator?,
+            lookupContextIdentity: AnyHashable?,
+            lookupContextProvider: (() async -> WorkspaceLookupContext)?,
+            configuration: FileMentionPickerConfiguration
         ) {
             fileTagHelper.configure(
                 textView: textView,
                 enabled: enabled,
                 store: store,
                 searchService: searchService,
-                selectionCoordinator: selectionCoordinator
+                selectionCoordinator: selectionCoordinator,
+                lookupContextIdentity: lookupContextIdentity,
+                lookupContextProvider: lookupContextProvider,
+                configuration: configuration
             )
         }
 

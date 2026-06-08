@@ -3973,10 +3973,6 @@ class PromptViewModel: ObservableObject {
         let metaInstructions = metaInstructions
         let promptText = promptText
         let filePathDisplayOption = filePathDisplayOption
-        let includeFileTree = promptContext.rendersFileTree
-        let fileTreeMode = promptContext.effectiveFileTreeMode
-        let onlyIncludeRoots = onlyIncludeRootsWithSelectedFiles
-        let showCodeMapMarkers = !codeMapsGloballyDisabled
         let includeSavedPrompts = includeSavedPromptsInClipboard
         let includeUserPrompt = includeUserPromptInClipboard
         let includeDatetime = includeDatetimeInUserInstructions
@@ -3996,64 +3992,25 @@ class PromptViewModel: ObservableObject {
         }()
 
         Task {
-            let store = workspaceFileContextStore
-            let fileTreeContent: String
-            if includeFileTree {
-                let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                    selection: selectionSnapshot,
-                    request: WorkspaceFileTreeSnapshotRequest(
-                        mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: fileTreeMode),
-                        filePathDisplay: filePathDisplayOption,
-                        onlyIncludeRootsWithSelectedFiles: onlyIncludeRoots,
-                        includeLegend: true,
-                        showCodeMapMarkers: showCodeMapMarkers,
-                        rootScope: .allLoaded
-                    ),
-                    profile: .uiAssisted
-                )
-                fileTreeContent = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-            } else {
-                fileTreeContent = ""
-            }
-            let accountingService = PromptContextAccountingService()
-            let resolution = await accountingService.resolveEntries(
+            let preAssembly = await self.preAssemblePromptContext(
+                cfg: promptContext,
                 selection: selectionSnapshot,
-                store: store,
-                rootScope: .allLoaded,
-                profile: .uiAssisted,
-                codeMapUsage: promptContext.codeMapUsage
+                lookupContext: self.allLoadedWorkspaceLookupContext()
             )
-            let fileEntries = resolution.entries
-            let codemapSnapshots = await store.codemapSnapshotDictionary()
-            let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(fileEntries)
-            let includeFiles = includeFilesInClipboard && !fileEntries.isEmpty
-
-            // Get git diff based on resolved preset config (not UI state)
-            let gitDiff: String? = await {
-                guard diffEntries.isEmpty else { return nil }
-                switch promptContext.gitInclusion {
-                case .none:
-                    return nil
-                case .selected:
-                    let selectedPaths = await self.resolvedSelectedGitDiffPaths(for: selectionSnapshot)
-                    return await self.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
-                case .complete:
-                    return await self.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-                }
-            }()
+            let includeFiles = includeFilesInClipboard && !preAssembly.entries.isEmpty
 
             // Use captured values inside the Task
             let clipboardContent = await PromptPackagingService.generateClipboardContent(
                 metaInstructions: metaInstructions,
                 userInstructions: promptText,
-                files: fileEntries,
-                fileTreeContent: fileTreeContent,
-                gitDiff: gitDiff,
+                files: preAssembly.entries,
+                fileTreeContent: preAssembly.fileTreeContent,
+                gitDiff: preAssembly.gitDiff,
                 includeSavedPrompts: includeSavedPrompts,
                 includeFiles: includeFiles,
                 includeUserPrompt: includeUserPrompt,
                 filePathDisplay: filePathDisplayOption,
-                codemapSnapshots: codemapSnapshots,
+                codemapSnapshots: preAssembly.codemapSnapshots,
                 includeDatetimeInUserInstructions: includeDatetime,
                 promptSectionsOrder: promptSectionsOrder,
                 disabledPromptSections: disabledPromptSections,
@@ -4798,7 +4755,8 @@ class PromptViewModel: ObservableObject {
         overrideMode: PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
-        selectionOverride: StoredSelection? = nil
+        selectionOverride: StoredSelection? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> AIMessage {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
@@ -4815,7 +4773,8 @@ class PromptViewModel: ObservableObject {
             resolvedConfig.gitInclusion = gitInclusionOverride
         }
         let activeConfig = applyingGlobalCodeMapOverride(resolvedConfig)
-        let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
+        let logicalSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
+        let lookupContext = lookupContextOverride ?? allLoadedWorkspaceLookupContext()
 
         // Determine effective read-only mode. Legacy/manual edit settings are treated as Chat.
         let effectiveMode: PlanActMode = {
@@ -4834,21 +4793,14 @@ class PromptViewModel: ObservableObject {
         // active chat packaging no longer needs FileViewModel selection snapshots.
         let filePathDisplay = filePathDisplayOption
         let temperature = setModelTemperature ? modelTemperature : nil
-        let effectiveCodeMapUsage = activeConfig.codeMapUsage
-        let includeFileTree = activeConfig.rendersFileTree
-        let effectiveFileTreeMode = activeConfig.effectiveFileTreeMode
-        let store = workspaceFileContextStore
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
-            selection: effectiveSelection,
-            store: store,
-            rootScope: .allLoaded,
-            profile: .uiAssisted,
-            codeMapUsage: effectiveCodeMapUsage
+        let preAssembly = await preAssemblePromptContext(
+            cfg: activeConfig,
+            selection: logicalSelection,
+            lookupContext: lookupContext,
+            includeLocalDefinitionsInFileTree: true,
+            gitBaseOverride: gitBaseOverride
         )
-        let fileEntries = resolution.entries
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-        let (diffEntries, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(fileEntries)
+        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
         // Identify a stored prompt to be used as SYSTEM prompt when configured
         let idsCandidate = activeConfig.storedPromptIds ?? preset.storedPromptIds
@@ -4882,72 +4834,17 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        let allFileAPIs = await store.allCodemapFileAPIs()
-
         // Build file contents with effective code map usage
         let fileBlocks = PromptPackagingService.generateFileContents(
             codeEntries,
             filePathDisplay: filePathDisplay,
-            codemapSnapshots: codemapSnapshots
-        )
-
-        // Build file tree + code-map according to override (non-mutating)
-        let fileTreeString: String
-        if includeFileTree {
-            let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: effectiveSelection,
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: effectiveFileTreeMode),
-                    filePathDisplay: filePathDisplay,
-                    onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-                    includeLegend: true,
-                    showCodeMapMarkers: !codeMapsGloballyDisabled,
-                    rootScope: .allLoaded
-                ),
-                profile: .uiAssisted
-            )
-            let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-
-            // Only treat as having codemap entries if they actually have fileAPI available
-            let hasCodemapEntries = codeEntries.contains(where: { $0.isCodemap && codemapSnapshots[$0.file.id]?.fileAPI != nil })
-            let defBlock: String = {
-                guard !hasCodemapEntries else { return "" }
-                let rootInfos = fileTreeSnapshot.roots.map {
-                    CodeMapExtractor.RootInfo(
-                        standardizedRootFullPath: $0.standardizedRootPath,
-                        displayName: $0.name
-                    )
-                }
-                return CodeMapExtractor.buildLocalDefinitionBlockIfNeeded(
-                    codeMapUsage: effectiveCodeMapUsage,
-                    selectedFiles: codeEntries.filter { !$0.isCodemap }.map(\.file),
-                    allFileAPIs: allFileAPIs,
-                    filePathDisplay: filePathDisplay,
-                    roots: rootInfos
-                ).text
-            }()
-
-            fileTreeString = [tree, defBlock].filter { !$0.isEmpty }.joined(separator: "\n\n")
-        } else {
-            fileTreeString = ""
-        }
-
-        // Compute git diff without mutating state (selected diff files override inclusion)
-        let gitDiff: String? = await PromptPackagingService.resolveGitDiff(
-            fromDiffEntries: diffEntries
-        ) {
-            let diffBase = gitBaseOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let effectiveBase = (diffBase?.isEmpty == false) ? diffBase : nil
-            switch activeConfig.gitInclusion {
-            case .none:
-                return nil
-            case .selected:
-                let selectedPaths = await resolvedSelectedGitDiffPaths(for: effectiveSelection)
-                return await gitViewModel.getDiffForAbsolutePaths(selectedPaths, vs: effectiveBase, forceRefreshStatus: true)
-            case .complete:
-                return await gitViewModel.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+            codemapSnapshots: preAssembly.codemapSnapshots,
+            displayPathResolver: { entry in
+                preAssembly.displayPath(for: entry)
             }
-        }
+        )
+        let fileTreeString = preAssembly.fileTreeContent ?? ""
+        let gitDiff = preAssembly.gitDiff
 
         // Meta prompts:
         // - If override supplies stored prompts AND they are NOT used as system, use them.
@@ -5467,6 +5364,42 @@ extension PromptViewModel {
         return combinedMeta
     }
 
+    func allLoadedWorkspaceLookupContext() -> WorkspaceLookupContext {
+        WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+    }
+
+    func preAssemblePromptContext(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        includeLocalDefinitionsInFileTree: Bool = false,
+        gitBaseOverride: String? = nil
+    ) async -> PromptContextPreAssemblyResult {
+        let diffBase = gitBaseOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveBase = (diffBase?.isEmpty == false) ? diffBase : nil
+        let gitVM = gitViewModel
+        return await PromptContextPreAssemblyService.resolve(
+            PromptContextPreAssemblyRequest(
+                cfg: cfg,
+                selection: selection,
+                store: workspaceFileContextStore,
+                lookupContext: lookupContext,
+                filePathDisplay: filePathDisplayOption,
+                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: !codeMapsGloballyDisabled,
+                selectedGitDiffFolderPolicy: .expandFolders,
+                selectedGitDiffLookupProfile: .uiAssisted,
+                includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+                selectedGitDiffProvider: { [gitVM] selectedPaths in
+                    await gitVM.getDiffForAbsolutePaths(selectedPaths, vs: effectiveBase, forceRefreshStatus: true)
+                },
+                completeGitDiffProvider: { [gitVM] in
+                    await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+                }
+            )
+        )
+    }
+
     /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.
     func buildClipboard(
         for inputConfig: PromptContextResolved,
@@ -5477,80 +5410,12 @@ extension PromptViewModel {
         let cfg = applyingGlobalCodeMapOverride(inputConfig)
         let promptText = promptTextOverride ?? promptText
         let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
-        let store = workspaceFileContextStore
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
+        let preAssembly = await preAssemblePromptContext(
+            cfg: cfg,
             selection: effectiveSelection,
-            store: store,
-            rootScope: .allLoaded,
-            profile: .uiAssisted,
-            codeMapUsage: cfg.codeMapUsage
+            lookupContext: allLoadedWorkspaceLookupContext(),
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree
         )
-        let fileEntries = resolution.entries
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-        let (diffEntries, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(fileEntries)
-
-        // 1) File tree, with optional chat local definitions for token parity.
-        let combinedTreeAndMap: String?
-        if cfg.rendersFileTree {
-            let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: effectiveSelection,
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: cfg.effectiveFileTreeMode),
-                    filePathDisplay: filePathDisplayOption,
-                    onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-                    includeLegend: true,
-                    showCodeMapMarkers: !codeMapsGloballyDisabled,
-                    rootScope: .allLoaded
-                ),
-                profile: .uiAssisted
-            )
-            let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-            let defBlock: String
-            if includeLocalDefinitionsInFileTree {
-                let hasCodemapEntries = codeEntries.contains { $0.isCodemap && codemapSnapshots[$0.file.id]?.fileAPI != nil }
-                if hasCodemapEntries {
-                    defBlock = ""
-                } else {
-                    let rootInfos = fileTreeSnapshot.roots.map {
-                        CodeMapExtractor.RootInfo(
-                            standardizedRootFullPath: $0.standardizedRootPath,
-                            displayName: $0.name
-                        )
-                    }
-                    let allFileAPIs = await store.allCodemapFileAPIs()
-                    defBlock = CodeMapExtractor.buildLocalDefinitionBlockIfNeeded(
-                        codeMapUsage: cfg.codeMapUsage,
-                        selectedFiles: codeEntries.filter { !$0.isCodemap }.map(\.file),
-                        allFileAPIs: allFileAPIs,
-                        filePathDisplay: filePathDisplayOption,
-                        roots: rootInfos
-                    ).text
-                }
-            } else {
-                defBlock = ""
-            }
-            let combined = [tree, defBlock].filter { !$0.isEmpty }.joined(separator: "\n\n")
-            combinedTreeAndMap = combined.isEmpty ? nil : combined
-        } else {
-            combinedTreeAndMap = nil
-        }
-
-        // 2) Git diff (optional)
-        let gitDiff: String?
-        switch cfg.gitInclusion {
-        case .none:
-            gitDiff = nil
-        case .selected:
-            let selectedPaths = await resolvedSelectedGitDiffPaths(for: effectiveSelection)
-            gitDiff = diffEntries.isEmpty
-                ? await gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
-                : nil
-        case .complete:
-            gitDiff = diffEntries.isEmpty
-                ? await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-                : nil
-        }
 
         // 2.5) Meta prompts assembly.
         let combinedMeta = metaInstructions(for: cfg)
@@ -5560,14 +5425,14 @@ extension PromptViewModel {
         return await PromptPackagingService.generateClipboardContent(
             metaInstructions: combinedMeta,
             userInstructions: cfg.includeUserPrompt ? promptText : "",
-            files: fileEntries,
-            fileTreeContent: combinedTreeAndMap,
-            gitDiff: gitDiff,
+            files: preAssembly.entries,
+            fileTreeContent: preAssembly.fileTreeContent,
+            gitDiff: preAssembly.gitDiff,
             includeSavedPrompts: includeMetaBlock,
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: codemapSnapshots,
+            codemapSnapshots: preAssembly.codemapSnapshots,
             includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,

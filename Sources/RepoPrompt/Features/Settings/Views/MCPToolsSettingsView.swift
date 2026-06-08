@@ -42,7 +42,8 @@ struct MCPToolsSettingsView: View {
     private var controlsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Toggle("Enable MCP tools for this window", isOn: $server.windowToolsEnabled)
-                .help("Allow external tools to interact with this window's workspace")
+                .hoverTooltip("Allow external tools to interact with this window's workspace")
+                .accessibilityHint("Allow external tools to interact with this window's workspace")
 
             if !server.windowToolsEnabled {
                 HStack(spacing: 8) {

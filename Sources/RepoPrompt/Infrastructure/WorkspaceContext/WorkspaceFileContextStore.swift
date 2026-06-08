@@ -1097,6 +1097,15 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
+    func invalidateCodemapSnapshotsForCheckoutMutation(rootIDs: [UUID]) -> [UUID] {
+        var removedFileIDs: [UUID] = []
+        for rootID in rootIDs {
+            removedFileIDs.append(contentsOf: removeCodemapSnapshots(forRootID: rootID))
+        }
+        return removedFileIDs
+    }
+
+    @discardableResult
     func applyObservedCodemapResults(_ results: [WorkspaceObservedCodemapResult]) -> [String] {
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         var droppedPaths: [String] = []
@@ -1136,6 +1145,32 @@ actor WorkspaceFileContextStore {
             ))
         }
         return Array(Set(droppedPaths)).sorted()
+    }
+
+    @discardableResult
+    func reconcileLoadedRootCatalogWithDisk(rootID: UUID) async -> [FileSystemDelta] {
+        guard let state = rootStatesByID[rootID] else { return [] }
+        let root = state.root
+        let folderPaths = Set(
+            state.folderIDsByRelativePath.compactMap { relativePath, folderID -> String? in
+                isDiscoverableFolderID(folderID) ? relativePath : nil
+            }
+        )
+        guard !folderPaths.isEmpty else { return [] }
+
+        let deltas: [FileSystemDelta]
+        do {
+            deltas = try await state.service.scanFoldersInParallel(folderPaths)
+        } catch {
+            return []
+        }
+        guard !deltas.isEmpty,
+              let currentRoot = rootStatesByID[rootID]?.root,
+              currentRoot.standardizedFullPath == root.standardizedFullPath
+        else { return deltas }
+
+        await handleObservedFileSystemDeltas(deltas, root: root)
+        return deltas
     }
 
     func ensureIndexedFiles(paths: [String]) async -> [String] {
@@ -1407,6 +1442,12 @@ actor WorkspaceFileContextStore {
 
     func cancelAllCodemapScans() async {
         await codeScanActor.cancelAllScans()
+    }
+
+    func cancelCodemapScansForCheckoutMutation(rootIDs: [UUID]) async {
+        let rootFolderPaths = rootIDs.compactMap { rootStatesByID[$0]?.root.standardizedFullPath }
+        guard !rootFolderPaths.isEmpty else { return }
+        await codeScanActor.cancelAndUnloadScans(forRootFolders: rootFolderPaths)
     }
 
     func clearAllCodemapCaches(rootFolders: [String]) async {

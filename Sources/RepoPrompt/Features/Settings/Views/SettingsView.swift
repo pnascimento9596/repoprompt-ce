@@ -181,7 +181,7 @@ struct SettingsView: View {
             Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
-        .help(tab.title)
+        .hoverTooltip(tab.title)
         .accessibilityHint(Text(""))
     }
 

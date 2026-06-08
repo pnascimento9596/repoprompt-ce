@@ -4,7 +4,6 @@ import Foundation
 final class AgentRuntimeMetricsUIStore: ObservableObject {
     let runtimeVM = AgentRuntimeSidebarViewModel()
     @Published private(set) var revision: Int = 0
-    private var lastLiveSelectedFileCount: Int?
 
     func update(
         transcriptSnapshot: AgentTranscriptAnalyticsSnapshot,
@@ -13,14 +12,11 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String
     ) {
-        if let liveSelectedFileCount {
-            lastLiveSelectedFileCount = liveSelectedFileCount
-        }
         let previousSnapshot = runtimeVM.snapshot
         runtimeVM.update(
             snapshot: transcriptSnapshot,
             codexUsage: codexUsage,
-            liveSelectedFileCount: lastLiveSelectedFileCount,
+            liveSelectedFileCount: liveSelectedFileCount,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw
         )

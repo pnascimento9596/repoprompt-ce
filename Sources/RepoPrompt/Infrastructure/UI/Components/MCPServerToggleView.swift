@@ -106,7 +106,8 @@ struct MCPServerToggleView: View {
         .buttonStyle(CustomButtonStyle())
         .padding(.leading, 8)
         .padding(.trailing, 8)
-        .help(toolbarStateObserver.visualState.helpText)
+        .hoverTooltip(toolbarStateObserver.visualState.helpText, .bottom)
+        .accessibilityHint(toolbarStateObserver.visualState.helpText)
         .popover(isPresented: $showPopover, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
             popoverContent()
         }
@@ -553,7 +554,8 @@ struct MCPServerPopoverContent: View {
                                 Image(systemName: "info.circle.fill")
                                     .foregroundColor(.orange)
                                     .font(.system(size: 12))
-                                    .help("Setup Wizard hid presets so you can use the model dropdown above directly. Click 'Show presets' to restore them.")
+                                    .hoverTooltip("Setup Wizard hid presets so you can use the model dropdown above directly. Click 'Show presets' to restore them.")
+                                    .accessibilityLabel("Setup Wizard hid presets so you can use the model dropdown above directly. Click Show presets to restore them.")
                                 Text("Presets hidden by Setup Wizard.")
                                     .font(fontPreset.captionFont)
                                     .foregroundColor(.secondary)

@@ -55,6 +55,25 @@ struct AgentSessionWorktreeBinding: Codable, Equatable, Identifiable {
     var summary: AgentSessionWorktreeBindingSummary {
         AgentSessionWorktreeBindingSummary(binding: self)
     }
+
+    func updatingCheckout(branch: String?, head: String?) -> AgentSessionWorktreeBinding {
+        AgentSessionWorktreeBinding(
+            id: id,
+            repositoryID: repositoryID,
+            repoKey: repoKey,
+            logicalRootPath: logicalRootPath,
+            logicalRootName: logicalRootName,
+            worktreeID: worktreeID,
+            worktreeRootPath: worktreeRootPath,
+            worktreeName: worktreeName,
+            branch: branch,
+            head: head,
+            visualLabel: visualLabel,
+            visualColorHex: visualColorHex,
+            boundAt: boundAt,
+            source: source
+        )
+    }
 }
 
 /// Lightweight worktree-binding data copied into session-list/index records so callers can show

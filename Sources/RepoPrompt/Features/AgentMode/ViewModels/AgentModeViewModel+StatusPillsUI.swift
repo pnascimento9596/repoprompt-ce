@@ -60,9 +60,14 @@ extension AgentModeViewModel {
                     path: indicator.worktreeRootPath,
                     name: indicator.worktreeName,
                     branch: indicator.branch,
+                    head: nil,
+                    isDetached: indicator.branch == nil,
                     label: indicator.label,
                     colorHex: indicator.colorHex,
-                    isPrunable: !indicator.isAvailable
+                    isLocked: false,
+                    lockReason: nil,
+                    isPrunable: !indicator.isAvailable,
+                    prunableReason: indicator.isAvailable ? nil : indicator.tooltipText
                 )
             )
         } ?? .local
@@ -99,7 +104,7 @@ extension AgentModeViewModel {
             && !session.hasSentFirstMessage
             && session.runState == .idle
             && session.runID == nil
-            && session.activeHeadlessRunAttemptID == nil
+            && session.activeRunAttemptID == nil
             && session.providerSessionID == nil
             && session.codexConversationID == nil
             && session.worktreeBindings.isEmpty

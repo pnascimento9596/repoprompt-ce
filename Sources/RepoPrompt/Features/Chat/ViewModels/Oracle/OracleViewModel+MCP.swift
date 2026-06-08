@@ -24,6 +24,7 @@ extension OracleViewModel {
         let tabID: UUID
         let promptText: String
         let selection: StoredSelection
+        let lookupContext: WorkspaceLookupContext?
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
 
@@ -31,12 +32,14 @@ extension OracleViewModel {
             tabID: UUID,
             promptText: String,
             selection: StoredSelection,
+            lookupContext: WorkspaceLookupContext? = nil,
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil
         ) {
             self.tabID = tabID
             self.promptText = promptText
             self.selection = selection
+            self.lookupContext = lookupContext
             self.agentModeSessionID = agentModeSessionID
             self.agentModeRunID = agentModeRunID
         }
@@ -941,6 +944,7 @@ extension OracleViewModel {
         // Deprecated compatibility parameter: Oracle replies are text-only and no longer emit diffs.
         _ = args["include_diffs"]?.boolValue
         let selectionOverride = tabContext?.selection
+        let lookupContextOverride = tabContext?.lookupContext
 
         // ────────── 2. Handle model selection ──────────
         let presetsManager = ModelPresetsManager.shared
@@ -1022,7 +1026,8 @@ extension OracleViewModel {
             overrideMode: effectiveMode,
             gitInclusionOverride: nil,
             gitBaseOverride: nil,
-            selectionOverride: selectionOverride
+            selectionOverride: selectionOverride,
+            lookupContextOverride: lookupContextOverride
         )
         let queryId = activeQueryId(for: chatID) ?? currentQueryId
 

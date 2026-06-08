@@ -86,6 +86,7 @@ struct AgentComposerProps: Equatable {
     let autoEditEnabled: Bool
     let stagedSlashCommand: AgentStagedSlashCommandProps?
     let draftRestorationEvent: AgentDraftRestorationProps?
+    let fileTagLookupContextIdentity: AgentWorkspaceLookupContextIdentity
 
     static let empty = AgentComposerProps(
         currentTabID: nil,
@@ -116,6 +117,10 @@ struct AgentComposerProps: Equatable {
         lockedAgentSelectionMessage: nil,
         autoEditEnabled: ApplyEditsApprovalStore.globalDefaultAutoEditEnabled(),
         stagedSlashCommand: nil,
-        draftRestorationEvent: nil
+        draftRestorationEvent: nil,
+        fileTagLookupContextIdentity: AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        ).identity
     )
 }

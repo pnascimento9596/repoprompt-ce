@@ -216,6 +216,7 @@ struct AgentAttachmentsStrip: View, Equatable {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: fontPreset.scaledMetric(170), alignment: .leading)
+                .accessibilityLabel(attachment.relativePath)
 
             if allowsRemoval, let onRemoveTaggedFile {
                 Button {
@@ -234,7 +235,7 @@ struct AgentAttachmentsStrip: View, Equatable {
         .padding(.vertical, 6)
         .background(Color.secondary.opacity(0.08))
         .clipShape(Capsule())
-        .help(attachment.relativePath)
+        .hoverTooltip(attachment.relativePath)
     }
 
     private func title(for attachment: AgentImageAttachment) -> String {

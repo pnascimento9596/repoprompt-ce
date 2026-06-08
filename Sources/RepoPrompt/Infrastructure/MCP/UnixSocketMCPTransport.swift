@@ -21,6 +21,137 @@ import RepoPromptShared
     private func unixSocketMCPTransportDebugLog(_ message: @autoclosure () -> String) {}
 #endif
 
+#if DEBUG
+    private final class UnixSocketMCPTransportCallbackGate: @unchecked Sendable {
+        enum Kind: Hashable {
+            case terminal
+            case cancellation
+        }
+
+        private let lock = NSLock()
+        private var heldKinds: Set<Kind> = []
+        private var pendingCallbacks: [Kind: [@Sendable () -> Void]] = [:]
+
+        func hold(_ kind: Kind) {
+            lock.lock()
+            heldKinds.insert(kind)
+            lock.unlock()
+        }
+
+        func submit(_ kind: Kind, callback: @escaping @Sendable () -> Void) {
+            lock.lock()
+            guard heldKinds.contains(kind) else {
+                lock.unlock()
+                callback()
+                return
+            }
+            pendingCallbacks[kind, default: []].append(callback)
+            lock.unlock()
+        }
+
+        func release(_ kind: Kind) {
+            lock.lock()
+            heldKinds.remove(kind)
+            let callbacks = pendingCallbacks.removeValue(forKey: kind) ?? []
+            lock.unlock()
+            callbacks.forEach { $0() }
+        }
+    }
+
+    struct UnixSocketMCPTransportCleanupSnapshot {
+        let hasActiveReader: Bool
+        let pendingReaderCancellationCount: Int
+        let earlyReaderCancellationCount: Int
+        let readerIsRetained: Bool
+        let terminalCallbackCount: Int
+        let cancellationCallbackCount: Int
+        let finalizationCount: Int
+        let descriptorCloseCount: Int
+        let staleCancellationCount: Int
+        let staleTerminalCount: Int
+        let socketIsOwned: Bool
+    }
+#endif
+
+private final class MCPTransportIngressGate: @unchecked Sendable {
+    enum OfferResult {
+        case accepted
+        case overflow(MCPReceiveBufferOverflowError)
+        case terminal
+    }
+
+    private let lock = NSLock()
+    private let capacity: Int
+    private var acceptedFrameCount = 0
+    private var droppedFrameCount = 0
+    private var highWaterMark = 0
+    private var isTerminal = false
+    private var terminalCause: MCPTransportTerminalCause?
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    func offer(
+        _ frame: Data,
+        to continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    ) -> OfferResult {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isTerminal else {
+            return .terminal
+        }
+
+        switch continuation.yield(frame) {
+        case let .enqueued(remainingCapacity):
+            acceptedFrameCount += 1
+            highWaterMark = max(highWaterMark, capacity - remainingCapacity)
+            return .accepted
+        case .dropped:
+            droppedFrameCount += 1
+            highWaterMark = capacity
+            isTerminal = true
+            terminalCause = .receiveBufferOverflow
+            return .overflow(MCPReceiveBufferOverflowError(
+                capacity: capacity,
+                highWaterMark: highWaterMark
+            ))
+        case .terminated:
+            isTerminal = true
+            return .terminal
+        @unknown default:
+            isTerminal = true
+            return .terminal
+        }
+    }
+
+    func closeAndSnapshot() -> MCPTransportIngressSnapshot {
+        lock.lock()
+        isTerminal = true
+        let snapshot = makeSnapshot()
+        lock.unlock()
+        return snapshot
+    }
+
+    func snapshot() -> MCPTransportIngressSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return makeSnapshot()
+    }
+
+    private func makeSnapshot() -> MCPTransportIngressSnapshot {
+        MCPTransportIngressSnapshot(
+            receiveBufferCapacity: capacity,
+            acceptedFrameCount: acceptedFrameCount,
+            droppedFrameCount: droppedFrameCount,
+            receiveBufferHighWaterMark: highWaterMark,
+            isTerminal: isTerminal,
+            terminalCause: terminalCause
+        )
+    }
+}
+
 /// A Transport implementation using UNIX domain sockets for local MCP communication.
 ///
 /// This transport connects to a UNIX socket created by the CLI within a connection folder.
@@ -38,46 +169,85 @@ public actor UnixSocketMCPTransport: Transport {
     /// If true, this transport was created with an existing FD (no connect needed)
     private let ownsExistingFD: Bool
 
-    // Message stream for received data
-    private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
-    private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    private struct InboundChannel {
+        let stream: AsyncThrowingStream<Data, Swift.Error>
+        let continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+        let gate: MCPTransportIngressGate
 
-    // Close notification stream for cleanup signaling
-    private nonisolated let closeStream: AsyncStream<Void>
-    private var closeContinuation: AsyncStream<Void>.Continuation
+        init(capacity: Int) {
+            var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
+            stream = AsyncThrowingStream(
+                Data.self,
+                bufferingPolicy: .bufferingOldest(capacity)
+            ) { continuation = $0 }
+            self.continuation = continuation
+            gate = MCPTransportIngressGate(capacity: capacity)
+        }
+    }
+
+    private struct CloseChannel {
+        let stream: AsyncStream<Void>
+        let continuation: AsyncStream<Void>.Continuation
+
+        init() {
+            var continuation: AsyncStream<Void>.Continuation!
+            stream = AsyncStream(Void.self) { continuation = $0 }
+            self.continuation = continuation
+        }
+    }
+
+    /// Connection-local inbound and close channels. URL-backed transports replace
+    /// these after teardown so a successor connection cannot inherit terminal state.
+    private let receiveBufferCapacity: Int
+    private var inboundChannel: InboundChannel
+    private var closeChannel: CloseChannel
     private var closeSignaled = false
 
-    // Event-driven read source (replaces poll loop)
-    private var reader: NewlineDelimitedSocketReader?
+    /// Event-driven read source (replaces poll loop)
     private let readQueue = DispatchQueue(label: "com.repoprompt.mcp.unix.read", qos: .userInitiated)
 
-    /// Track fd that the read source is bound to (helps avoid closing wrong fd on reuse)
-    private var readSourceFD: Int32?
-    private var readSourceToken: UInt64?
-    private var readSourceSocketOwnershipGeneration: UInt64?
     private var nextReadSourceToken: UInt64 = 0
+
+    private struct ReaderIdentity: Hashable {
+        let fd: Int32
+        let token: UInt64
+        let socketOwnershipGeneration: UInt64
+    }
+
+    private struct ActiveReaderOwnership {
+        let identity: ReaderIdentity
+        let reader: NewlineDelimitedSocketReader
+    }
 
     /// Retains cancelled readers until their delayed cancel handlers perform final close.
     /// The transport retainer intentionally forms a temporary cycle so cleanup does not
     /// depend on an external manager keeping this actor alive after disconnect returns.
     private struct PendingReaderCancellation {
-        let fd: Int32
-        let socketOwnershipGeneration: UInt64
+        let identity: ReaderIdentity
         let reader: NewlineDelimitedSocketReader
         let transportRetainer: UnixSocketMCPTransport
     }
 
+    private var activeReaderOwnership: ActiveReaderOwnership?
     private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]
+    private var earlyReaderCancellations: Set<ReaderIdentity> = []
 
     /// Changes whenever socketFD is replaced or synchronously closed.
     private var socketOwnershipGeneration: UInt64 = 0
 
-    /// Optional error captured when read loop terminates (for diagnostics/logging)
-    private var readError: Swift.Error?
-
     #if DEBUG
+        private nonisolated let callbackGate = UnixSocketMCPTransportCallbackGate()
+        private weak var debugLastReader: NewlineDelimitedSocketReader?
+        private var debugTerminalCallbackCount = 0
+        private var debugCancellationCallbackCount = 0
+        private var debugReaderFinalizationCount = 0
+        private var debugDescriptorCloseCount = 0
+        private var debugStaleCancellationCount = 0
+        private var debugStaleTerminalCount = 0
         /// Forces the adopted-FD startup path to fail after preparation but before reader ownership.
         private var failNextExistingFDConnectBeforeReaderStart = false
+        /// Leaves a selected overflow pending so tests can race it with another teardown path.
+        private var deferNextReceiveOverflowTeardown = false
     #endif
 
     /// Generation counter that increments on each connection close/open cycle.
@@ -102,30 +272,19 @@ public actor UnixSocketMCPTransport: Transport {
     public init(
         socketURL: URL,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
-        writePollIntervalMilliseconds: Int32 = 250
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024
     ) {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         self.socketURL = socketURL
         ownsExistingFD = false
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
-
-        // Initialize streams
-        var msgCont: AsyncThrowingStream<Data, Swift.Error>.Continuation!
-        messageStream = AsyncThrowingStream(
-            Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
-        ) { continuation in
-            msgCont = continuation
-        }
-        messageContinuation = msgCont
-
-        var closeCont: AsyncStream<Void>.Continuation!
-        closeStream = AsyncStream(Void.self) { continuation in
-            closeCont = continuation
-        }
-        closeContinuation = closeCont
+        self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        inboundChannel = InboundChannel(capacity: sanitizedReceiveBufferCapacity)
+        closeChannel = CloseChannel()
     }
 
     /// Creates a transport using an already-connected file descriptor.
@@ -136,9 +295,11 @@ public actor UnixSocketMCPTransport: Transport {
     public init(
         connectedFD: Int32,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
-        writePollIntervalMilliseconds: Int32 = 250
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024
     ) throws {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         do {
             try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
         } catch {
@@ -156,22 +317,9 @@ public actor UnixSocketMCPTransport: Transport {
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
-
-        // Initialize streams
-        var msgCont: AsyncThrowingStream<Data, Swift.Error>.Continuation!
-        messageStream = AsyncThrowingStream(
-            Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
-        ) { continuation in
-            msgCont = continuation
-        }
-        messageContinuation = msgCont
-
-        var closeCont: AsyncStream<Void>.Continuation!
-        closeStream = AsyncStream(Void.self) { continuation in
-            closeCont = continuation
-        }
-        closeContinuation = closeCont
+        self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        inboundChannel = InboundChannel(capacity: sanitizedReceiveBufferCapacity)
+        closeChannel = CloseChannel()
     }
 
     private static func createLogger(_ logger: Logger?) -> Logger {
@@ -208,9 +356,7 @@ public actor UnixSocketMCPTransport: Transport {
 
         unixSocketMCPTransportDebugLog("connecting to \(socketURL.path)")
 
-        isStopping = false
-        streamFinished = false
-        closeSignaled = false
+        prepareForConnectionAttempt()
 
         // Wait for socket file to appear and connect
         let startTime = Date()
@@ -271,9 +417,35 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         let framed = Self.frameWithNewlineIfNeeded(message)
+        MCPResponseDeliveryTracer.emitFrame(
+            layer: "app_uds_transport",
+            phase: "send_started",
+            frame: framed,
+            direction: .serverToClient,
+            connectionGeneration: fdGeneration
+        )
 
-        try await writeAll(framed)
+        do {
+            try await writeAll(framed)
+        } catch {
+            MCPResponseDeliveryTracer.emitFrame(
+                layer: "app_uds_transport",
+                phase: "send_failed",
+                frame: framed,
+                direction: .serverToClient,
+                connectionGeneration: fdGeneration,
+                terminalReason: "app_uds_send_failed"
+            )
+            throw error
+        }
         lastActivityTime = Date()
+        MCPResponseDeliveryTracer.emitFrame(
+            layer: "app_uds_transport",
+            phase: "send_completed",
+            frame: framed,
+            direction: .serverToClient,
+            connectionGeneration: fdGeneration
+        )
         mcpTransportLog("UnixSocketMCPTransport sent \(framed.count) bytes successfully")
     }
 
@@ -291,13 +463,17 @@ public actor UnixSocketMCPTransport: Transport {
 
     /// Returns the async stream of received messages.
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
-        messageStream
+        inboundChannel.stream
     }
 
     /// Returns the close notification stream.
     /// Use this to detect when the socket closes so connections can be cleaned up promptly.
     public func closed() -> AsyncStream<Void> {
-        closeStream
+        closeChannel.stream
+    }
+
+    func ingressSnapshot() -> MCPTransportIngressSnapshot {
+        inboundChannel.gate.snapshot()
     }
 
     /// Returns seconds since last activity, or nil if never active.
@@ -307,6 +483,16 @@ public actor UnixSocketMCPTransport: Transport {
     }
 
     // MARK: - Private Implementation
+
+    private func prepareForConnectionAttempt() {
+        isStopping = false
+        if streamFinished || closeSignaled {
+            inboundChannel = InboundChannel(capacity: receiveBufferCapacity)
+            closeChannel = CloseChannel()
+        }
+        streamFinished = false
+        closeSignaled = false
+    }
 
     /// Connects to the UNIX socket at socketURL.
     private func connectToSocket() throws {
@@ -380,6 +566,9 @@ public actor UnixSocketMCPTransport: Transport {
     private func closeSocket() {
         if socketFD >= 0 {
             Darwin.close(socketFD)
+            #if DEBUG
+                debugDescriptorCloseCount += 1
+            #endif
             socketFD = -1
             socketOwnershipGeneration &+= 1
         }
@@ -388,7 +577,20 @@ public actor UnixSocketMCPTransport: Transport {
     /// Wakes blocked I/O and deterministically transfers final-close responsibility.
     /// If a reader exists, its cancel handler remains the sole final-close owner to
     /// avoid a stale callback closing a reused descriptor number.
-    private func tearDownSocket(error: Swift.Error?) {
+    private func tearDownSocket(error proposedError: Swift.Error?) {
+        guard !streamFinished else { return }
+        let ingressSnapshot = inboundChannel.gate.closeAndSnapshot()
+        let resolvedError: Swift.Error? = if ingressSnapshot.terminalCause == .receiveBufferOverflow {
+            MCPReceiveBufferOverflowError(
+                capacity: ingressSnapshot.receiveBufferCapacity,
+                highWaterMark: ingressSnapshot.receiveBufferHighWaterMark
+            )
+        } else {
+            proposedError
+        }
+        if ingressSnapshot.terminalCause == .receiveBufferOverflow {
+            logger.error("UnixSocketMCPTransport ingress terminated: \(String(describing: resolvedError))")
+        }
         isConnected = false
         isStopping = true
 
@@ -399,12 +601,12 @@ public actor UnixSocketMCPTransport: Transport {
         if !pendingReaderCancellationOwnsCurrentSocket() {
             closeSocket()
         }
-        transitionToClosed(error: error)
+        transitionToClosed(error: resolvedError)
     }
 
     private func connectExistingFD() throws {
         if isConnected {
-            guard reader != nil else {
+            guard activeReaderOwnership != nil else {
                 let error = MCPError.connectionClosed
                 tearDownSocket(error: error)
                 throw error
@@ -457,7 +659,64 @@ public actor UnixSocketMCPTransport: Transport {
         func debugFailNextExistingFDConnectBeforeReaderStart() {
             failNextExistingFDConnectBeforeReaderStart = true
         }
+
+        func debugDeferNextReceiveOverflowTeardown() {
+            deferNextReceiveOverflowTeardown = true
+        }
+
+        func debugHoldReaderTerminalCallback() {
+            callbackGate.hold(.terminal)
+        }
+
+        func debugReleaseReaderTerminalCallbacks() {
+            callbackGate.release(.terminal)
+        }
+
+        func debugHoldReaderCancellationCallback() {
+            callbackGate.hold(.cancellation)
+        }
+
+        func debugReleaseReaderCancellationCallbacks() {
+            callbackGate.release(.cancellation)
+        }
+
+        func debugTriggerReadErrorForCleanupTest() {
+            guard let identity = activeReaderOwnership?.identity else { return }
+            handleReaderTerminal(.error(POSIXError(.EIO)), from: identity)
+        }
+
+        func debugCleanupSnapshot() -> UnixSocketMCPTransportCleanupSnapshot {
+            UnixSocketMCPTransportCleanupSnapshot(
+                hasActiveReader: activeReaderOwnership != nil,
+                pendingReaderCancellationCount: pendingReaderCancellations.count,
+                earlyReaderCancellationCount: earlyReaderCancellations.count,
+                readerIsRetained: debugLastReader != nil,
+                terminalCallbackCount: debugTerminalCallbackCount,
+                cancellationCallbackCount: debugCancellationCallbackCount,
+                finalizationCount: debugReaderFinalizationCount,
+                descriptorCloseCount: debugDescriptorCloseCount,
+                staleCancellationCount: debugStaleCancellationCount,
+                staleTerminalCount: debugStaleTerminalCount,
+                socketIsOwned: socketFD >= 0
+            )
+        }
     #endif
+
+    private nonisolated func scheduleReaderTerminalCallback(_ callback: @escaping @Sendable () -> Void) {
+        #if DEBUG
+            callbackGate.submit(.terminal, callback: callback)
+        #else
+            callback()
+        #endif
+    }
+
+    private nonisolated func scheduleReaderCancellationCallback(_ callback: @escaping @Sendable () -> Void) {
+        #if DEBUG
+            callbackGate.submit(.cancellation, callback: callback)
+        #else
+            callback()
+        #endif
+    }
 
     private nonisolated static func ensureNonBlocking(fd: Int32) throws {
         let flags = fcntl(fd, F_GETFL)
@@ -617,123 +876,190 @@ public actor UnixSocketMCPTransport: Transport {
         try ReadSourceFDPreflight.validateOpenFD(fd, label: "UnixSocketMCPTransport read socket")
         stopReadSource()
 
-        // Track which FD this source is bound to
         nextReadSourceToken &+= 1
-        let token = nextReadSourceToken
-        readSourceFD = fd
-        readSourceToken = token
-        readSourceSocketOwnershipGeneration = socketOwnershipGeneration
+        let identity = ReaderIdentity(
+            fd: fd,
+            token: nextReadSourceToken,
+            socketOwnershipGeneration: socketOwnershipGeneration
+        )
 
-        let cont = messageContinuation
+        let inboundChannel = inboundChannel
         let log = logger
 
         let newReader = NewlineDelimitedSocketReader(
             fd: fd,
             queue: readQueue,
             logger: log,
-            onFrame: { frame in
-                mcpTransportLog("UnixSocketMCPTransport yielding message of \(frame.count) bytes")
-                cont.yield(frame)
+            onFrame: { [weak self] frame in
+                guard let self else { return }
+                switch inboundChannel.gate.offer(frame, to: inboundChannel.continuation) {
+                case .accepted:
+                    mcpTransportLog("UnixSocketMCPTransport accepted message of \(frame.count) bytes")
+                case let .overflow(error):
+                    mcpConnectionLog("UnixSocketMCPTransport receive buffer overflow; terminating connection")
+                    let transport = self
+                    Task { await transport.handleReceiveBufferOverflow(error, from: identity) }
+                case .terminal:
+                    break
+                }
             },
-            onEOF: { hasResidual in
-                mcpConnectionLog("UnixSocketMCPTransport received EOF")
-                Task { self.handleReadEOF(hasResidualData: hasResidual) }
+            onTerminal: { [weak self] terminal in
+                guard let transport = self else { return }
+                transport.scheduleReaderTerminalCallback {
+                    Task { await transport.handleReaderTerminal(terminal, from: identity) }
+                }
             },
-            onError: { error in
-                Task { self.handleReadError(error: error) }
+            onBytesRead: { [weak self] in
+                guard let transport = self else { return }
+                Task { await transport.noteActivity(from: identity) }
             },
-            onBytesRead: { Task { self.noteActivity() } },
             onCancel: { [weak self] in
-                mcpConnectionLog("UnixSocketMCPTransport read source cancelled for fd=\(fd) token=\(token)")
-                Task { await self?.readSourceDidCancel(fd: fd, token: token) }
+                guard let transport = self else { return }
+                mcpConnectionLog(
+                    "UnixSocketMCPTransport read source cancelled for fd=\(identity.fd) token=\(identity.token)"
+                )
+                transport.scheduleReaderCancellationCallback {
+                    Task { await transport.readSourceDidCancel(identity) }
+                }
             }
         )
 
-        reader = newReader
+        activeReaderOwnership = ActiveReaderOwnership(identity: identity, reader: newReader)
+        #if DEBUG
+            debugLastReader = newReader
+        #endif
         do {
             try newReader.start()
         } catch {
-            reader = nil
-            readSourceFD = nil
-            readSourceToken = nil
-            readSourceSocketOwnershipGeneration = nil
+            if activeReaderOwnership?.identity == identity {
+                activeReaderOwnership = nil
+            }
             throw error
         }
         mcpConnectionLog("UnixSocketMCPTransport read source started for fd=\(fd)")
     }
 
-    /// Stops the read source. Does NOT close the FD - that happens in cancelHandler.
+    /// Moves active reader ownership to the cancellation finalizer before requesting cancellation.
     private func stopReadSource() {
-        guard let reader else { return }
-        guard let fd = readSourceFD,
-              let token = readSourceToken,
-              let socketOwnershipGeneration = readSourceSocketOwnershipGeneration
-        else {
-            self.reader = nil
-            readSourceFD = nil
-            readSourceToken = nil
-            readSourceSocketOwnershipGeneration = nil
-            reader.stop()
-            return
-        }
+        guard let activeOwnership = activeReaderOwnership else { return }
+        activeReaderOwnership = nil
 
-        pendingReaderCancellations[token] = PendingReaderCancellation(
-            fd: fd,
-            socketOwnershipGeneration: socketOwnershipGeneration,
-            reader: reader,
+        let identity = activeOwnership.identity
+        pendingReaderCancellations[identity.token] = PendingReaderCancellation(
+            identity: identity,
+            reader: activeOwnership.reader,
             transportRetainer: self
         )
-        self.reader = nil
-        readSourceFD = nil
-        readSourceToken = nil
-        readSourceSocketOwnershipGeneration = nil
-        reader.stop()
-        // Note: retained reader cleanup happens in readSourceDidCancel
+        activeOwnership.reader.stop()
+
+        if earlyReaderCancellations.contains(identity) {
+            finalizeReaderCancellation(identity)
+        }
     }
 
     private func pendingReaderCancellationOwnsCurrentSocket() -> Bool {
         pendingReaderCancellations.values.contains { ownership in
-            ownership.fd == socketFD &&
-                ownership.socketOwnershipGeneration == socketOwnershipGeneration
+            ownership.identity.fd == socketFD &&
+                ownership.identity.socketOwnershipGeneration == socketOwnershipGeneration
         }
     }
 
-    /// Called by the read source's cancel handler. Closes the FD safely.
-    private func readSourceDidCancel(fd: Int32, token: UInt64) {
-        guard let ownership = pendingReaderCancellations.removeValue(forKey: token) else { return }
-        guard ownership.fd == fd else {
-            logger.error("UnixSocketMCPTransport reader cancellation fd mismatch for token=\(token)")
+    /// Called by the read source's cancel handler. Cancellation may beat terminal teardown.
+    private func readSourceDidCancel(_ identity: ReaderIdentity) {
+        #if DEBUG
+            debugCancellationCallbackCount += 1
+        #endif
+
+        if pendingReaderCancellations[identity.token]?.identity == identity {
+            finalizeReaderCancellation(identity)
             return
         }
 
-        if socketFD == fd, socketOwnershipGeneration != ownership.socketOwnershipGeneration {
-            logger.warning("UnixSocketMCPTransport skipping stale reader cancellation close for reused fd=\(fd)")
+        if activeReaderOwnership?.identity == identity {
+            earlyReaderCancellations.insert(identity)
             return
         }
 
-        Darwin.close(fd)
-        if socketFD == fd {
-            socketFD = -1
-            socketOwnershipGeneration &+= 1
+        #if DEBUG
+            debugStaleCancellationCount += 1
+        #endif
+    }
+
+    /// Sole final-close owner for a reader cancellation identity.
+    private func finalizeReaderCancellation(_ identity: ReaderIdentity) {
+        guard pendingReaderCancellations[identity.token]?.identity == identity,
+              let ownership = pendingReaderCancellations.removeValue(forKey: identity.token)
+        else {
+            return
+        }
+        earlyReaderCancellations.remove(identity)
+        withExtendedLifetime(ownership) {
+            #if DEBUG
+                debugReaderFinalizationCount += 1
+            #endif
+
+            if socketFD == identity.fd,
+               socketOwnershipGeneration != identity.socketOwnershipGeneration
+            {
+                logger.warning(
+                    "UnixSocketMCPTransport skipping stale reader cancellation close for reused fd=\(identity.fd)"
+                )
+                return
+            }
+
+            Darwin.close(identity.fd)
+            #if DEBUG
+                debugDescriptorCloseCount += 1
+            #endif
+            if socketFD == identity.fd {
+                socketFD = -1
+                socketOwnershipGeneration &+= 1
+            }
         }
     }
 
-    /// Called when read encounters an error.
-    private func handleReadError(error: Swift.Error) {
-        readError = error
+    private func handleReceiveBufferOverflow(
+        _ error: MCPReceiveBufferOverflowError,
+        from identity: ReaderIdentity
+    ) {
+        guard activeReaderOwnership?.identity == identity else { return }
+        guard !streamFinished else { return }
+        #if DEBUG
+            if deferNextReceiveOverflowTeardown {
+                deferNextReceiveOverflowTeardown = false
+                return
+            }
+        #endif
         tearDownSocket(error: error)
     }
 
-    /// Called when read encounters EOF.
-    /// - Parameter hasResidualData: If true, buffer had incomplete frame data
-    private func handleReadEOF(hasResidualData: Bool) {
-        if hasResidualData {
+    private func handleReaderTerminal(
+        _ terminal: NewlineDelimitedSocketReaderTerminal,
+        from identity: ReaderIdentity
+    ) {
+        #if DEBUG
+            debugTerminalCallbackCount += 1
+        #endif
+
+        guard activeReaderOwnership?.identity == identity else {
+            #if DEBUG
+                debugStaleTerminalCount += 1
+            #endif
+            return
+        }
+
+        switch terminal {
+        case let .error(error):
+            tearDownSocket(error: error)
+        case let .eof(hasResidualData):
+            mcpConnectionLog("UnixSocketMCPTransport received EOF")
+            guard hasResidualData else {
+                tearDownSocket(error: nil)
+                return
+            }
             // Treat residual incomplete frame as a protocol error
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
-            readError = truncationError
             tearDownSocket(error: truncationError)
-        } else {
-            tearDownSocket(error: nil)
         }
     }
 
@@ -752,7 +1078,8 @@ public actor UnixSocketMCPTransport: Transport {
     }
 
     /// Updates the activity timestamp (called from read handler).
-    private func noteActivity() {
+    private func noteActivity(from identity: ReaderIdentity) {
+        guard activeReaderOwnership?.identity == identity else { return }
         lastActivityTime = Date()
     }
 
@@ -761,9 +1088,9 @@ public actor UnixSocketMCPTransport: Transport {
         guard !streamFinished else { return }
         streamFinished = true
         if let error {
-            messageContinuation.finish(throwing: error)
+            inboundChannel.continuation.finish(throwing: error)
         } else {
-            messageContinuation.finish()
+            inboundChannel.continuation.finish()
         }
     }
 
@@ -771,7 +1098,7 @@ public actor UnixSocketMCPTransport: Transport {
     private func signalClosedOnce() {
         guard !closeSignaled else { return }
         closeSignaled = true
-        closeContinuation.yield()
-        closeContinuation.finish()
+        closeChannel.continuation.yield()
+        closeChannel.continuation.finish()
     }
 }

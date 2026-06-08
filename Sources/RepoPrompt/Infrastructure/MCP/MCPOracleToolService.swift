@@ -17,6 +17,7 @@ struct MCPOracleToolService {
     let captureRequestMetadata: () async -> RequestMetadata
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
     let requireCurrentTabContext: (String) async throws -> TabScopedContext
+    let resolveLookupContext: (TabScopedContext) async -> WorkspaceLookupContext
     let rebindChatSessionIfNeeded: (_ metadata: RequestMetadata, _ chatIDString: String) throws -> Void
     let resolveTabIDForAgentMode: (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
     let requireTargetWindow: () throws -> WindowState
@@ -155,15 +156,23 @@ struct MCPOracleToolService {
         let owner = resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
         let tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
-            tabContext = Self.oracleSendTabContext(from: virtualContext, owner: owner)
+            tabContext = await oracleSendTabContext(from: virtualContext, owner: owner)
         } else {
             guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
+            let worktreeBindings = owner.agentSessionID.map {
+                targetWindow.agentModeViewModel.worktreeBindings(forAgentSessionID: $0, tabID: tabID)
+            } ?? []
+            let lookupContext = await oraclePackagingLookupContext(
+                agentSessionID: owner.agentSessionID,
+                worktreeBindings: worktreeBindings
+            )
             tabContext = OracleViewModel.OracleSendTabContext(
                 tabID: tabID,
                 promptText: tabSnapshot.promptText,
                 selection: tabSnapshot.selection,
+                lookupContext: lookupContext,
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID
             )
@@ -254,9 +263,9 @@ struct MCPOracleToolService {
             let context = try await requireCurrentTabContext(oracleSendToolName)
             if runPurpose == .agentModeRun, let targetWindow {
                 let owner = resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
-                tabContext = Self.oracleSendTabContext(from: context, owner: owner)
+                tabContext = await oracleSendTabContext(from: context, owner: owner)
             } else {
-                tabContext = Self.oracleSendTabContext(from: context)
+                tabContext = await oracleSendTabContext(from: context)
             }
         }
 
@@ -477,14 +486,34 @@ struct MCPOracleToolService {
         )
     }
 
-    private static func oracleSendTabContext(
+    private func oraclePackagingLookupContext(for context: TabScopedContext) async -> WorkspaceLookupContext? {
+        await resolveLookupContext(context)
+    }
+
+    private func oraclePackagingLookupContext(
+        agentSessionID: UUID?,
+        worktreeBindings: [AgentSessionWorktreeBinding]
+    ) async -> WorkspaceLookupContext? {
+        guard let agentSessionID else { return .visibleWorkspace }
+        return await AgentWorkspaceLookupContextResolver.lookupContext(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: agentSessionID,
+                worktreeBindings: worktreeBindings
+            ),
+            store: promptVM.workspaceFileContextStore
+        )
+    }
+
+    private func oracleSendTabContext(
         from context: TabScopedContext,
         owner: AgentOracleOwner = AgentOracleOwner(agentSessionID: nil, runID: nil)
-    ) -> OracleViewModel.OracleSendTabContext {
-        OracleViewModel.OracleSendTabContext(
+    ) async -> OracleViewModel.OracleSendTabContext {
+        let lookupContext = await oraclePackagingLookupContext(for: context)
+        return OracleViewModel.OracleSendTabContext(
             tabID: context.tabID,
             promptText: context.promptText,
             selection: context.selection,
+            lookupContext: lookupContext,
             agentModeSessionID: owner.agentSessionID,
             agentModeRunID: owner.runID
         )

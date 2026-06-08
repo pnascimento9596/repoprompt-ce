@@ -51,6 +51,9 @@ only_rules:
   # Imports and diagnostics hygiene.
   - unused_import
 
+  # UI quality gates.
+  - custom_rules
+
 # Deferred for later cleanup plans: line/file/type/function length, complexity,
 # force unwrap/try/cast, implicitly unwrapped optionals, unowned captures,
 # strict naming rules, broad optional-binding/empty-count idiom cleanup,
@@ -58,5 +61,16 @@ only_rules:
 # fatalError message cleanup, prompt-string leading/trailing whitespace, and
 # SwiftLint brace/statement-position rules that currently conflict with
 # SwiftFormat wrapping.
+
+custom_rules:
+  no_swiftui_help_modifier:
+    name: "SwiftUI .help Modifier"
+    included:
+      - 'Sources/RepoPrompt/.*\.swift$'
+    regex: '\.help\s*\('
+    match_kinds:
+      - identifier
+    message: "Use .hoverTooltip(...) instead of .help(...)."
+    severity: error
 
 reporter: "xcode"

@@ -83,7 +83,8 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         purpose: MCPRunPurpose,
         codeMapsDisabled: Bool,
         connectedFD: Int32,
-        parentManager: ServerNetworkManager
+        parentManager: ServerNetworkManager,
+        receiveBufferCapacity: Int = 1024
     ) throws {
         self.connectionID = connectionID
         self.sessionToken = sessionToken
@@ -93,7 +94,11 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         self.parentManager = parentManager
 
         // Create transport with existing connected FD
-        transport = try UnixSocketMCPTransport(connectedFD: connectedFD, logger: bootstrapLog)
+        transport = try UnixSocketMCPTransport(
+            connectedFD: connectedFD,
+            logger: bootstrapLog,
+            receiveBufferCapacity: receiveBufferCapacity
+        )
 
         server = MCP.Server(
             name: Bundle.main.appName,
@@ -103,6 +108,9 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
                 prompts: .init(listChanged: false),
                 resources: .init(subscribe: false, listChanged: false),
                 tools: .init(listChanged: true)
+            ),
+            configuration: MCP.Server.Configuration(
+                responseSendTimeout: MCPTimeoutPolicy.responseSendDeadline
             )
         )
     }
@@ -113,7 +121,14 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
             guard let self else { return }
             for await _ in await transport.closed() {
                 let id = connectionID
+                let ingressSnapshot = await transport.ingressSnapshot()
                 mcpConnectionLog("BootstrapSocketConnectionManager: transport closed for \(id)")
+                await parentManager.recordTransportIngressTerminal(
+                    connectionID: id,
+                    clientName: _clientName,
+                    sessionToken: sessionToken,
+                    snapshot: ingressSnapshot
+                )
                 await parentManager.removeConnection(id)
                 break
             }
@@ -236,6 +251,23 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         updateState(.cancelled)
     }
 
+    func abortForExecutionWatchdog() async {
+        if !isClosing {
+            mcpConnectionLog("Force-disconnecting bootstrap connection \(connectionID) after unresponsive tool cancellation")
+            isClosing = true
+            healthMonitoringTask?.cancel()
+            healthMonitoringTask = nil
+            closeWatchTask?.cancel()
+            closeWatchTask = nil
+        }
+
+        // Delivery must stop immediately even if ordinary shutdown has already
+        // started and is blocked on the uncooperative handler.
+        await transport.disconnect()
+        updateState(.cancelled)
+        Task { await server.stop() }
+    }
+
     func connectionState() -> ConnectionStateSnapshot {
         state
     }
@@ -246,6 +278,10 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
     func secondsSinceLastActivity() async -> TimeInterval {
         await transport.secondsSinceLastActivity() ?? 0
+    }
+
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+        await transport.ingressSnapshot()
     }
 
     private func updateState(_ newState: ConnectionStateSnapshot) {

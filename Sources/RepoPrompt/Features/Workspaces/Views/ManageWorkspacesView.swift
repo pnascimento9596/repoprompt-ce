@@ -335,7 +335,8 @@ struct ManageWorkspacesView: View {
                         .font(fontPreset.captionFont)
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
-                        .help(path)
+                        .hoverTooltip(path)
+                        .accessibilityLabel(path)
                 }
             }
         }
