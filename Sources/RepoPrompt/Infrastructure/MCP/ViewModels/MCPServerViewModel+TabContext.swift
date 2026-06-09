@@ -903,7 +903,8 @@ extension MCPServerViewModel {
         windowID: Int,
         workspaceID providedWorkspaceID: UUID? = nil,
         snapshot: ComposeTabState,
-        runID: UUID? = nil
+        runID: UUID? = nil,
+        signalRouting: Bool = true
     ) {
         tabContextLog("installTabContext tab=\(snapshot.id) window=\(windowID) clientID=\(clientID ?? "nil") clientName=\(clientName ?? "nil") runID=\(runID?.uuidString ?? "nil")")
         let resolvedWorkspaceID: UUID? = {
@@ -951,7 +952,12 @@ extension MCPServerViewModel {
             tabContextByConnectionID[uuid] = context
             windowIDByConnection[uuid] = context.windowID
             if let runID = context.runID {
-                _ = registerRunIDMapping(connectionID: uuid, runID: runID, windowID: context.windowID)
+                _ = registerRunIDMapping(
+                    connectionID: uuid,
+                    runID: runID,
+                    windowID: context.windowID,
+                    signalRouting: signalRouting
+                )
                 // Consume any queued intent for this exact run after direct installation.
                 if let clientName {
                     let popped = pendingRunScopedTabContexts.popByRunID(clientName: clientName, runID: runID)
@@ -1901,28 +1907,43 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func cleanupRunIDMapping(runID: UUID, connectionID: UUID) {
-        connectionIDByRunID.removeValue(forKey: runID)
-        connectionIDToRunID.removeValue(forKey: connectionID)
+    func cleanupRunIDMapping(
+        runID: UUID,
+        connectionID: UUID,
+        signalRoutingFailure: Bool = true
+    ) {
+        if connectionIDByRunID[runID] == connectionID {
+            connectionIDByRunID.removeValue(forKey: runID)
+        }
+        if connectionIDToRunID[connectionID] == runID {
+            connectionIDToRunID.removeValue(forKey: connectionID)
+        }
         tabContextLog("cleanupRunIDMapping removed runID=\(runID) connectionID=\(connectionID)")
 
-        // Notify routing waiter that this runID will never route (enables early exit from wait)
-        MCPRoutingWaiter.signalFailed(runID)
+        // A stale generation must not fail routing for a newer replacement connection.
+        if signalRoutingFailure, liveConnectionID(forRunID: runID) == nil {
+            MCPRoutingWaiter.signalFailed(runID)
+        }
     }
 
     @MainActor
     @discardableResult
-    func registerRunIDMapping(connectionID: UUID, runID: UUID, windowID: Int) -> Bool {
+    func registerRunIDMapping(
+        connectionID: UUID,
+        runID: UUID,
+        windowID: Int,
+        signalRouting: Bool = true
+    ) -> Bool {
         // Fast path: already mapped to this exact run/connection.
         if connectionIDByRunID[runID] == connectionID,
            connectionIDToRunID[connectionID] == runID
         {
             windowIDByConnection[connectionID] = windowID
-            MCPRoutingWaiter.signalRouted(runID)
+            if signalRouting {
+                MCPRoutingWaiter.signalRouted(runID)
+            }
             return true
         }
-
-        windowIDByConnection[connectionID] = windowID
 
         // If this connection is already bound to a different run, refuse remap
         if let bound = tabContextByConnectionID[connectionID],
@@ -1958,12 +1979,14 @@ extension MCPServerViewModel {
             // Avoid dangling reverse mapping for stale run
             connectionIDByRunID.removeValue(forKey: previous)
         }
+        windowIDByConnection[connectionID] = windowID
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         tabContextLog("registerRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
 
-        // Notify routing waiter that this runID is now routed
-        MCPRoutingWaiter.signalRouted(runID)
+        if signalRouting {
+            MCPRoutingWaiter.signalRouted(runID)
+        }
 
         return true
     }
@@ -2154,10 +2177,14 @@ extension MCPServerViewModel {
                 tabContextByConnectionID.removeValue(forKey: connectionID)
                 windowIDByConnection.removeValue(forKey: connectionID)
 
-                if let boundRunID = context.runID {
+                if let boundRunID = context.runID,
+                   connectionIDByRunID[boundRunID] == connectionID
+                {
                     connectionIDByRunID.removeValue(forKey: boundRunID)
                 }
-                connectionIDToRunID.removeValue(forKey: connectionID)
+                if connectionIDToRunID[connectionID] == context.runID {
+                    connectionIDToRunID.removeValue(forKey: connectionID)
+                }
 
                 tabContextLog("removeTabContext removed bound context connectionID=\(connectionID) runID=\(runID?.uuidString ?? "nil") tab=\(context.tabID)")
             }
