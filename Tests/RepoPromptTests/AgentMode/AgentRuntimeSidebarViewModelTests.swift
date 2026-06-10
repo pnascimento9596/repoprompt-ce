@@ -4,6 +4,18 @@ import XCTest
 
 @MainActor
 final class AgentRuntimeSidebarViewModelTests: XCTestCase {
+    func testContextWindowFallbackScopesClaudeAliasesToProvider() {
+        var claude = AgentRuntimeSidebarViewModel.ContextSnapshot()
+        claude.selectedAgent = .claudeCode
+        claude.selectedModelRaw = "fable:xhigh"
+        XCTAssertEqual(claude.effectiveContextWindowTokens, 1_000_000)
+
+        var glm = AgentRuntimeSidebarViewModel.ContextSnapshot()
+        glm.selectedAgent = .claudeCodeGLM
+        glm.selectedModelRaw = "opus"
+        XCTAssertEqual(glm.effectiveContextWindowTokens, 200_000)
+    }
+
     func testStaleLiveZeroDoesNotMaskNewerManageSelectionCount() throws {
         let store = AgentRuntimeMetricsUIStore()
         store.update(

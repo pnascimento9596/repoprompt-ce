@@ -37,11 +37,12 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         /// Context window with agent-specific fallback when the provider hasn't reported one yet.
         var effectiveContextWindowTokens: Int {
             if let contextWindowTokens { return contextWindowTokens }
-            if let selectedModelRaw,
-               let model = AgentModel(rawValue: selectedModelRaw),
-               model.isExtendedContext
+            if let selectedAgent,
+               let selectedModelRaw,
+               let model = AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent),
+               let modelContextWindow = model.contextWindowTokens(for: selectedAgent)
             {
-                return 1_000_000
+                return modelContextWindow
             }
             switch selectedAgent {
             case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: return 200_000

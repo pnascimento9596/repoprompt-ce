@@ -55,14 +55,17 @@ enum AgentModel: String, CaseIterable, Codable {
     case gpt54MiniHigh = "gpt-5.4-mini-high"
 
     // Claude Code models
+    case claudeFable = "fable"
     case claudeSonnet = "sonnet"
     case claudeOpus = "opus"
     case claudeHaiku = "haiku"
     case claudeOpus1m = "opus[1m]"
 
     // Claude Code full model IDs (static known versions; no dynamic probing)
+    case claudeFable5 = "claude-fable-5"
     case claudeSonnet46 = "claude-sonnet-4-6"
     case claudeSonnet45 = "claude-sonnet-4-5"
+    case claudeOpus48 = "claude-opus-4-8"
     case claudeOpus47 = "claude-opus-4-7"
     case claudeOpus46 = "claude-opus-4-6"
     case claudeOpus45 = "claude-opus-4-5"
@@ -106,12 +109,15 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniLow: "GPT-5.4 Mini Low"
         case .gpt54MiniMedium: "GPT-5.4 Mini Medium"
         case .gpt54MiniHigh: "GPT-5.4 Mini High"
+        case .claudeFable: "Fable Latest"
         case .claudeSonnet: "Sonnet Latest"
         case .claudeOpus: "Opus Latest"
         case .claudeHaiku: "Haiku Latest"
         case .claudeOpus1m: "Opus Latest (1M)"
+        case .claudeFable5: "Fable 5"
         case .claudeSonnet46: "Sonnet 4.6"
         case .claudeSonnet45: "Sonnet 4.5"
+        case .claudeOpus48: "Opus 4.8"
         case .claudeOpus47: "Opus 4.7"
         case .claudeOpus46: "Opus 4.6"
         case .claudeOpus45: "Opus 4.5"
@@ -149,12 +155,15 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniLow: "Fast GPT-5.4 Mini. Good for quick exploration and lookups."
         case .gpt54MiniMedium: "GPT-5.4 Mini with balanced reasoning. Best exploration sub-agent for context gathering."
         case .gpt54MiniHigh: "GPT-5.4 Mini with deep reasoning. Good for complex exploration and analysis."
+        case .claudeFable: "Most capable Claude model. Best for ambitious coding projects, long-horizon reasoning, and complex agentic work."
         case .claudeSonnet: "Balanced speed and capability. Good for general coding, analysis, and everyday work."
-        case .claudeOpus: "Strongest Claude model. Best for open-ended tasks, architecture, and complex reasoning."
+        case .claudeOpus: "Strongest Claude Opus model. Best for open-ended tasks, architecture, and complex reasoning."
         case .claudeHaiku: "Fast and lightweight. Good for exploration, quick edits, and mapping codebases."
         case .claudeOpus1m: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context."
+        case .claudeFable5: "Pinned Claude Fable 5. Most capable tier for ambitious coding projects and long-running agentic work."
         case .claudeSonnet46: "Pinned Claude Sonnet 4.6. Balanced speed and capability for everyday engineering."
         case .claudeSonnet45: "Pinned Claude Sonnet 4.5. Balanced speed and capability for everyday engineering."
+        case .claudeOpus48: "Pinned Claude Opus 4.8. Strongest Opus tier for complex reasoning and architecture."
         case .claudeOpus47: "Pinned Claude Opus 4.7. Strongest Claude tier for complex reasoning and architecture."
         case .claudeOpus46: "Pinned Claude Opus 4.6. Strongest Claude tier for complex reasoning and architecture."
         case .claudeOpus45: "Pinned Claude Opus 4.5. Strongest Claude tier for complex reasoning and architecture."
@@ -199,12 +208,13 @@ enum AgentModel: String, CaseIterable, Codable {
             ]
         case .claudeCode:
             // Family priority matches the Claude Code picker catalog:
-            // Opus[1M] → Opus → Sonnet → Haiku. Within each family,
+            // Fable → Opus[1M] → Opus → Sonnet → Haiku. Within each family,
             // latest aliases come first, then pinned full IDs by descending version.
             [
                 .defaultModel,
+                .claudeFable, .claudeFable5,
                 .claudeOpus1m,
-                .claudeOpus, .claudeOpus47, .claudeOpus46, .claudeOpus45,
+                .claudeOpus, .claudeOpus48, .claudeOpus47, .claudeOpus46, .claudeOpus45,
                 .claudeSonnet, .claudeSonnet46, .claudeSonnet45,
                 .claudeHaiku, .claudeHaiku45
             ]
@@ -395,16 +405,6 @@ enum AgentModel: String, CaseIterable, Codable {
         try container.encode(rawValue)
     }
 
-    /// Whether this model uses the 1M extended context window.
-    var isExtendedContext: Bool {
-        switch self {
-        case .claudeOpus1m:
-            true
-        default:
-            false
-        }
-    }
-
     /// Returns the release date for models with staged rollouts
     var availableFrom: Date? {
         nil
@@ -426,26 +426,40 @@ enum AgentModel: String, CaseIterable, Codable {
             [.fast, .exploration, .engineering]
         case .gpt55CodexHigh:
             [.complex, .engineering, .pair]
-        case .claudeOpus:
+        case .claudeFable, .claudeOpus:
             [.complex, .engineering, .pair]
         default:
             []
         }
     }
 
-    /// Known context window size in tokens, when verified.
-    /// Returns `nil` for models where the context window is unknown or unverified.
+    /// Known context window size in tokens for unambiguous, pinned model IDs.
+    /// Provider aliases use `contextWindowTokens(for:)` because the same raw
+    /// values can represent unrelated models in Claude-compatible backends.
     var contextWindowTokens: Int? {
         switch self {
-        case .claudeOpus1m:
+        case .claudeFable5, .claudeOpus1m, .claudeOpus48:
             1_000_000
-        case .claudeSonnet, .claudeOpus, .claudeHaiku,
-             .claudeSonnet46, .claudeSonnet45,
+        case .claudeSonnet46, .claudeSonnet45,
              .claudeOpus47, .claudeOpus46, .claudeOpus45,
              .claudeHaiku45:
             200_000
         default:
             nil
         }
+    }
+
+    func contextWindowTokens(for agentKind: AgentProviderKind) -> Int? {
+        if agentKind == .claudeCode {
+            switch self {
+            case .claudeFable, .claudeOpus:
+                return 1_000_000
+            case .claudeSonnet, .claudeHaiku:
+                return 200_000
+            default:
+                break
+            }
+        }
+        return contextWindowTokens
     }
 }

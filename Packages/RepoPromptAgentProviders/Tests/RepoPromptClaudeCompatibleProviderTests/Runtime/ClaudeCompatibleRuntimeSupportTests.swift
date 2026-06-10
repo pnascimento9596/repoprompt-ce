@@ -149,7 +149,21 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(claude.defaultModelRaw, "opus")
         XCTAssertEqual(claude.options.first?.rawValue, "default")
         XCTAssertEqual(claude.options.first?.isPlaceholderDefault, true)
+        XCTAssertEqual(Array(claude.options.map(\.rawValue).prefix(8)), [
+            "default",
+            "fable",
+            "claude-fable-5",
+            "opus[1m]",
+            "opus",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6"
+        ])
+        XCTAssertTrue(claude.options.contains { $0.rawValue == "fable" && $0.supportedEffortLevels.contains("xhigh") })
+        XCTAssertTrue(claude.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
+        XCTAssertTrue(claude.options.contains { $0.rawValue == "opus" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(claude.options.contains { $0.rawValue == "opus[1m]" && $0.supportedEffortLevels.contains("xhigh") })
+        XCTAssertTrue(claude.options.contains { $0.rawValue == "claude-opus-4-8" && $0.supportedEffortLevels.contains("xhigh") })
 
         let zai = ClaudeCompatibleModelCatalog.snapshot(pluginID: .zaiClaudeCode, includeEffortVariants: false)
         XCTAssertEqual(zai.defaultModelRaw, "sonnet")

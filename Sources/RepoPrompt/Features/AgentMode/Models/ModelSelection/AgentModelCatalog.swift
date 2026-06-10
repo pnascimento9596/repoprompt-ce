@@ -1010,11 +1010,14 @@ enum AgentModelCatalog {
     }
 
     /// Base model raw values (lowercased) that support the XHigh effort tier.
-    /// Opus Latest, Opus 1M, and pinned Opus full IDs support XHigh.
+    /// Fable, Opus Latest, Opus 1M, and pinned Fable/Opus full IDs support XHigh.
     /// Sonnet, Haiku, and GLM deliberately do not support XHigh.
     private static let claudeXHighEligibleBaseRaws: Set<String> = [
+        AgentModel.claudeFable.rawValue.lowercased(),
+        AgentModel.claudeFable5.rawValue.lowercased(),
         AgentModel.claudeOpus.rawValue.lowercased(),
         AgentModel.claudeOpus1m.rawValue.lowercased(),
+        AgentModel.claudeOpus48.rawValue.lowercased(),
         AgentModel.claudeOpus47.rawValue.lowercased(),
         AgentModel.claudeOpus46.rawValue.lowercased(),
         AgentModel.claudeOpus45.rawValue.lowercased()
@@ -2080,7 +2083,7 @@ enum AgentModelCatalog {
                 let specifier = ClaudeModelSpecifier(raw: option.rawValue)
                 let effortDisplayName = specifier.effortLevel?.displayName
                 let targetNameSuffix = effortDisplayName.map { "\(group.displayName) \($0)" } ?? option.displayName
-                let contextWindow = AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent)?.contextWindowTokens
+                let contextWindow = AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent)?.contextWindowTokens(for: agent)
                 return DiscoveryStartTarget(
                     selectionID: selectionID,
                     modelRaw: option.rawValue,
@@ -2107,7 +2110,7 @@ enum AgentModelCatalog {
                 description: representative?.description,
                 available: true,
                 tags: tags,
-                contextWindowTokens: representativeModel?.contextWindowTokens,
+                contextWindowTokens: representativeModel?.contextWindowTokens(for: agent),
                 supportedReasoningEfforts: [],
                 defaultReasoningEffort: nil,
                 startTargets: targets
@@ -2124,7 +2127,7 @@ enum AgentModelCatalog {
     ) -> DiscoveryModel {
         let selectionID = AgentModelSelectionID(agentRaw: agent.rawValue, modelRaw: option.rawValue)
         let staticModel = AgentModel(rawValue: option.rawValue)
-        let contextWindow = staticModel?.contextWindowTokens
+        let contextWindow = staticModel?.contextWindowTokens(for: agent)
         let tags = staticModel?.discoveryTags ?? AgentModelDiscoveryTag.infer(from: option.rawValue)
 
         let target = DiscoveryStartTarget(

@@ -234,7 +234,10 @@ public enum ClaudeCompatibleModelCatalog {
     private static let haikuRaw = "haiku"
     private static let sonnetRaw = "sonnet"
     private static let opusRaw = "opus"
+    private static let fableRaw = "fable"
+    private static let fable5Raw = "claude-fable-5"
     private static let opus1mRaw = "opus[1m]"
+    private static let opus48Raw = "claude-opus-4-8"
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
@@ -244,6 +247,18 @@ public enum ClaudeCompatibleModelCatalog {
 
     private static let claudeModels: [StaticModel] = [
         StaticModel(
+            rawValue: fableRaw,
+            displayName: "Fable Latest",
+            description: "Most capable Claude model. Best for ambitious coding projects, long-horizon reasoning, and complex agentic work.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: fable5Raw,
+            displayName: "Fable 5",
+            description: "Pinned Claude Fable 5. Most capable tier for ambitious coding projects and long-running agentic work.",
+            supportsXHigh: true
+        ),
+        StaticModel(
             rawValue: opus1mRaw,
             displayName: "Opus Latest (1M)",
             description: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context.",
@@ -252,7 +267,13 @@ public enum ClaudeCompatibleModelCatalog {
         StaticModel(
             rawValue: opusRaw,
             displayName: "Opus Latest",
-            description: "Strongest Claude model. Best for open-ended tasks, architecture, and complex reasoning.",
+            description: "Strongest Claude Opus model. Best for open-ended tasks, architecture, and complex reasoning.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: opus48Raw,
+            displayName: "Opus 4.8",
+            description: "Pinned Claude Opus 4.8. Strongest Opus tier for complex reasoning and architecture.",
             supportsXHigh: true
         ),
         StaticModel(

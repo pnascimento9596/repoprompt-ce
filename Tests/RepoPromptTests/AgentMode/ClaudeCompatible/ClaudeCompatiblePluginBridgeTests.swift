@@ -70,16 +70,42 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(snapshot.defaultModelRaw, "opus")
         XCTAssertEqual(snapshot.options.first?.rawValue, "default")
         XCTAssertEqual(snapshot.options.first?.isPlaceholderDefault, true)
+        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "fable" && $0.supportedEffortLevels.contains("xhigh") })
+        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(snapshot.options.contains { $0.rawValue == "opus" && $0.supportedEffortLevels.contains("xhigh") })
+        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "claude-opus-4-8" && $0.supportedEffortLevels.contains("xhigh") })
 
         let options = AgentModelCatalog.options(for: .claudeCode, availability: availability)
         let menu = AgentModelCatalog.claudeMenu(for: options, agentKind: .claudeCode)
         XCTAssertEqual(AgentModelCatalog.defaultModelRaw(for: .claudeCode, availability: availability), "opus")
         XCTAssertEqual(menu.defaultOption?.rawValue, "default")
         let groupRaws = Set(menu.groups.map(\.baseModelRaw))
+        XCTAssertTrue(groupRaws.contains("fable"))
+        XCTAssertTrue(groupRaws.contains("claude-fable-5"))
         XCTAssertTrue(groupRaws.contains("opus[1m]"))
         XCTAssertTrue(groupRaws.contains("opus"))
+        XCTAssertTrue(groupRaws.contains("claude-opus-4-8"))
         XCTAssertTrue(groupRaws.contains("sonnet"))
+        XCTAssertEqual(Array(AgentModel.modelsForAgent(.claudeCode).map(\.rawValue).prefix(7)), [
+            "default",
+            "fable",
+            "claude-fable-5",
+            "opus[1m]",
+            "opus",
+            "claude-opus-4-8",
+            "claude-opus-4-7"
+        ])
+        XCTAssertEqual(
+            AgentModelCatalog.supportedClaudeEfforts(forSelectedModelRaw: "fable", agentKind: .claudeCode),
+            [.low, .medium, .high, .max, .xhigh]
+        )
+        XCTAssertNil(AgentModel.claudeFable.contextWindowTokens)
+        XCTAssertEqual(AgentModel.claudeFable.contextWindowTokens(for: .claudeCode), 1_000_000)
+        XCTAssertEqual(AgentModel.claudeFable5.contextWindowTokens, 1_000_000)
+        XCTAssertNil(AgentModel.claudeOpus.contextWindowTokens)
+        XCTAssertEqual(AgentModel.claudeOpus.contextWindowTokens(for: .claudeCode), 1_000_000)
+        XCTAssertNil(AgentModel.claudeOpus.contextWindowTokens(for: .claudeCodeGLM))
+        XCTAssertEqual(AgentModel.claudeOpus48.contextWindowTokens, 1_000_000)
 
         let discovery = try XCTUnwrap(AgentModelCatalog.discoveryAgents(availability: availability).first { $0.agent == .claudeCode })
         XCTAssertEqual(discovery.defaults.modelRaw, "opus")
@@ -87,6 +113,17 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(discovery.runtime, "claude_native")
         XCTAssertTrue(discovery.models.contains { $0.id == "default" })
         XCTAssertTrue(discovery.models.contains { $0.id == "opus" })
+        let fableDiscovery = try XCTUnwrap(discovery.models.first { $0.id == "fable" })
+        XCTAssertEqual(fableDiscovery.contextWindowTokens, 1_000_000)
+        XCTAssertTrue(fableDiscovery.startTargets.contains { $0.modelRaw == "fable:xhigh" })
+
+        let compatibleAvailability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, zaiConfigured: true)
+        let glmDiscovery = try XCTUnwrap(
+            AgentModelCatalog.discoveryAgents(availability: compatibleAvailability).first { $0.agent == .claudeCodeGLM }
+        )
+        let glmOpusDiscovery = try XCTUnwrap(glmDiscovery.models.first { $0.id == "opus" })
+        XCTAssertNil(glmOpusDiscovery.contextWindowTokens)
+        XCTAssertTrue(glmOpusDiscovery.startTargets.allSatisfy { $0.contextWindowTokens == nil })
 
         let compatiblePluginOptions = [
             ClaudeCompatiblePluginModelOption(
