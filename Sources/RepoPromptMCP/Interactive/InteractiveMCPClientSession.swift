@@ -72,6 +72,35 @@ enum ToolCallTimeoutPolicy: Equatable {
     case none
 }
 
+private final class MCPInitializationSettlementState: @unchecked Sendable {
+    enum Outcome {
+        case pending
+        case completed
+        case timedOut
+        case callerCancelled
+    }
+
+    private let lock = NSLock()
+    private var outcome: Outcome = .pending
+
+    func claim(_ candidate: Outcome) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .pending = outcome else { return false }
+        outcome = candidate
+        return true
+    }
+
+    func finish() -> Outcome {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .pending = outcome {
+            outcome = .completed
+        }
+        return outcome
+    }
+}
+
 private final class ToolCallSettlementState: @unchecked Sendable {
     enum Outcome {
         case pending
@@ -249,22 +278,14 @@ actor InteractiveMCPClientSession {
             }
 
             logger.debug("Calling MCP client.connect(transport)...")
-            // Connect and initialize. Bound this wait so exec mode can surface
-            // bootstrap/initialize stalls instead of hanging indefinitely.
-            let initResult = try await withThrowingTaskGroup(of: Initialize.Result.self) { group in
-                group.addTask {
-                    try await client.connect(transport: transport)
-                }
-                group.addTask {
-                    try await Task.sleep(for: .seconds(10))
-                    throw InteractiveSessionError.bootstrapResponseTimeout
-                }
-
-                guard let result = try await group.next() else {
-                    throw InteractiveSessionError.bootstrapResponseTimeout
-                }
-                group.cancelAll()
-                return result
+            // Connect and initialize. Avoid returning Initialize.Result through a
+            // throwing task group: Swift 6.2 release builds can abort in
+            // swift_task_dealloc when that timeout race tears down a child task.
+            let initResult = try await Self.awaitInitialization(
+                timeoutNanoseconds: 10_000_000_000,
+                timeoutSleep: timeoutSleep
+            ) {
+                try await client.connect(transport: transport)
             }
             logger.debug("MCP client connected successfully")
 
@@ -293,6 +314,70 @@ actor InteractiveMCPClientSession {
             throw error
         }
     }
+
+    private static func awaitInitialization(
+        timeoutNanoseconds: UInt64,
+        timeoutSleep: @escaping TimeoutSleep,
+        operation: @escaping @Sendable () async throws -> Initialize.Result
+    ) async throws -> Initialize.Result {
+        let settlement = MCPInitializationSettlementState()
+        let connectionTask = Task {
+            try await operation()
+        }
+        let timeoutTask = Task {
+            do {
+                try await timeoutSleep(timeoutNanoseconds)
+            } catch {
+                return
+            }
+            if settlement.claim(.timedOut) {
+                connectionTask.cancel()
+            }
+        }
+
+        return try await withTaskCancellationHandler {
+            let connectionResult: Result<Initialize.Result, Error>
+            do {
+                connectionResult = try await .success(connectionTask.value)
+            } catch {
+                connectionResult = .failure(error)
+            }
+
+            let outcome = settlement.finish()
+            timeoutTask.cancel()
+            await timeoutTask.value
+
+            switch outcome {
+            case .completed:
+                return try connectionResult.get()
+            case .timedOut:
+                throw InteractiveSessionError.bootstrapResponseTimeout
+            case .callerCancelled:
+                throw CancellationError()
+            case .pending:
+                preconditionFailure("Connection task completion must settle initialization state")
+            }
+        } onCancel: {
+            if settlement.claim(.callerCancelled) {
+                connectionTask.cancel()
+            }
+            timeoutTask.cancel()
+        }
+    }
+
+    #if DEBUG
+        static func debugAwaitInitialization(
+            timeoutNanoseconds: UInt64,
+            timeoutSleep: @escaping TimeoutSleep,
+            operation: @escaping @Sendable () async throws -> Initialize.Result
+        ) async throws -> Initialize.Result {
+            try await awaitInitialization(
+                timeoutNanoseconds: timeoutNanoseconds,
+                timeoutSleep: timeoutSleep,
+                operation: operation
+            )
+        }
+    #endif
 
     /// Disconnects from the MCP server.
     func disconnect() async {
