@@ -231,10 +231,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.enumerated().map { ($1.id, $0) },
                 uniquingKeysWith: { _, last in last }
             )
+            refreshSelectionMirrorContextRevision()
         }
     }
 
-    @Published private(set) var activeWorkspaceID: UUID? = nil // New property to track the active workspace ID
+    @Published private(set) var activeWorkspaceID: UUID? = nil {
+        didSet {
+            guard oldValue != activeWorkspaceID else { return }
+            refreshSelectionMirrorContextRevision()
+        }
+    }
+
     #if DEBUG
         private var restoreTokenRecountWatchdogIDs: Set<UUID> = []
     #endif
@@ -255,6 +262,28 @@ class WorkspaceManagerViewModel: ObservableObject {
     private static var nextWorkspaceSelectionRevision: UInt64 = 1
     private var selectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
     private var revisedSelectionByWorkspaceTab: [WorkspaceTabSelectionKey: StoredSelection] = [:]
+
+    private struct SelectionMirrorContext: Equatable {
+        let workspaceID: UUID
+        let tabID: UUID
+    }
+
+    private var lastSelectionMirrorContext: SelectionMirrorContext?
+    private(set) var selectionMirrorContextRevision: UInt64 = 0
+
+    private func refreshSelectionMirrorContextRevision() {
+        let context: SelectionMirrorContext? = if let activeWorkspaceID,
+                                                  let workspace = workspaces.first(where: { $0.id == activeWorkspaceID }),
+                                                  let tabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
+        {
+            SelectionMirrorContext(workspaceID: activeWorkspaceID, tabID: tabID)
+        } else {
+            nil
+        }
+        guard context != lastSelectionMirrorContext else { return }
+        lastSelectionMirrorContext = context
+        selectionMirrorContextRevision &+= 1
+    }
 
     private func bumpStateVersion(for id: UUID?) {
         guard let id else { return }
@@ -3806,25 +3835,40 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Applies the newest stored selection to the active file-selector UI without replaying
-    /// prompt text or other compose-tab state. Used by deferred `read_file` auto-selection.
+    /// Performs one selection mirror attempt. The coordinator owns identity fencing and repair.
+    @MainActor
+    func applySelectionMirrorAttempt(
+        _ selection: StoredSelection,
+        forTabID tabID: UUID,
+        workspaceID: UUID
+    ) async {
+        guard let active = activeWorkspace,
+              active.id == workspaceID,
+              active.activeComposeTabID == tabID
+        else { return }
+
+        beginApplyingTabContext(forTabID: tabID)
+        defer { endApplyingTabContext(forTabID: tabID) }
+        await fileManager.applyStoredSelection(selection)
+        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+    }
+
+    /// Applies the newest stored selection after deferred `read_file` auto-selection.
     @MainActor
     func applyStoredSelectionMirrorForReadFileAutoSelection(tabID: UUID) async {
         guard let active = activeWorkspace,
               active.activeComposeTabID == tabID,
               let tab = composeTab(with: tabID)
         else { return }
-
-        beginApplyingTabContext(forTabID: tabID)
-        defer { endApplyingTabContext(forTabID: tabID) }
         if let selectionCoordinator {
-            await selectionCoordinator.withApplyingSelectionMirror {
-                await fileManager.applyStoredSelection(tab.selection)
-            }
+            await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: tabID)
         } else {
-            await fileManager.applyStoredSelection(tab.selection)
+            await applySelectionMirrorAttempt(
+                tab.selection,
+                forTabID: tabID,
+                workspaceID: active.id
+            )
         }
-        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
     }
 
     /// Silent "stored-only" update: updates the compose tab in the backing store

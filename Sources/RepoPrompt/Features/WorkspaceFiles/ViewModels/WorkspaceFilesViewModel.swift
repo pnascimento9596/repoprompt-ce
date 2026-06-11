@@ -1087,7 +1087,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         selectionCoordinatorCancellable?.cancel()
         selectionCoordinatorCancellable = coordinator.changes
             .sink { [weak self, weak coordinator] change in
-                guard change.source != .uiFlush else { return }
+                guard change.source != .uiFlush, change.source != .mcpTabContext else { return }
                 Task { @MainActor [weak self, weak coordinator] in
                     guard let self, let coordinator else { return }
                     guard change.tabID == nil || change.tabID == currentTabID else { return }

@@ -1316,31 +1316,34 @@ extension MCPServerViewModel {
     static func persistMCPSelectionThroughCoordinator(
         _ selection: StoredSelection,
         for tabID: UUID,
-        selectionCoordinator: WorkspaceSelectionCoordinator?
+        selectionCoordinator: WorkspaceSelectionCoordinator?,
+        mirrorToUIIfActive: Bool = true
     ) async -> MCPSelectionCoordinatorPersistenceResult {
         guard let selectionCoordinator,
               let current = selectionCoordinator.selectionSnapshot(for: tabID, flushPendingUIIfActive: false)
         else { return .unavailable }
-        guard current.selection != selection else { return .unchanged }
+        let outcome: MCPSelectionCoordinatorPersistenceResult = current.selection == selection ? .unchanged : .persisted
         _ = await selectionCoordinator.persistSelection(
             selection,
             for: tabID,
             source: .mcpTabContext,
-            mirrorToUIIfActive: true
+            mirrorToUIIfActive: mirrorToUIIfActive
         )
-        return .persisted
+        return outcome
     }
 
     @MainActor
     static func persistMCPSelectionAndVerifyThroughCoordinator(
         _ selection: StoredSelection,
         for tabID: UUID,
-        selectionCoordinator: WorkspaceSelectionCoordinator?
+        selectionCoordinator: WorkspaceSelectionCoordinator?,
+        mirrorToUIIfActive: Bool = true
     ) async -> MCPSelectionPersistenceVerification {
         let outcome = await persistMCPSelectionThroughCoordinator(
             selection,
             for: tabID,
-            selectionCoordinator: selectionCoordinator
+            selectionCoordinator: selectionCoordinator,
+            mirrorToUIIfActive: mirrorToUIIfActive
         )
         let canonicalSelection = selectionCoordinator?
             .selectionSnapshot(for: tabID, flushPendingUIIfActive: false)?
@@ -1478,7 +1481,8 @@ extension MCPServerViewModel {
             await Self.persistMCPSelectionThroughCoordinator(
                 persistedSelection,
                 for: contextKey.tabID,
-                selectionCoordinator: selectionCoordinator
+                selectionCoordinator: selectionCoordinator,
+                mirrorToUIIfActive: false
             )
         }
         guard let refreshedTarget = currentReadFileAutoSelectionTab(for: contextKey) else { return false }

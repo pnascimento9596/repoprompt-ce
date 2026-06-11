@@ -278,7 +278,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let firstRead = gatedReadTask(fixture: fixture, id: 6)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(firstRead, gate: gate, id: 6)
             let secondRead = gatedReadTask(fixture: fixture, id: 7)
             try await assertReadReplyReturned(secondRead, gate: gate, id: 7)
@@ -319,7 +319,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let read = gatedReadTask(fixture: fixture, id: 6)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(read, gate: gate, id: 6)
 
             let exportURL = fixture.rootURL.appendingPathComponent("prompt-export.txt")
@@ -373,7 +373,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let read = gatedReadTask(fixture: fixture, id: 7)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(read, gate: gate, id: 7)
 
             let clearFinished = PersistentAsyncSignal()
@@ -395,9 +395,19 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             await gate.release()
             try await Self.assertSuccessfulResponse(clearTask.value, id: 8)
+
+            fixture.window.workspaceManager.publishActiveComposeTabSnapshot(
+                commitToMemory: true,
+                touchModified: false
+            )
+            await Task.yield()
+
             let finalSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
             XCTAssertEqual(finalSelection?.selectedPaths, [])
             XCTAssertEqual(finalSelection?.slices, [:])
+            let storedSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            XCTAssertEqual(storedSelection?.selectedPaths, [])
+            XCTAssertEqual(storedSelection?.slices, [:])
             let current = await fixture.retainedConnectionSnapshot()
             Self.assertStableAgentModeSnapshot(current, fixture: fixture)
         }
@@ -423,7 +433,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let read = gatedReadTask(fixture: fixture, id: 7)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(read, gate: gate, id: 7)
 
             let finishCompleted = PersistentAsyncSignal()
@@ -470,7 +480,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     ]
                 )
             }
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             let searchFinished = PersistentAsyncSignal()
             let searchObserver = Task {
                 let result = await searchTask.result
@@ -521,7 +531,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let read = gatedReadTask(fixture: fixture, id: 7)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(read, gate: gate, id: 7)
 
             let manager = fixture.window.workspaceManager
@@ -556,7 +566,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let read = gatedReadTask(fixture: fixture, id: 7)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(read, gate: gate, id: 7)
 
             let manager = fixture.window.workspaceManager
@@ -600,7 +610,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
 
             let read = gatedReadTask(fixture: fixture, id: 7)
-            await gate.waitUntilStarted()
+            try await requireGateStarted(gate)
             try await assertReadReplyReturned(read, gate: gate, id: 7)
 
             try fixture.window.mcpServer.bindTabForConnection(
@@ -676,6 +686,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let response = try await observer.value.get()
             let formattedRead = try Self.readFileText(from: response, id: id)
             XCTAssertTrue(formattedRead.contains(Fixture.sentinelContent), formattedRead)
+        }
+
+        func requireGateStarted(_ gate: PersistentAsyncGate) async throws {
+            guard await gate.waitUntilStarted() else {
+                XCTFail("Timed out waiting for the persistent async gate to start")
+                throw PersistentAsyncGateTimeoutError()
+            }
         }
 
         func waitUntilMarked(_ signal: PersistentAsyncSignal, timeout: Duration) async -> Bool {
@@ -1158,33 +1175,30 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
     }
 
+    private struct PersistentAsyncGateTimeoutError: Error {}
+
     private actor PersistentAsyncGate {
         private var started = false
         private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-        func markStartedAndWaitForRelease() async {
+        func markStartedAndWaitForRelease(timeout: Duration = .seconds(10)) async {
             started = true
-            startWaiters.forEach { $0.resume() }
-            startWaiters.removeAll()
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
+            let deadline = ContinuousClock.now + timeout
+            while !released, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(10))
             }
         }
 
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
+        func waitUntilStarted(timeout: Duration = .seconds(2)) async -> Bool {
+            let deadline = ContinuousClock.now + timeout
+            while !started, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(10))
             }
+            return started
         }
 
         func release() {
             released = true
-            releaseWaiters.forEach { $0.resume() }
-            releaseWaiters.removeAll()
         }
     }
 

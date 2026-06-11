@@ -492,6 +492,39 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testMCPSelectionPersistenceUnchangedActiveSelectionReconcilesStaleUI() async {
+        let activeTabID = UUID()
+        let canonical = StoredSelection(selectedPaths: ["/tmp/canonical.swift"], codemapAutoEnabled: false)
+        let staleUI = StoredSelection(selectedPaths: ["/tmp/stale-ui.swift"])
+        let manager = FakeMCPSelectionManager(
+            tabs: [ComposeTabState(id: activeTabID, name: "Active", selection: canonical)],
+            activeTabID: activeTabID
+        )
+        manager.mirroredSelection = staleUI
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: manager,
+            store: WorkspaceFileContextStore()
+        )
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let result = await MCPServerViewModel.persistMCPSelectionThroughCoordinator(
+            canonical,
+            for: activeTabID,
+            selectionCoordinator: coordinator,
+            mirrorToUIIfActive: true
+        )
+
+        XCTAssertEqual(result, .unchanged)
+        XCTAssertEqual(manager.composeTab(with: activeTabID)?.selection, canonical)
+        XCTAssertEqual(manager.mirrorAttempts, [canonical])
+        XCTAssertEqual(manager.mirroredSelection, canonical)
+        XCTAssertTrue(changes.isEmpty)
+    }
+
+    @MainActor
     func testMCPSelectionPersistenceRereadsCanonicalSelectionAndReportsMismatch() async {
         let activeTabID = UUID()
         let inactiveTabID = UUID()
@@ -862,8 +895,11 @@ final class TabContextRoutingTests: XCTestCase {
 @MainActor
 private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
+    private(set) var selectionMirrorContextRevision: UInt64 = 0
 
     private let ignoreStoredOnlyUpdates: Bool
+    private(set) var mirrorAttempts: [StoredSelection] = []
+    var mirroredSelection: StoredSelection?
 
     init(tabs: [ComposeTabState], activeTabID: UUID, ignoreStoredOnlyUpdates: Bool = false) {
         self.ignoreStoredOnlyUpdates = ignoreStoredOnlyUpdates
@@ -880,6 +916,18 @@ private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
     }
 
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {}
+
+    func applySelectionMirrorAttempt(
+        _ selection: StoredSelection,
+        forTabID tabID: UUID,
+        workspaceID: UUID
+    ) async {
+        guard activeWorkspace?.id == workspaceID,
+              activeWorkspace?.activeComposeTabID == tabID
+        else { return }
+        mirrorAttempts.append(selection)
+        mirroredSelection = selection
+    }
 
     func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
         guard !ignoreStoredOnlyUpdates else { return }
