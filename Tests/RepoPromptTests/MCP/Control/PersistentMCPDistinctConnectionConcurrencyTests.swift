@@ -1643,8 +1643,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let id = allocateRequestID()
             let rawJSON = try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
+                    var registered = false
                     do {
                         try register(continuation, for: id)
+                        registered = true
                         try sendJSON([
                             "jsonrpc": "2.0",
                             "id": id,
@@ -1656,7 +1658,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                             self?.failPending(id: id, error: ClientError.timedOut(id))
                         }
                     } catch {
-                        if !failPending(id: id, error: error) {
+                        if registered {
+                            // Once registered, only the pending map owns the resume; if
+                            // failPending finds nothing, close() already resumed it.
+                            failPending(id: id, error: error)
+                        } else {
                             continuation.resume(throwing: error)
                         }
                     }
