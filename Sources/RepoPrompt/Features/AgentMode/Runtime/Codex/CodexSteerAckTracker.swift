@@ -180,14 +180,20 @@ final class CodexSteerAckTracker {
     }
 
     private func pruneTerminalTombstonesIfNeeded() {
-        while terminalAttemptOrder.count > maxTerminalTombstones {
-            let expiredID = terminalAttemptOrder.removeFirst()
-            guard let record = attempts[expiredID],
-                  record.terminalState != nil,
-                  record.dispatchContinuation == nil,
-                  record.terminalContinuation == nil
-            else { continue }
+        var index = 0
+        while terminalAttemptOrder.count > maxTerminalTombstones, index < terminalAttemptOrder.count {
+            let expiredID = terminalAttemptOrder[index]
+            if let record = attempts[expiredID],
+               record.terminalState == nil
+               || record.dispatchContinuation != nil
+               || record.terminalContinuation != nil
+            {
+                // Keep attempts with live waiters tracked so a later prune can still remove them.
+                index += 1
+                continue
+            }
             attempts.removeValue(forKey: expiredID)
+            terminalAttemptOrder.remove(at: index)
         }
     }
 }

@@ -2337,6 +2337,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession
     ) {
         guard var inFlight = session.codexFallbackDispatchInFlight else { return }
+        // Successor dispatches begin a new run attempt, so lineage deliberately
+        // excludes runAttemptID.
+        guard identity.threadID == inFlight.originThreadID,
+              identity.controllerInstanceID == inFlight.originControllerInstanceID,
+              identity.controllerGeneration == inFlight.originControllerGeneration,
+              identity.runID == inFlight.originRunID
+        else { return }
         let previousBlockingTurn = inFlight.blockingTurn
         let blockingTurn = codexFallbackBlockingTurn(for: identity)
         switch inFlight.state {

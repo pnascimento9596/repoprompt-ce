@@ -1251,10 +1251,20 @@ final class CodexNativeSessionController {
             guard let acceptedTurnID = Self.nonEmptyString(
                 (result["turnId"] as? String)
                     ?? ((result["turn"] as? [String: Any])?["id"] as? String)
-            ),
-                acceptedTurnID == expectedTurnID
-            else {
+            ) else {
                 throw CodexAppServerClient.ClientError.invalidResponse
+            }
+            guard acceptedTurnID == expectedTurnID else {
+                throw CodexTurnSteerError.expectedTurnMismatch(
+                    expectedTurnID: expectedTurnID,
+                    actualTurnID: acceptedTurnID,
+                    failure: CodexAppServerClient.RequestFailure(
+                        method: "turn/steer",
+                        code: nil,
+                        message: "Codex accepted turn/steer for turn \(acceptedTurnID) instead of expected turn \(expectedTurnID).",
+                        data: nil
+                    )
+                )
             }
             return CodexTurnSteerReceipt(acceptedTurnID: acceptedTurnID)
         } catch let error as CodexAppServerClient.ClientError {
