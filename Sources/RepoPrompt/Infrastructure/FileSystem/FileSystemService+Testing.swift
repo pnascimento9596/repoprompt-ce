@@ -158,16 +158,22 @@ import Foundation
                     FSEventCallbackEntry(path: event.absolutePath, flags: event.flags, id: event.eventId)
                 }
             )
+            let filterResult = watcherEarlyFilter.filter(payload)
+            guard let retainedPayload = filterResult.payload else { return nil }
             let drain: (@Sendable () async -> Void)? = if scheduleDrain {
                 { [weak self] in await self?.drainAcceptedWatcherIngressMailbox() }
             } else {
                 nil
             }
-            return watcherIngressMailbox.accept(payload, lifecycleCorrelation: nil, scheduleDrain: drain)
+            return watcherIngressMailbox.accept(retainedPayload, lifecycleCorrelation: nil, scheduleDrain: drain)
         }
 
         func watcherIngressMailboxSnapshotForTesting() -> FileSystemWatcherIngressMailbox.Snapshot {
             watcherIngressMailbox.snapshotForTesting()
+        }
+
+        func watcherEarlyFilterSnapshotForTesting() -> FileSystemWatcherEarlyFilter.Snapshot {
+            watcherEarlyFilter.snapshotForTesting()
         }
 
         func publicationStateForTesting() -> (

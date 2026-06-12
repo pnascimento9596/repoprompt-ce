@@ -32,6 +32,7 @@ actor FileSystemService {
     let fileManager = FileManager.default
     nonisolated let diagnosticRootToken = UUID()
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
+    nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -318,6 +319,7 @@ actor FileSystemService {
         self.enableHierarchicalIgnores = enableHierarchicalIgnores
 
         watcherIngressMailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: Self.maxPendingRawEvents)
+        watcherEarlyFilter = FileSystemWatcherEarlyFilter(rootPath: path)
         nextFSEventStreamStartEventID = FSEventsGetCurrentEventId()
 
         // Configure parallelism caps based on available cores
@@ -340,6 +342,7 @@ actor FileSystemService {
 
         // Initialize root-level ignore rules in per-folder cache
         cacheIgnoreRules(ignoreRules, for: "")
+        watcherEarlyFilter.install(ignoreRules.snapshot(), generation: watcherEarlyFilter.currentGeneration())
     }
 
     #if DEBUG
@@ -389,6 +392,7 @@ actor FileSystemService {
             watcherIngressMailbox = FileSystemWatcherIngressMailbox(
                 maxQueuedRawEntries: maxPendingWatcherIngressEntriesOverride ?? Self.maxPendingRawEvents
             )
+            watcherEarlyFilter = FileSystemWatcherEarlyFilter(rootPath: path)
             nextFSEventStreamStartEventID = FSEventsGetCurrentEventId()
 
             // Configure parallelism caps (allow test overrides)
@@ -427,6 +431,7 @@ actor FileSystemService {
 
             // Initialize root-level ignore rules in per-folder cache
             cacheIgnoreRules(ignoreRules, for: "")
+            watcherEarlyFilter.install(ignoreRules.snapshot(), generation: watcherEarlyFilter.currentGeneration())
         }
 
     #endif

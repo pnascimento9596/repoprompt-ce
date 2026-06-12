@@ -156,6 +156,7 @@ extension FileSystemService {
             visitedItems[relativePath] = false
             if case .ineligible(.ignored) = eligibility {
                 explicitlyManagedIgnoredFilePaths.insert(relativePath)
+                watcherEarlyFilter.addExplicitlyManagedIgnoredFile(relativePath)
             }
         case .ineligible:
             break
@@ -479,9 +480,12 @@ extension FileSystemService {
             }
         #endif
 
+        let filterResult = service.watcherEarlyFilter.filter(payload)
+        guard let retainedPayload = filterResult.payload else { return }
+
         let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
         let acceptedWatermark = service.watcherIngressMailbox.accept(
-            payload,
+            retainedPayload,
             lifecycleCorrelation: lifecycleCorrelation
         ) { [weak service] in
             await service?.drainAcceptedWatcherIngressMailbox()
@@ -492,6 +496,8 @@ extension FileSystemService {
             correlation: lifecycleCorrelation,
             EditFlowPerf.Dimensions(
                 sourceItemCount: payload.count,
+                contentItemCount: retainedPayload.count,
+                changeCount: filterResult.filteredEntryCount,
                 rootToken: service.diagnosticRootToken.uuidString,
                 ingressSequence: acceptedWatermark.rawValue
             )
