@@ -598,6 +598,13 @@ extension MCPServerViewModel {
         return ctx.tabID
     }
 
+    #if DEBUG
+        @MainActor
+        func debugSelectionRevisionForBoundConnection(_ connectionID: UUID) -> UInt64? {
+            tabContextByConnectionID[connectionID]?.selectionRevision
+        }
+    #endif
+
     @MainActor
     func connectionBindingSnapshot(forConnection connectionID: UUID) -> ConnectionBindingSnapshot {
         if let context = tabContextByConnectionID[connectionID],
@@ -1451,6 +1458,12 @@ extension MCPServerViewModel {
         {
             var refreshed = selectionOnlyCommitContext(from: context)
             refreshed.selection = canonicalSelection
+            if let workspaceID = context.workspaceID {
+                refreshed.selectionRevision = workspaceManager?.selectionRevisionForMCP(
+                    workspaceID: workspaceID,
+                    tabID: context.tabID
+                ) ?? latest.selectionRevision
+            }
             refreshed.readFileAutoSelectionGeneration = latest.readFileAutoSelectionGeneration
             tabContextByConnectionID[connectionID] = refreshed
         }

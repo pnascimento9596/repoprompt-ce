@@ -165,6 +165,11 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             workspaceID: workspaceID,
             windowID: window.windowID
         )
+        #if DEBUG
+            let staleSelectionRevision = try XCTUnwrap(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(staleConnectionID)
+            )
+        #endif
         let setValue = try await ServerNetworkManager.withConnectionID(setterConnectionID) {
             try await manageSelection([
                 "op": .string("set"),
@@ -178,6 +183,21 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
         let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
         XCTAssertEqual(try Self.selectionPaths(setValue), [logicalPath])
+        #if DEBUG
+            let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: tabID
+            )
+            XCTAssertGreaterThan(canonicalSelectionRevision, staleSelectionRevision)
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(setterConnectionID),
+                canonicalSelectionRevision
+            )
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(staleConnectionID),
+                staleSelectionRevision
+            )
+        #endif
         XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
         XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: logicalPath))
