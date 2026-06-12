@@ -4121,9 +4121,31 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try await manager.loadFolder(at: root, for: workspace)
             let roots = await store.roots()
             let rootRecord = try XCTUnwrap(roots.first)
+
+            // This test drives the store directly. Remove the live FSEvents producer and settle any
+            // load-time publication before measuring one exact produced-versus-handled transition.
+            await store.stopWatchingRoot(id: rootRecord.id)
+            let baselineSettled = await waitForAsyncCondition {
+                let roots = await store.readSearchRootDiagnosticsSnapshot()
+                guard let root = roots.first(where: { $0.rootID == rootRecord.id }) else { return false }
+                let handled = manager.appliedIndexProjectionDiagnosticsSnapshot()
+                    .handledGenerationByRootID[rootRecord.id] ?? 0
+                return handled == root.producedAppliedIndexGeneration
+            }
+            XCTAssertTrue(baselineSettled)
+            let baselineRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let baselineRoot = try XCTUnwrap(baselineRoots.first { $0.rootID == rootRecord.id })
+            let baselineProjection = manager.appliedIndexProjectionDiagnosticsSnapshot()
+            let baselineGeneration = baselineRoot.producedAppliedIndexGeneration
+            let expectedGeneration = baselineGeneration &+ 1
+            XCTAssertEqual(
+                baselineProjection.handledGenerationByRootID[rootRecord.id] ?? 0,
+                baselineGeneration
+            )
+
             let projectionGate = AsyncGate()
-            manager.setAppliedIndexProjectionWillHandleHandlerForTesting { rootID, _ in
-                guard rootID == rootRecord.id else { return }
+            manager.setAppliedIndexProjectionWillHandleHandlerForTesting { rootID, generation in
+                guard rootID == rootRecord.id, generation == expectedGeneration else { return }
                 await projectionGate.markStartedAndWaitForRelease()
             }
 
@@ -4146,8 +4168,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let producedRoots = await store.readSearchRootDiagnosticsSnapshot()
             let producedRoot = try XCTUnwrap(producedRoots.first { $0.rootID == rootRecord.id })
             let blockedProjection = manager.appliedIndexProjectionDiagnosticsSnapshot()
-            XCTAssertEqual(producedRoot.producedAppliedIndexGeneration, 1)
-            XCTAssertEqual(blockedProjection.handledGenerationByRootID[rootRecord.id] ?? 0, 0)
+            XCTAssertEqual(producedRoot.producedAppliedIndexGeneration, expectedGeneration)
+            XCTAssertEqual(
+                blockedProjection.handledGenerationByRootID[rootRecord.id] ?? 0,
+                baselineGeneration
+            )
             XCTAssertEqual(
                 producedRoot.producedAppliedIndexGeneration - (blockedProjection.handledGenerationByRootID[rootRecord.id] ?? 0),
                 1
@@ -4156,12 +4181,13 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await projectionGate.release()
             await replayTask.value
             let projectionSettled = await waitForAsyncCondition {
-                manager.appliedIndexProjectionDiagnosticsSnapshot().handledGenerationByRootID[rootRecord.id] == 1
+                manager.appliedIndexProjectionDiagnosticsSnapshot().handledGenerationByRootID[rootRecord.id]
+                    == expectedGeneration
             }
             XCTAssertTrue(projectionSettled)
             let settledProjection = manager.appliedIndexProjectionDiagnosticsSnapshot()
-            XCTAssertEqual(settledProjection.handledEventCount, 1)
-            XCTAssertEqual(settledProjection.handledGenerationByRootID[rootRecord.id], 1)
+            XCTAssertEqual(settledProjection.handledEventCount, baselineProjection.handledEventCount + 1)
+            XCTAssertEqual(settledProjection.handledGenerationByRootID[rootRecord.id], expectedGeneration)
             manager.setAppliedIndexProjectionWillHandleHandlerForTesting(nil)
             await manager.unloadAllRootFolders()
         }
