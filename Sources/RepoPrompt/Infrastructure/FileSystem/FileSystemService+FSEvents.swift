@@ -1110,16 +1110,9 @@ extension FileSystemService {
                         let mdate = try? await getFileModificationDate(atRelativePath: relPath)
                         immediateModifications.append(.fileModified(relPath, mdate))
                     }
-                    // If it's a tracked folder, also scan it for changes. Known file
-                    // events periodically verify their parent as a safety net against
-                    // incomplete file-level FSEvents.
+                    // If it's a tracked folder, also scan it for changes.
                     if isDir {
                         trackFolder(relPath, eventId: eventId)
-                    } else {
-                        let parent = parentDirectory(of: relPath)
-                        if shouldScheduleSafetyNetScan(for: parent) {
-                            trackFolder(parent, eventId: eventId)
-                        }
                     }
                 } else {
                     let parent = parentDirectory(of: relPath)

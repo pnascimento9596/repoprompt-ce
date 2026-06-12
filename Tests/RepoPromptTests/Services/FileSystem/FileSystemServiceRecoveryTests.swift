@@ -34,6 +34,60 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
     }
 
     #if DEBUG
+        func testKnownNestedFileModificationPublishesWatermarkWithoutParentScan() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemKnownFileModification")
+            let folderURL = root.appendingPathComponent("Sources/Nested", isDirectory: true)
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+            let fileURL = folderURL.appendingPathComponent("Known.swift")
+            try "initial".write(to: fileURL, atomically: true, encoding: .utf8)
+
+            let service = try await FileSystemService(
+                path: root.path,
+                respectGitignore: false,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true,
+                enableHierarchicalIgnores: false,
+                testVisitedPaths: ["Sources", "Sources/Nested", "Sources/Nested/Known.swift"],
+                testVisitedItems: [
+                    "Sources": true,
+                    "Sources/Nested": true,
+                    "Sources/Nested/Known.swift": false
+                ],
+                isTestMode: true
+            )
+            let publications = LockedPublications()
+            let publisher = await service.publisherForChanges()
+            let cancellable = publisher.sink { publications.append($0) }
+            let flags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
+            )
+            let acceptedPayload = await service.acceptWatcherPayloadForTesting([
+                (absolutePath: fileURL.path, flags: flags, eventId: 7)
+            ], scheduleDrain: false)
+            let accepted = try XCTUnwrap(acceptedPayload)
+
+            _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: accepted)
+
+            let publication = try XCTUnwrap(publications.snapshot().last)
+            let processed = await service.getProcessedFolders()
+            let state = await service.watcherStateForTesting()
+            XCTAssertEqual(publication.source, .watcher)
+            XCTAssertEqual(publication.watcherAcceptedWatermark, accepted)
+            XCTAssertTrue(publication.deltas.contains { delta in
+                if case .fileModified("Sources/Nested/Known.swift", _) = delta {
+                    return true
+                }
+                return false
+            })
+            XCTAssertTrue(processed.isEmpty)
+            XCTAssertTrue(state.pendingScanTargets.isEmpty)
+            XCTAssertNil(state.lastScannedEventIdByFolder["Sources/Nested"])
+            XCTAssertNil(state.lastVerifiedAtByFolder["Sources/Nested"])
+            XCTAssertNil(state.fileEventCountSinceLastScan["Sources/Nested"])
+            withExtendedLifetime(cancellable) {}
+        }
+
         func testFolderScanCapSchedulesQuietFollowUpBatchesThroughAcceptedWatermark() async throws {
             let root = try temporaryRoots.makeRoot(suiteName: "FileSystemFolderScanCap")
             let folders = ["A", "B", "C"]
