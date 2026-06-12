@@ -67,7 +67,7 @@ Improve MCP throughput across same-connection bursts, parallel agent threads, lo
 - [x] Phase 2 / WI-9 — bounded Git concurrency and command consolidation
 - [x] Phase 2 / WI-10 — classified, resource-keyed ordinary-tool admission
 - [x] Phase 3 / WI-11 — immutable per-root catalog shards and scope composition
-- [ ] Phase 3 / WI-12 — canonical delta application to shards
+- [x] Phase 3 / WI-12 — canonical delta application to shards
 - [ ] Phase 3 / WI-13 — per-root path indexes with global top-k merge
 - [ ] Phase 3 / WI-14 — shared physical-root service across windows
 - [ ] Phase 3 / WI-15 — (conditional) decoupled completion publication with ordered ownership
@@ -272,6 +272,8 @@ Immutable `RootCatalogShard` keyed by `(canonical/config identity, rootID, lifet
 ### Work Item 12 — Canonical delta application to shards
 
 Consume `WorkspaceAppliedIndexBatchEvent` (exact upserts/removals/modifications, generation, unload, `requiresFullResync` — `WorkspaceFileContextModels.swift:374-422`) against a private shard builder: require contiguous generations per root lifetime, fall back to root-snapshot rebuild on any gap, unload, overflow, dirty recovery, or full-resync signal. Choose patch-versus-rebuild by delta-size thresholds measured in WI-3. Raw FSEvents never patch search state directly. **Hard dependency on WI-1** — deltas are not authoritative until the startup and failed-scan gaps are fixed.
+
+**Landed threshold:** patch only one logical catalog record. WI-3 establishes rebuild work counts but no measured multi-record crossover, so larger batches rebuild authoritatively rather than relying on an invented threshold.
 
 ### Work Item 13 — Per-root path indexes with global top-k merge
 

@@ -397,6 +397,7 @@ import RepoPromptShared
                 ],
                 "root_catalog_shards": [
                     "live_generation_cap_per_root": snapshot.rootCatalogShards.liveGenerationCapPerRoot,
+                    "max_patch_logical_mutation_count": snapshot.rootCatalogShards.maxPatchLogicalMutationCount,
                     "published_shard_count": snapshot.rootCatalogShards.publishedShardCount,
                     "total_build_count": snapshot.rootCatalogShards.totalBuildCount,
                     "total_backstop_count": snapshot.rootCatalogShards.totalBackstopCount,
@@ -410,6 +411,11 @@ import RepoPromptShared
                             "live_topology_generations": root.liveTopologyGenerations,
                             "retained_topology_generations": root.retainedTopologyGenerations,
                             "build_count": root.buildCount,
+                            "patch_count": root.patchCount,
+                            "authoritative_rebuild_count": root.authoritativeRebuildCount,
+                            "fallback_reason_counts": root.fallbackReasonCounts,
+                            "last_applied_index_generation": root.lastAppliedIndexGeneration.map { $0 as Any } ?? NSNull(),
+                            "delta_state_dirty": root.deltaStateDirty,
                             "backstop_count": root.backstopCount,
                             "max_live_generation_count": root.maxLiveGenerationCount
                         ]
