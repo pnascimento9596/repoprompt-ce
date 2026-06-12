@@ -234,6 +234,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('for arch in arm64 x86_64; do', source)
         self.assertIn('REPOPROMPT_SWIFTPM_SCRATCH_PATH="$scratch"', source)
         self.assertIn('patch_keyboard_shortcuts_resource_lookup.sh', source)
+        self.assertIn('patch_keyboard_shortcuts_preview_macros.sh', source)
         self.assertIn('--scratch-path "$scratch"', source)
         self.assertIn('--arch "$arch"', source)
         self.assertIn('--product RepoPrompt', source)
@@ -242,6 +243,10 @@ APP_SIGN_ARGS=(){app_signing_body}
         architecture_loop = source.split('for arch in arm64 x86_64; do', 1)[1]
         self.assertLess(source.index('run rm -rf "$SCRATCH_ROOT"'), source.index('for arch in arm64 x86_64; do'))
         self.assertLess(architecture_loop.index('"$KEYBOARD_SHORTCUTS_PATCH_HELPER"'), architecture_loop.index("swift build"))
+        self.assertLess(
+            architecture_loop.index('"$KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER"'),
+            architecture_loop.index("swift build"),
+        )
         self.assertEqual(source.count('"$LIPO" -create'), 2)
         self.assertNotIn("codesign", source)
 
@@ -262,6 +267,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         tools = temp_dir / "tools"
         tools.mkdir()
         patch_log = temp_dir / "patch.log"
+        preview_patch_log = temp_dir / "preview-patch.log"
         wrapper = tools / "without-tokens"
         wrapper.write_text(
             """#!/usr/bin/env bash
@@ -293,6 +299,11 @@ if (( show )); then printf '%s\\n' "$bin"; fi
             "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$REPOPROMPT_SWIFTPM_SCRATCH_PATH\" >> \"$PATCH_LOG\"\n",
             encoding="utf-8",
         )
+        preview_patch = tools / "patch-keyboard-shortcuts-preview-macros"
+        preview_patch.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$REPOPROMPT_SWIFTPM_SCRATCH_PATH\" >> \"$PREVIEW_PATCH_LOG\"\n",
+            encoding="utf-8",
+        )
         comparator = tools / "compare-resources"
         comparator.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n", encoding="utf-8")
         lipo = tools / "lipo"
@@ -313,7 +324,7 @@ printf 'arm64 x86_64\\n' > "$output"
         )
         ditto = tools / "ditto"
         ditto.write_text("#!/usr/bin/env bash\nset -euo pipefail\ncp -R \"$1\" \"$2\"\n", encoding="utf-8")
-        for tool in (wrapper, patch, comparator, lipo, ditto):
+        for tool in (wrapper, patch, preview_patch, comparator, lipo, ditto):
             tool.chmod(0o755)
 
         env = os.environ.copy()
@@ -324,8 +335,10 @@ printf 'arm64 x86_64\\n' > "$output"
                 "REPOPROMPT_PUBLIC_SWIFTPM_SCRATCH_ROOT": str(scratch),
                 "REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS": str(wrapper),
                 "REPOPROMPT_KEYBOARD_SHORTCUTS_PATCH_HELPER": str(patch),
+                "REPOPROMPT_KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER": str(preview_patch),
                 "REPOPROMPT_SWIFTPM_RESOURCE_COMPARATOR": str(comparator),
                 "PATCH_LOG": str(patch_log),
+                "PREVIEW_PATCH_LOG": str(preview_patch_log),
                 "LIPO": str(lipo),
             }
         )
@@ -342,6 +355,10 @@ printf 'arm64 x86_64\\n' > "$output"
         self.assertTrue((output / "Current.bundle" / "value.txt").is_file())
         self.assertEqual(
             patch_log.read_text(encoding="utf-8").splitlines(),
+            [str(scratch / "arm64"), str(scratch / "x86_64")],
+        )
+        self.assertEqual(
+            preview_patch_log.read_text(encoding="utf-8").splitlines(),
             [str(scratch / "arm64"), str(scratch / "x86_64")],
         )
 
