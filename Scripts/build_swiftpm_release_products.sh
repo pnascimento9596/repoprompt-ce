@@ -10,6 +10,7 @@ SCRATCH_ROOT="${REPOPROMPT_PUBLIC_SWIFTPM_SCRATCH_ROOT:-$DEFAULT_SCRATCH_ROOT}"
 SCRATCH_SENTINEL_NAME=".repoprompt-public-swiftpm-scratch"
 LIPO="${LIPO:-lipo}"
 KEYBOARD_SHORTCUTS_PATCH_HELPER="${REPOPROMPT_KEYBOARD_SHORTCUTS_PATCH_HELPER:-$SCRIPT_DIR/patch_keyboard_shortcuts_resource_lookup.sh}"
+KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER="${REPOPROMPT_KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER:-$SCRIPT_DIR/patch_keyboard_shortcuts_preview_macros.sh}"
 RESOURCE_COMPARATOR="${REPOPROMPT_SWIFTPM_RESOURCE_COMPARATOR:-$SCRIPT_DIR/compare_swiftpm_release_resources.py}"
 CLEAN_PUBLIC_SWIFTPM_BUILDS="${REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS:-1}"
 
@@ -54,6 +55,7 @@ require_exact_arch() {
 
 [[ -x "$RUN_WITHOUT_GITHUB_TOKENS" ]] || fail "missing token-scrubbing SwiftPM wrapper: $RUN_WITHOUT_GITHUB_TOKENS"
 [[ -x "$KEYBOARD_SHORTCUTS_PATCH_HELPER" ]] || fail "missing KeyboardShortcuts resource patch helper: $KEYBOARD_SHORTCUTS_PATCH_HELPER"
+[[ -x "$KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER" ]] || fail "missing KeyboardShortcuts preview macros patch helper: $KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER"
 [[ -x "$RESOURCE_COMPARATOR" ]] || fail "missing resource comparator: $RESOURCE_COMPARATOR"
 command -v "$LIPO" >/dev/null 2>&1 || fail "missing lipo command: $LIPO"
 command -v ditto >/dev/null 2>&1 || fail "missing ditto"
@@ -91,6 +93,10 @@ for arch in arm64 x86_64; do
         REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS="$RUN_WITHOUT_GITHUB_TOKENS" \
         REPOPROMPT_SWIFTPM_SCRATCH_PATH="$scratch" \
         "$KEYBOARD_SHORTCUTS_PATCH_HELPER" "$ROOT_DIR"
+    run env \
+        REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS="$RUN_WITHOUT_GITHUB_TOKENS" \
+        REPOPROMPT_SWIFTPM_SCRATCH_PATH="$scratch" \
+        "$KEYBOARD_SHORTCUTS_PREVIEW_MACROS_PATCH_HELPER" "$ROOT_DIR"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build \
         "${SWIFT_BUILD_ARGS[@]}" \
         --arch "$arch" \

@@ -1,0 +1,20 @@
+diff --git a/Sources/KeyboardShortcuts/Recorder.swift b/Sources/KeyboardShortcuts/Recorder.swift
+index 8575db0..0000000 100644
+--- a/Sources/KeyboardShortcuts/Recorder.swift
++++ b/Sources/KeyboardShortcuts/Recorder.swift
+@@ -172,14 +172,1 @@
+-#Preview {
+-	KeyboardShortcuts.Recorder("record_shortcut", name: .init("xcodePreview"))
+-		.environment(\.locale, .init(identifier: "en"))
+-}
+-
+-#Preview {
+-	KeyboardShortcuts.Recorder("record_shortcut", name: .init("xcodePreview"))
+-		.environment(\.locale, .init(identifier: "zh-Hans"))
+-}
+-
+-#Preview {
+-	KeyboardShortcuts.Recorder("record_shortcut", name: .init("xcodePreview"))
+-		.environment(\.locale, .init(identifier: "ru"))
+-}
++// RepoPromptKeyboardShortcutsPreviewMacrosV1: stripped #Preview blocks (CLT lacks PreviewsMacros plugin)

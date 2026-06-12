@@ -251,6 +251,9 @@ else
     phase "Patching KeyboardShortcuts resource lookup"
     run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
 
+    phase "Patching KeyboardShortcuts preview macros"
+    run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_preview_macros.sh" "$ROOT_DIR"
+
     phase "Building $APP_NAME ($CONF, host-native)"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
