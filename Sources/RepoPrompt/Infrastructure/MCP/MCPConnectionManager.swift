@@ -149,6 +149,7 @@ protocol MCPServerConnection: Actor {
     func isViableForRetention() -> Bool
     func secondsSinceLastActivity() async -> TimeInterval
     func transportIngressSnapshot() async -> MCPTransportIngressSnapshot?
+    func waitUntilResponseDeliveryDrained() async -> Bool
     /// Whether this is a legacy filesystem-backed connection (deprecated)
     nonisolated var isFilesystemBacked: Bool { get }
     /// Legacy: connection folder URL for filesystem connections
@@ -169,6 +170,12 @@ protocol MCPServerConnection: Actor {
     ///   - stage: Current stage name
     ///   - message: Human-readable message
     func sendProgress(tool: String, kind: RepoPromptProgressKind, stage: String, message: String) async
+}
+
+extension MCPServerConnection {
+    func waitUntilResponseDeliveryDrained() async -> Bool {
+        true
+    }
 }
 
 // MARK: - Dashboard Models
@@ -12411,6 +12418,11 @@ actor ServerNetworkManager {
     func hasInFlightCalls(for connectionID: UUID) async -> Bool {
         guard let limiters = callLimiters[connectionID] else { return false }
         return await limiters.hasInFlightCalls()
+    }
+
+    func waitUntilResponseDeliveryDrained(for connectionID: UUID) async -> Bool {
+        guard let connection = connections[connectionID] else { return false }
+        return await connection.waitUntilResponseDeliveryDrained()
     }
 
     #if DEBUG

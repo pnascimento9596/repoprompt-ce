@@ -2585,6 +2585,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         let finalizedConnections = await ContextBuilderChildConnectionFinalizer.finalize(
             connectionIDs: agentConnections,
+            awaitResponseDeliveryDrain: { cid in
+                await ServerNetworkManager.shared.waitUntilResponseDeliveryDrained(
+                    for: cid
+                )
+            },
             commitContext: { [weak self, weak record] cid in
                 guard let self, let record,
                       activeAgentRuns.contains(runID),

@@ -152,6 +152,126 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
     }
 }
 
+/// Tracks request/response publication at the socket boundary so lifecycle cleanup can
+/// wait for completed writes rather than closing after a handler merely returns.
+final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
+    struct Snapshot {
+        let pendingRequestCount: Int
+        let waiterCount: Int
+        let isTerminal: Bool
+    }
+
+    private let lock = NSLock()
+    private var pendingRequestIDs: Set<JSONRPCBridgeID> = []
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
+    private var isTerminal = false
+
+    func recordAcceptedClientFrame(_ frame: Data) {
+        let requestIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame,
+            direction: .clientToServer
+        ).compactMap { message -> JSONRPCBridgeID? in
+            guard message.kind == .request,
+                  let id = message.id,
+                  id != .null
+            else {
+                return nil
+            }
+            return id
+        }
+        guard !requestIDs.isEmpty else { return }
+
+        lock.lock()
+        if !isTerminal {
+            pendingRequestIDs.formUnion(requestIDs)
+        }
+        lock.unlock()
+    }
+
+    func recordDeliveredServerFrame(_ frame: Data) {
+        let responseIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame,
+            direction: .serverToClient
+        ).compactMap { message -> JSONRPCBridgeID? in
+            guard message.kind == .response,
+                  let id = message.id,
+                  id != .null
+            else {
+                return nil
+            }
+            return id
+        }
+        guard !responseIDs.isEmpty else { return }
+
+        let continuations: [CheckedContinuation<Bool, Never>]
+        lock.lock()
+        pendingRequestIDs.subtract(responseIDs)
+        if !isTerminal, pendingRequestIDs.isEmpty {
+            continuations = waiters
+            waiters.removeAll()
+        } else {
+            continuations = []
+        }
+        lock.unlock()
+        continuations.forEach { $0.resume(returning: true) }
+    }
+
+    func waitUntilDrained() async -> Bool {
+        await withCheckedContinuation { continuation in
+            let immediateResult: Bool?
+            lock.lock()
+            if isTerminal {
+                immediateResult = false
+            } else if pendingRequestIDs.isEmpty {
+                immediateResult = true
+            } else {
+                waiters.append(continuation)
+                immediateResult = nil
+            }
+            lock.unlock()
+
+            if let immediateResult {
+                continuation.resume(returning: immediateResult)
+            }
+        }
+    }
+
+    func reset() {
+        let continuations: [CheckedContinuation<Bool, Never>]
+        lock.lock()
+        continuations = waiters
+        waiters.removeAll()
+        pendingRequestIDs.removeAll()
+        isTerminal = false
+        lock.unlock()
+        continuations.forEach { $0.resume(returning: false) }
+    }
+
+    func close() {
+        let continuations: [CheckedContinuation<Bool, Never>]
+        lock.lock()
+        guard !isTerminal else {
+            lock.unlock()
+            return
+        }
+        isTerminal = true
+        continuations = waiters
+        waiters.removeAll()
+        lock.unlock()
+        continuations.forEach { $0.resume(returning: false) }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            pendingRequestCount: pendingRequestIDs.count,
+            waiterCount: waiters.count,
+            isTerminal: isTerminal
+        )
+    }
+}
+
 /// A Transport implementation using UNIX domain sockets for local MCP communication.
 ///
 /// This transport connects to a UNIX socket created by the CLI within a connection folder.
@@ -258,6 +378,7 @@ public actor UnixSocketMCPTransport: Transport {
     private var fdGeneration: UInt64 = 0
 
     private var lastActivityTime: Date?
+    private let responseDeliveryGate = MCPTransportResponseDeliveryGate()
 
     /// Connection timeout when waiting for socket to appear and accept connections
     private let connectionTimeout: TimeInterval = 30.0
@@ -495,6 +616,7 @@ public actor UnixSocketMCPTransport: Transport {
             )
             throw error
         }
+        responseDeliveryGate.recordDeliveredServerFrame(framed)
         lastActivityTime = Date()
         #if DEBUG
             if recordedResponses.isEmpty {
@@ -581,9 +703,14 @@ public actor UnixSocketMCPTransport: Transport {
         return Date().timeIntervalSince(lastActivityTime)
     }
 
+    func waitUntilResponseDeliveryDrained() async -> Bool {
+        await responseDeliveryGate.waitUntilDrained()
+    }
+
     // MARK: - Private Implementation
 
     private func prepareForConnectionAttempt() {
+        responseDeliveryGate.reset()
         isStopping = false
         if streamFinished || closeSignaled {
             inboundChannel = InboundChannel(capacity: receiveBufferCapacity)
@@ -678,6 +805,7 @@ public actor UnixSocketMCPTransport: Transport {
     /// avoid a stale callback closing a reused descriptor number.
     private func tearDownSocket(error proposedError: Swift.Error?) {
         guard !streamFinished else { return }
+        responseDeliveryGate.close()
         #if DEBUG
             if let timelineConnectionID {
                 MCPRequestTimelineRegistry.shared.removeConnection(
@@ -999,6 +1127,7 @@ public actor UnixSocketMCPTransport: Transport {
             logger: log,
             onFrame: { [weak self] frame in
                 guard let self else { return }
+                responseDeliveryGate.recordAcceptedClientFrame(frame)
                 switch inboundChannel.gate.offer(frame, to: inboundChannel.continuation) {
                 case .accepted:
                     #if DEBUG
