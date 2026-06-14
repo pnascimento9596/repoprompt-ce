@@ -148,6 +148,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(indicator.markerStyle, .ring)
         XCTAssertTrue(indicator.isAvailable)
         XCTAssertEqual(indicator.capsuleText, "WT feature-x")
+        XCTAssertTrue(indicator.allowsCompactCapsule)
+        XCTAssertNil(indicator.missingWorktreePath)
     }
 
     func testIndicatorMakeFallsBackToResolvedIdentityForMissingOrInvalidFields() {
@@ -195,7 +197,11 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
     }
 
     func testIndicatorUnavailableSurfacesStaleStateInTooltipAndAccessibility() {
-        let summary = makeSummary(visualLabel: "feature-x", visualColorHex: "#112233")
+        let summary = makeSummary(
+            visualLabel: "feature-x",
+            visualColorHex: "#112233",
+            worktreeRootPath: "  /tmp/Repo-missing  \n"
+        )
         let identity = WorktreeVisualIdentity(colorHex: "#112233")
 
         let indicator = AgentWorktreeIndicator.make(
@@ -206,16 +212,30 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
 
         XCTAssertFalse(indicator.isAvailable)
         XCTAssertEqual(indicator.capsuleText, "WT feature-x")
+        XCTAssertFalse(indicator.allowsCompactCapsule)
+        XCTAssertEqual(indicator.missingWorktreePath, "/tmp/Repo-missing")
         XCTAssertTrue(indicator.tooltipText.contains("unavailable"))
         XCTAssertTrue(indicator.tooltipText.contains("feature-x"))
         XCTAssertTrue(indicator.accessibilityText.contains("unavailable"))
+    }
+
+    func testUnavailableIndicatorOmitsBlankRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  \n\t  "),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#112233"),
+            isAvailable: false
+        )
+
+        XCTAssertFalse(indicator.allowsCompactCapsule)
+        XCTAssertNil(indicator.missingWorktreePath)
     }
 
     private func makeSummary(
         visualLabel: String? = "feature-x",
         visualColorHex: String? = "#123456",
         worktreeName: String? = "wt-name",
-        branch: String? = "main"
+        branch: String? = "main",
+        worktreeRootPath: String = "/tmp/Repo-wt"
     ) -> AgentSessionWorktreeBindingSummary {
         AgentSessionWorktreeBindingSummary(
             id: "binding-1",
@@ -224,7 +244,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             logicalRootPath: "/tmp/Repo",
             logicalRootName: "Repo",
             worktreeID: "wt_0123456789abcdef",
-            worktreeRootPath: "/tmp/Repo-wt",
+            worktreeRootPath: worktreeRootPath,
             worktreeName: worktreeName,
             branch: branch,
             visualLabel: visualLabel,

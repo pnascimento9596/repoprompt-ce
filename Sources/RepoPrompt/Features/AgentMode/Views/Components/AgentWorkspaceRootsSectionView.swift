@@ -29,12 +29,24 @@ struct AgentWorkspaceRootsSectionView: View {
 
     @State private var addFolderError: String?
     @State private var hoveredRootID: UUID?
+    @FocusState private var focusedRootAction: RootActionFocus?
     @State private var showModelsPopover = false
     @State private var showPermissionsPopover = false
     @State private var isAddFolderHovered = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
+    }
+
+    private struct RootActionFocus: Hashable {
+        enum Action: Hashable {
+            case moveUp
+            case moveDown
+            case remove
+        }
+
+        let rowID: UUID
+        let action: Action
     }
 
     private static let estimatedFolderRowHeight: CGFloat = 28
@@ -377,22 +389,22 @@ struct AgentWorkspaceRootsSectionView: View {
     private func rootRow(_ row: AgentWorkspaceRootRow) -> some View {
         let hasMultipleRoots = roots.count > 1
         let isHovered = hoveredRootID == row.id
+        let hasFocusedAction = focusedRootAction?.rowID == row.id
         let hasContextLine = rowHasContextLine(row)
 
-        return ZStack(alignment: .trailing) {
-            VStack(alignment: .leading, spacing: rootLineSpacing) {
-                rootIdentityLine(row)
+        return VStack(alignment: .leading, spacing: rootLineSpacing) {
+            rootIdentityLine(row)
 
-                if hasContextLine {
-                    rootContextLine(row)
-                }
+            if hasContextLine {
+                rootContextLine(row)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            if isHovered {
-                rootActionsOverlay(row, hasMultipleRoots: hasMultipleRoots)
-                    .transition(.opacity)
-            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .trailing) {
+            rootActionsOverlay(row, hasMultipleRoots: hasMultipleRoots)
+                .opacity(isHovered || hasFocusedAction ? 1 : 0)
+                .allowsHitTesting(isHovered)
+                .accessibilityHidden(false)
         }
         .padding(.horizontal, rootRowHorizontalPadding)
         .padding(.vertical, rootRowVerticalPadding)
@@ -481,6 +493,7 @@ struct AgentWorkspaceRootsSectionView: View {
                 ) {
                     rootsStore.moveRootUp(rowID: row.id)
                 }
+                .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveUp))
                 .disabled(!row.canMoveUp)
                 .opacity(row.canMoveUp ? 1 : 0.3)
 
@@ -493,6 +506,7 @@ struct AgentWorkspaceRootsSectionView: View {
                 ) {
                     rootsStore.moveRootDown(rowID: row.id)
                 }
+                .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveDown))
                 .disabled(!row.canMoveDown)
                 .opacity(row.canMoveDown ? 1 : 0.3)
             }
@@ -506,6 +520,7 @@ struct AgentWorkspaceRootsSectionView: View {
             ) {
                 rootsStore.removeRoot(rowID: row.id)
             }
+            .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .remove))
         }
         .padding(.horizontal, fontPreset.scaledClamped(3, max: 5))
         .padding(.vertical, fontPreset.scaledClamped(2, max: 3))
@@ -518,6 +533,12 @@ struct AgentWorkspaceRootsSectionView: View {
 
     @ViewBuilder
     private func rootRowContextMenu(_ row: AgentWorkspaceRootRow, hasMultipleRoots: Bool) -> some View {
+        if let missingWorktreePath = row.worktree?.missingWorktreePath {
+            Button("Copy Missing Worktree Path") {
+                copyToPasteboard(missingWorktreePath)
+            }
+            Divider()
+        }
         Button("Copy Path") {
             copyToPasteboard(row.fullPath)
         }
@@ -559,11 +580,18 @@ struct AgentWorkspaceRootsSectionView: View {
     /// worktree in the active Agent session. Available worktrees keep their
     /// configured identity color; unavailable worktrees preserve the `WT label`
     /// text and add warning treatment without changing the saved identity color.
+    @ViewBuilder
     private func worktreeCapsule(_ worktree: AgentWorktreeIndicator) -> some View {
         let tint = worktree.isAvailable ? worktree.color : Color.orange
-        return ViewThatFits(in: .horizontal) {
-            worktreeCapsuleBody(worktree, tint: tint, isCompact: false)
-            worktreeCapsuleBody(worktree, tint: tint, isCompact: true)
+        Group {
+            if worktree.allowsCompactCapsule {
+                ViewThatFits(in: .horizontal) {
+                    worktreeCapsuleBody(worktree, tint: tint, isCompact: false)
+                    worktreeCapsuleBody(worktree, tint: tint, isCompact: true)
+                }
+            } else {
+                worktreeCapsuleBody(worktree, tint: tint, isCompact: false)
+            }
         }
         .hoverTooltip(worktree.tooltipText, .top)
         .accessibilityLabel(worktree.accessibilityText)
@@ -739,6 +767,7 @@ private struct RootIconButton: View {
                 )
         }
         .buttonStyle(PlainButtonStyle())
+        .accessibilityLabel(tooltip)
         .onHover { isHovered = $0 }
         .hoverTooltip(tooltip, .top)
     }
