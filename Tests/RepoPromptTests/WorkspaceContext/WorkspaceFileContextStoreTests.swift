@@ -284,7 +284,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             createTask.cancel()
 
-            let settledBeforeRelease = await waitForAsyncCondition(maxYields: 10000) {
+            let settledBeforeRelease = await waitForAsyncCondition(timeout: .seconds(2)) {
                 await settledSignal.isMarked()
             }
             XCTAssertTrue(settledBeforeRelease)
@@ -295,7 +295,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await mutationGate.release()
             let observedCancellation = await resultTask.value
             XCTAssertTrue(observedCancellation)
-            let reconciled = await waitForAsyncCondition(maxYields: 10000) {
+            let reconciled = await waitForAsyncCondition(timeout: .seconds(5)) {
                 guard FileManager.default.fileExists(atPath: root.appendingPathComponent("CreatedAfterCancellation.swift").path) else {
                     return false
                 }
@@ -357,7 +357,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             }
 
             overwriteTask.cancel()
-            let settledBeforeRelease = await waitForAsyncCondition(maxYields: 10000) {
+            let settledBeforeRelease = await waitForAsyncCondition(timeout: .seconds(2)) {
                 await settledSignal.isMarked()
             }
             XCTAssertTrue(settledBeforeRelease)
@@ -368,7 +368,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await mutationGate.release()
             let observedCancellation = await resultTask.value
             XCTAssertTrue(observedCancellation)
-            let reconciled = await waitForAsyncCondition(maxYields: 10000) {
+            let reconciled = await waitForAsyncCondition(timeout: .seconds(5)) {
                 guard (try? String(contentsOf: fileURL, encoding: .utf8)) == "new" else { return false }
                 return await (try? store.readContent(
                     rootID: record.id,
@@ -395,6 +395,15 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             try await store.startWatchingRoot(id: record.id)
             let loadedService = await store.fileSystemServiceForTesting(rootID: record.id)
             let service = try XCTUnwrap(loadedService)
+            await service.setMoveItemToTrashIOForTesting { url in
+                try FileManager.default.removeItem(at: url)
+            }
+            let rootID = record.id
+            addTeardownBlock {
+                await service.setMutationIOWillBeginHandlerForTesting(nil)
+                await service.setMoveItemToTrashIOForTesting(nil)
+                await store.stopWatchingRoot(id: rootID)
+            }
 
             func exercise(
                 operation: FileSystemUncancellableMutation,
@@ -427,21 +436,21 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 }
 
                 mutationTask.cancel()
-                let settledBeforeRelease = await waitForAsyncCondition(maxYields: 10000) {
+                let settledBeforeRelease = await waitForAsyncCondition(timeout: .seconds(2)) {
                     await settledSignal.isMarked()
                 }
-                XCTAssertTrue(settledBeforeRelease)
-                XCTAssertTrue(beforeRelease())
+                XCTAssertTrue(settledBeforeRelease, "\(operation) cancellation did not settle before I/O release")
+                XCTAssertTrue(beforeRelease(), "\(operation) performed I/O before the test gate was released")
                 let waiterCountAfterCancellation = await service.pendingMutationWaiterCountForTesting()
-                XCTAssertEqual(waiterCountAfterCancellation, 0)
+                XCTAssertEqual(waiterCountAfterCancellation, 0, "\(operation) retained a canceled mutation waiter")
 
                 await gate.release()
                 let observedCancellation = await resultTask.value
-                XCTAssertTrue(observedCancellation)
-                let didReconcile = await waitForAsyncCondition(maxYields: 10000, reconciled)
-                XCTAssertTrue(didReconcile)
+                XCTAssertTrue(observedCancellation, "\(operation) did not report request cancellation")
+                let didReconcile = await waitForAsyncCondition(timeout: .seconds(5), reconciled)
+                XCTAssertTrue(didReconcile, "\(operation) did not reconcile after uncancellable I/O completed")
                 let finalWaiterCount = await service.pendingMutationWaiterCountForTesting()
-                XCTAssertEqual(finalWaiterCount, 0)
+                XCTAssertEqual(finalWaiterCount, 0, "\(operation) retained a mutation waiter after reconciliation")
             }
 
             try await exercise(
@@ -498,9 +507,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                     return await store.file(rootID: record.id, relativePath: "Trash.swift") == nil
                 }
             )
-
-            await service.setMutationIOWillBeginHandlerForTesting(nil)
-            await store.stopWatchingRoot(id: record.id)
         }
 
         func testStopWatchingRootDrainsTrackedPublisherIngress() async throws {
@@ -2409,7 +2415,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let roots = await store.roots()
             let retainedRootIDs = await store.retainedReadSearchDiagnosticRootIDsForTesting()
             let remainingFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
-            let serviceReleased = await waitForAsyncCondition(maxYields: 10000) {
+            let serviceReleased = await waitForAsyncCondition(timeout: .seconds(2)) {
                 weakService.value == nil
             }
 
@@ -5997,10 +6003,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
 
         private func waitForAsyncCondition(
-            maxYields: Int = 1000,
+            timeout: Duration = .seconds(2),
             _ condition: () async -> Bool
         ) async -> Bool {
-            for _ in 0 ..< maxYields {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while clock.now < deadline {
                 if await condition() { return true }
                 await Task.yield()
             }

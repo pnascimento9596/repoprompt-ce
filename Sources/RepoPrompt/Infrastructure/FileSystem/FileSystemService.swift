@@ -137,6 +137,9 @@ actor FileSystemService {
         /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
 
+        /// Test-only replacement for the real Finder Trash operation.
+        var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
+
         enum WatcherActivationFailurePoint {
             case streamCreation
             case streamStart
@@ -350,6 +353,10 @@ actor FileSystemService {
             _ handler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
         ) {
             mutationIOWillBeginHandler = handler
+        }
+
+        func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
+            moveItemToTrashIOForTesting = operation
         }
 
         func pendingMutationWaiterCountForTesting() -> Int {
