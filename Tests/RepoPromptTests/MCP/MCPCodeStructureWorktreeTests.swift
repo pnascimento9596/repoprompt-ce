@@ -222,6 +222,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
                 path: logicalRootURL.path
             )
             let worktreeRoot = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
+            let loadedWorktreeService = await store.fileSystemServiceForTesting(rootID: worktreeRoot.id)
+            let worktreeService = try XCTUnwrap(loadedWorktreeService)
+            await worktreeService.stopWatchingForChanges()
             let projection = makeProjection(logicalRoot: logicalRoot, physicalRoot: worktreeRoot, worktreeID: "active")
             let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
             let file = try await fileRecord(at: fileURL, store: store, rootScope: projection.lookupRootScope)
@@ -544,6 +547,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             in: window,
             path: root.path
         )
+        addTeardownBlock { @MainActor in
+            await window.workspaceFilesViewModel.cancelAllScans()
+        }
         return window
     }
 

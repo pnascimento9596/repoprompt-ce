@@ -4779,7 +4779,9 @@ actor WorkspaceFileContextStore {
         }
 
         do {
-            let requests = try await codemapScanRequests(for: currentFiles)
+            let loadedRequests = try await codemapScanRequests(for: currentFiles)
+            let stillMissingFileIDs = currentFileIDs.filter { codemapSnapshotsByFileID[$0] == nil }
+            let requests = loadedRequests.filter { stillMissingFileIDs.contains($0.fileID) }
             guard !requests.isEmpty else {
                 pendingCodemapRepairFileIDs.subtract(currentFileIDs)
                 return
@@ -6979,7 +6981,7 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) {
+    private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) async {
         pendingCodemapRepairFileIDs.subtract(results.map(\.fileID))
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         for result in results {
@@ -7014,6 +7016,7 @@ actor WorkspaceFileContextStore {
                 snapshots: snapshots.sorted { $0.relativePath < $1.relativePath }
             ))
         }
+        await codeScanActor.acknowledgeScanResults(fileIDs: results.map(\.fileID))
     }
 
     private func removeAllCodemapSnapshots() {

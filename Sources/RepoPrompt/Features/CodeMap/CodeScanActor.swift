@@ -189,6 +189,8 @@ actor CodeScanActor {
     // -------------------------------------
     private var resultContinuations = [UUID: AsyncStream<[ScanResult]>.Continuation]()
     private var resultBatchBuffer = [ScanResult]()
+    /// File IDs yielded to the store but not yet acknowledged as installed or rejected.
+    private var resultDeliveryPendingFileIDs = Set<UUID>()
     private var resultsCoalescingTask: Task<Void, Never>?
     private let resultsCoalescingDelay: UInt64 = 2_000_000_000 // e.g. 2 seconds
     private var lastResultsScheduleCall = DispatchTime.now()
@@ -1059,7 +1061,10 @@ actor CodeScanActor {
     ) async -> SelfHealingScanRequestResult {
         let requestedFileIDs = Set(requests.map(\.fileID))
         let alreadyScheduledFileIDs = Set(requestedFileIDs.filter { fileID in
-            if hasQueuedOrActiveScan(for: fileID) || resultBatchBuffer.contains(where: { $0.fileID == fileID }) {
+            if hasQueuedOrActiveScan(for: fileID)
+                || resultBatchBuffer.contains(where: { $0.fileID == fileID })
+                || resultDeliveryPendingFileIDs.contains(fileID)
+            {
                 return true
             }
             guard acceptedAPIFileIDs.contains(fileID),
@@ -1388,12 +1393,17 @@ actor CodeScanActor {
 
         let batch = resultBatchBuffer
         resultBatchBuffer.removeAll()
+        resultDeliveryPendingFileIDs.formUnion(batch.map(\.fileID))
         CodeMapPerfRuntime.sharedPipelineStats?.recordResultBatch(size: batch.count)
 
         for continuation in resultContinuations.values {
             continuation.yield(batch)
         }
         resultsCoalescingTask = nil
+    }
+
+    func acknowledgeScanResults(fileIDs: some Sequence<UUID>) {
+        resultDeliveryPendingFileIDs.subtract(fileIDs)
     }
 
     // -------------------------------------------------------
@@ -1497,6 +1507,7 @@ actor CodeScanActor {
                 }
                 acceptedAPIFileIDs.remove(fileID)
                 latestFileModDates.removeValue(forKey: fileID)
+                resultDeliveryPendingFileIDs.remove(fileID)
             }
         }
     }
