@@ -16,7 +16,8 @@ struct ExecutableFileIdentity: Equatable {
             throw ExecutableFileIdentityError.pathMustBeAbsolute(rawPath)
         }
 
-        let canonicalPath = canonicalizePath(rawPath)
+        let canonicalPath = FileSystemService.realpathString(rawPath)
+            ?? (rawPath as NSString).standardizingPath
         var info = stat()
         guard stat(canonicalPath, &info) == 0 else {
             throw ExecutableFileIdentityError.unavailable(canonicalPath)
@@ -38,19 +39,6 @@ struct ExecutableFileIdentity: Equatable {
             statusChangeSeconds: Int64(info.st_ctimespec.tv_sec),
             statusChangeNanoseconds: Int64(info.st_ctimespec.tv_nsec)
         )
-    }
-
-    private static func canonicalizePath(_ rawPath: String) -> String {
-        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
-        let didResolve = rawPath.withCString { rawPathPointer in
-            buffer.withUnsafeMutableBufferPointer { bufferPointer in
-                realpath(rawPathPointer, bufferPointer.baseAddress) != nil
-            }
-        }
-        if didResolve {
-            return String(cString: buffer)
-        }
-        return (rawPath as NSString).standardizingPath
     }
 
     static func captureForTrustedPathLaunch(atPath path: String) throws -> ExecutableFileIdentity {
