@@ -7802,6 +7802,7 @@ final class AgentModeViewModel: ObservableObject {
             EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
         )
         let importedTranscript: AgentTranscript
+        var trustedIncrementalFinalTurnStartSequenceIndex: Int?
         if reason == .liveMutation,
            session.pendingAskUser == nil,
            let mutationSummary = pendingMutationSummary,
@@ -7832,6 +7833,10 @@ final class AgentModeViewModel: ObservableObject {
                 protection: projectionProtection
             ) {
                 importedTranscript = incrementallyUpdatedTranscript
+                if workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex) {
+                    trustedIncrementalFinalTurnStartSequenceIndex =
+                        workingItemsSnapshot[mutationSummary.earliestChangedIndex].sequenceIndex
+                }
                 #if DEBUG
                     debugIncrementalPath = usesDurableFrontier ? "incremental-success:frontier" : "incremental-success:no-frontier"
                 #endif
@@ -7943,7 +7948,8 @@ final class AgentModeViewModel: ObservableObject {
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: reason == .coldLoad
+            isColdLoad: reason == .coldLoad,
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -7953,17 +7959,22 @@ final class AgentModeViewModel: ObservableObject {
         let hasCompactedTranscriptPrefix = builtPresentation.transcript.turns.contains { $0.retentionTier != .full }
         let canReconcileForStandardRetention = (!session.runState.isActive || hasCompactedTranscriptPrefix)
             && (session.runState != .completed || hasCompactedTranscriptPrefix)
+        let containsExcludedLegacyItems = AgentTranscriptIO.containsExcludedLegacyItems(
+            workingItemsSnapshot,
+            policy: importPolicy
+        )
+        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
+            from: existingTranscript,
+            to: builtPresentation.transcript
+        )
         let shouldReconcileWorkingItems: Bool = {
             guard session.items == workingItemsSnapshot,
                   canReconcileForStandardRetention
             else {
                 return false
             }
-            return AgentTranscriptIO.containsExcludedLegacyItems(workingItemsSnapshot, policy: importPolicy)
-                || AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
-                    from: existingTranscript,
-                    to: builtPresentation.transcript
-                )
+            return containsExcludedLegacyItems
+                || fullDetailTurnEnvelopeChanged
                 || builtPresentation.sanitizedActivityCount > 0
         }()
         let mayCompactActiveSummaryOnlyToolResults = !shouldReconcileWorkingItems
@@ -7971,7 +7982,45 @@ final class AgentModeViewModel: ObservableObject {
             && session.runState.isActive
             && !hasCompactedTranscriptPrefix
             && builtPresentation.sanitizedActivityCount > 0
-        if shouldReconcileWorkingItems || mayCompactActiveSummaryOnlyToolResults {
+        let didApplyIncrementalSummaryOnlyCompaction: Bool = {
+            guard builtPresentation.sanitizedActivityCount > 0,
+                  !containsExcludedLegacyItems,
+                  !fullDetailTurnEnvelopeChanged,
+                  let mutationSummary = pendingMutationSummary,
+                  mutationSummary.earliestChangedIndex == mutationSummary.latestChangedIndex,
+                  workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex)
+            else {
+                return false
+            }
+            let changedIndex = mutationSummary.earliestChangedIndex
+            let sourceItem = workingItemsSnapshot[changedIndex]
+            guard let compactedItem = Self.transcriptItem(
+                in: builtPresentation.transcript,
+                matching: sourceItem
+            ),
+                let retainedRawPayload = session.ephemeralToolResultPayloadByItemID[sourceItem.id],
+                Self.canApplyActiveSummaryOnlyToolResultCompaction(
+                    from: sourceItem,
+                    to: compactedItem,
+                    retainedPayload: retainedRawPayload
+                ),
+                session.replaceItemSilentlyForRetentionCompaction(
+                    at: changedIndex,
+                    with: compactedItem,
+                    retainedRawPayload: retainedRawPayload
+                )
+            else {
+                return false
+            }
+            markDerivedTranscriptSynchronized(
+                for: session,
+                projectionProtection: builtPresentation.projectionProtection
+            )
+            return true
+        }()
+        if !didApplyIncrementalSummaryOnlyCompaction,
+           shouldReconcileWorkingItems || mayCompactActiveSummaryOnlyToolResults
+        {
             let trimmedWorkingItems = AgentTranscriptIO.workingSourceItems(from: builtPresentation.transcript)
             let canApplyWorkingItems = shouldReconcileWorkingItems
                 || Self.canApplyActiveSummaryOnlyToolResultCompaction(
@@ -8289,7 +8338,8 @@ final class AgentModeViewModel: ObservableObject {
         previousProjectionProtection: AgentTranscriptProjectionProtection = .none,
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
-        isColdLoad: Bool = false
+        isColdLoad: Bool = false,
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
     ) -> BuiltTranscriptPresentation {
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
@@ -8364,11 +8414,13 @@ final class AgentModeViewModel: ObservableObject {
             transcript,
             previousSanitizedTranscript: previousSanitizedTranscript,
             reusablePrefixTurnCount: sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil,
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
             context: processingContext,
             purpose: .runtimePresentation
         )
         let sanitizedTranscript = AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(
-            in: sanitizeMetrics.transcript
+            in: sanitizeMetrics.transcript,
+            reusablePrefixTurnCount: sanitizeMetrics.reusedTurnCount
         )
         #if DEBUG || EDIT_FLOW_PERF
             if sanitizeReusableTurnCount > 0 {
@@ -8598,47 +8650,90 @@ final class AgentModeViewModel: ObservableObject {
         guard sourceItems.count == compactedItems.count else { return false }
         var foundSummaryOnlyToolResultCompaction = false
         for (sourceItem, compactedItem) in zip(sourceItems, compactedItems) {
-            guard sourceItem.id == compactedItem.id,
-                  sourceItem.timestamp == compactedItem.timestamp,
-                  sourceItem.kind == compactedItem.kind,
-                  sourceItem.attachments == compactedItem.attachments,
-                  sourceItem.taggedFileAttachments == compactedItem.taggedFileAttachments,
-                  sourceItem.toolName == compactedItem.toolName,
-                  sourceItem.toolInvocationID == compactedItem.toolInvocationID,
-                  sourceItem.toolArgsJSON == compactedItem.toolArgsJSON,
-                  sourceItem.reasoning == compactedItem.reasoning,
-                  sourceItem.sequenceIndex == compactedItem.sequenceIndex,
-                  sourceItem.isStreaming == compactedItem.isStreaming,
-                  sourceItem.workflow == compactedItem.workflow,
-                  sourceItem.codexGoalMode == compactedItem.codexGoalMode,
-                  sourceItem.isLocalControlPlaneEcho == compactedItem.isLocalControlPlaneEcho
-            else {
-                return false
-            }
             guard sourceItem != compactedItem else { continue }
-            guard sourceItem.kind == .toolResult,
-                  !sourceItem.isStreaming
-            else {
-                return false
-            }
-            let sourceResultJSON = sourceItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let compactedResultJSON = compactedItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let retainedPayload = retainedPayloadByItemID[sourceItem.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !sourceResultJSON.isEmpty,
-                  sourceResultJSON != compactedResultJSON,
-                  retainedPayload == sourceResultJSON,
-                  AgentTranscriptToolNormalizer.isSummaryOnly(raw: compactedResultJSON)
-            else {
-                return false
-            }
-            var expectedCompactedItem = sourceItem
-            expectedCompactedItem.text = compactedItem.text
-            expectedCompactedItem.toolResultJSON = compactedItem.toolResultJSON
-            expectedCompactedItem.toolIsError = compactedItem.toolIsError
-            guard expectedCompactedItem == compactedItem else { return false }
+            guard canApplyActiveSummaryOnlyToolResultCompaction(
+                from: sourceItem,
+                to: compactedItem,
+                retainedPayload: retainedPayload
+            ) else { return false }
             foundSummaryOnlyToolResultCompaction = true
         }
         return foundSummaryOnlyToolResultCompaction
+    }
+
+    private nonisolated static func canApplyActiveSummaryOnlyToolResultCompaction(
+        from sourceItem: AgentChatItem,
+        to compactedItem: AgentChatItem,
+        retainedPayload: String
+    ) -> Bool {
+        guard sourceItem.id == compactedItem.id,
+              sourceItem.timestamp == compactedItem.timestamp,
+              sourceItem.kind == compactedItem.kind,
+              sourceItem.attachments == compactedItem.attachments,
+              sourceItem.taggedFileAttachments == compactedItem.taggedFileAttachments,
+              sourceItem.toolName == compactedItem.toolName,
+              sourceItem.toolInvocationID == compactedItem.toolInvocationID,
+              sourceItem.toolArgsJSON == compactedItem.toolArgsJSON,
+              sourceItem.reasoning == compactedItem.reasoning,
+              sourceItem.sequenceIndex == compactedItem.sequenceIndex,
+              sourceItem.isStreaming == compactedItem.isStreaming,
+              sourceItem.workflow == compactedItem.workflow,
+              sourceItem.codexGoalMode == compactedItem.codexGoalMode,
+              sourceItem.isLocalControlPlaneEcho == compactedItem.isLocalControlPlaneEcho,
+              sourceItem.kind == .toolResult,
+              !sourceItem.isStreaming
+        else {
+            return false
+        }
+        let sourceResultJSON = sourceItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let compactedResultJSON = compactedItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !sourceResultJSON.isEmpty,
+              sourceResultJSON != compactedResultJSON,
+              retainedPayload.trimmingCharacters(in: .whitespacesAndNewlines) == sourceResultJSON,
+              AgentTranscriptToolNormalizer.isSummaryOnly(raw: compactedResultJSON)
+        else {
+            return false
+        }
+        var expectedCompactedItem = sourceItem
+        expectedCompactedItem.text = compactedItem.text
+        expectedCompactedItem.toolResultJSON = compactedItem.toolResultJSON
+        expectedCompactedItem.toolIsError = compactedItem.toolIsError
+        return expectedCompactedItem == compactedItem
+    }
+
+    private nonisolated static func transcriptItem(
+        in transcript: AgentTranscript,
+        matching sourceItem: AgentChatItem
+    ) -> AgentChatItem? {
+        guard let finalTurn = transcript.turns.last else { return nil }
+        for span in finalTurn.responseSpans.reversed() {
+            guard let firstSequenceIndex = span.activities.first?.sequenceIndex,
+                  let lastSequenceIndex = span.activities.last?.sequenceIndex,
+                  sourceItem.sequenceIndex >= firstSequenceIndex,
+                  sourceItem.sequenceIndex <= lastSequenceIndex
+            else {
+                continue
+            }
+            var lowerBound = span.activities.startIndex
+            var upperBound = span.activities.endIndex
+            while lowerBound < upperBound {
+                let midpoint = lowerBound + (upperBound - lowerBound) / 2
+                if span.activities[midpoint].sequenceIndex < sourceItem.sequenceIndex {
+                    lowerBound = midpoint + 1
+                } else {
+                    upperBound = midpoint
+                }
+            }
+            guard lowerBound < span.activities.endIndex,
+                  span.activities[lowerBound].sequenceIndex == sourceItem.sequenceIndex,
+                  span.activities[lowerBound].id == sourceItem.id
+            else {
+                continue
+            }
+            return span.activities[lowerBound].toItem()
+        }
+        return nil
     }
 
     private func applyBuiltTranscriptPresentation(

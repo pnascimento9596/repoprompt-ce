@@ -233,6 +233,52 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testCancelledAccountingReadBatchStopsSchedulingRemainingFiles() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AccountingCancellation")
+            let fileCount = 24
+            var selectedPaths: [String] = []
+            for index in 0 ..< fileCount {
+                let fileURL = root.appendingPathComponent("File\(index).swift")
+                try write("struct File\(index) {}", to: fileURL)
+                selectedPaths.append(fileURL.path)
+            }
+
+            let store = WorkspaceFileContextStore()
+            let rootRecord = try await store.loadRoot(path: root.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: rootRecord.id)
+            let service = try XCTUnwrap(loadedService)
+            let gate = AccountingReadCancellationGate()
+            await service.setContentReadChunkHandlerForTesting { _ in
+                await gate.markStartedAndWaitForRelease()
+            }
+
+            let accountingTask = Task {
+                await PromptContextAccountingService().resolveEntries(
+                    selection: StoredSelection(
+                        selectedPaths: selectedPaths,
+                        codemapAutoEnabled: false
+                    ),
+                    store: store,
+                    codeMapUsage: .none
+                )
+            }
+            await gate.waitUntilStarted()
+            accountingTask.cancel()
+            await gate.release()
+            _ = await accountingTask.value
+            try? await Task.sleep(for: .milliseconds(50))
+
+            let startedReadCount = await gate.startedCount()
+            await service.setContentReadChunkHandlerForTesting(nil)
+            XCTAssertLessThanOrEqual(
+                startedReadCount,
+                4,
+                "A cancelled accounting batch should not continue draining all selected files"
+            )
+        #endif
+    }
+
     func testCompleteCodemapResolutionBuildsSingleStaticPathSnapshot() async throws {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "AccountingCompleteCodemapBatch")
@@ -323,3 +369,43 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         )
     }
 }
+
+#if DEBUG
+    private actor AccountingReadCancellationGate {
+        private var count = 0
+        private var released = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func markStartedAndWaitForRelease() async {
+            count += 1
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard count > 0 else {
+                await withCheckedContinuation { continuation in
+                    startWaiters.append(continuation)
+                }
+                return
+            }
+        }
+
+        func release() {
+            released = true
+            let waiters = releaseWaiters
+            releaseWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
+        func startedCount() -> Int {
+            count
+        }
+    }
+#endif

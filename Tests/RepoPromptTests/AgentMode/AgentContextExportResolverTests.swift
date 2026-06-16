@@ -109,7 +109,7 @@ final class AgentContextExportResolverTests: XCTestCase {
                 ),
                 explicitFileCount
             )
-            XCTAssertEqual(snapshotBuildCount, 2)
+            XCTAssertEqual(snapshotBuildCount, 1)
             XCTAssertEqual(capture.droppedSampleCount, 0)
         #endif
     }

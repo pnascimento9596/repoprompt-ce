@@ -298,7 +298,6 @@ import RepoPromptShared
                     "consistency": "best_effort",
                     "limiter": limiterPayload,
                     "observers": [
-                        "tool_call_observer_count": toolCallObserverCount(),
                         "tool_event_observer_count": toolEventObserverCount()
                     ],
                     "window_count": windows.count,

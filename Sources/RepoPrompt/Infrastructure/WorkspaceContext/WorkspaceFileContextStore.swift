@@ -1062,6 +1062,11 @@ actor WorkspaceFileContextStore {
         let generation: UInt64
     }
 
+    private struct StaticPathMatchSnapshotCacheEntry {
+        let snapshot: StaticPathMatchData
+        var lastAccessSequence: UInt64
+    }
+
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -1089,6 +1094,8 @@ actor WorkspaceFileContextStore {
     private var rootCatalogShardWeakReferencesByRootID: [UUID: [WeakRootCatalogShardReference]] = [:]
     private var rootCatalogShardDeltaStatesByRootID: [UUID: RootCatalogShardDeltaState] = [:]
     private var pathMatchSnapshotIdentitiesByScope: [WorkspaceLookupRootScope: PathMatchCacheIdentity] = [:]
+    private var staticPathMatchSnapshotsByScope: [WorkspaceLookupRootScope: StaticPathMatchSnapshotCacheEntry] = [:]
+    private var nextStaticPathMatchSnapshotAccessSequence: UInt64 = 0
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
     private let interactiveReadCache = WorkspaceInteractiveReadCache()
@@ -1101,6 +1108,7 @@ actor WorkspaceFileContextStore {
     private var nextSearchContentInvalidationEpoch: UInt64 = 0
     private var activePublicationInvalidationBatch: PublicationInvalidationBatch?
     private static let maxCachedSearchCatalogSnapshotScopes = 16
+    private static let maxCachedStaticPathMatchSnapshotScopes = 16
     /// Covers overlapping readers/index builds while bounding retained full-root arrays. At the cap,
     /// callers receive an authoritative uncached rebuild until older ARC leases drain.
     private static let maxLiveRootCatalogShardGenerationsPerRoot = 8
@@ -5865,7 +5873,19 @@ actor WorkspaceFileContextStore {
     }
 
     func lookupPath(_ request: WorkspacePathLookupRequest) async -> WorkspacePathLookupResult? {
-        await lookupPath(request, rootRefs: rootRefs(scope: request.rootScope))
+        let normalizedPath = normalizeUserInputPath(request.userPath)
+        guard !normalizedPath.isEmpty else { return nil }
+
+        let selectedFileFullPaths = request.selectedFileFullPaths
+        let staticData = buildStaticSnapshot(scope: request.rootScope)
+        guard let match = await pathMatchWorker.locate(
+            userPath: normalizedPath,
+            profile: request.profile,
+            staticData: staticData,
+            selectedFileFullPaths: selectedFileFullPaths,
+            selectionSig: selectionSignature(for: selectedFileFullPaths)
+        ) else { return nil }
+        return lookupResult(input: request.userPath, match: match)
     }
 
     func lookupPath(
@@ -6287,12 +6307,35 @@ actor WorkspaceFileContextStore {
     }
 
     private func buildStaticSnapshot(scope: WorkspaceLookupRootScope) -> StaticPathMatchData {
-        buildStaticSnapshot(scope: scope, rootRefs: rootRefs(scope: scope))
+        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
+        if var cached = staticPathMatchSnapshotsByScope[scope],
+           cached.snapshot.cacheIdentity == cacheIdentity
+        {
+            cached.lastAccessSequence = nextStaticPathMatchSnapshotAccessSequenceValue()
+            staticPathMatchSnapshotsByScope[scope] = cached
+            return cached.snapshot
+        }
+        let snapshot = buildStaticSnapshot(
+            rootRefs: rootRefs(scope: scope),
+            cacheIdentity: cacheIdentity
+        )
+        cacheStaticPathMatchSnapshot(snapshot, scope: scope)
+        return snapshot
     }
 
     private func buildStaticSnapshot(
         scope: WorkspaceLookupRootScope,
         rootRefs roots: [WorkspaceRootRef]
+    ) -> StaticPathMatchData {
+        buildStaticSnapshot(
+            rootRefs: roots,
+            cacheIdentity: pathMatchCacheIdentity(scope: scope, rootRefs: roots)
+        )
+    }
+
+    private func buildStaticSnapshot(
+        rootRefs roots: [WorkspaceRootRef],
+        cacheIdentity: PathMatchCacheIdentity
     ) -> StaticPathMatchData {
         let snapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild, snapshotState) }
@@ -6338,8 +6381,6 @@ actor WorkspaceFileContextStore {
                 displayName: folder.name
             ) as FolderRecord
         }
-        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
-        pathMatchSnapshotIdentitiesByScope[scope] = cacheIdentity
         return StaticPathMatchData(
             filesByFullPath: fileRecords,
             foldersByFullPath: folderRecords,
@@ -6349,12 +6390,69 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    private func cacheStaticPathMatchSnapshot(
+        _ snapshot: StaticPathMatchData,
+        scope: WorkspaceLookupRootScope
+    ) {
+        if staticPathMatchSnapshotsByScope[scope] == nil,
+           staticPathMatchSnapshotsByScope.count >= Self.maxCachedStaticPathMatchSnapshotScopes,
+           let eviction = staticPathMatchSnapshotsByScope.min(by: {
+               $0.value.lastAccessSequence < $1.value.lastAccessSequence
+           })
+        {
+            staticPathMatchSnapshotsByScope.removeValue(forKey: eviction.key)
+            if pathMatchSnapshotIdentitiesByScope[eviction.key] == eviction.value.snapshot.cacheIdentity {
+                pathMatchSnapshotIdentitiesByScope.removeValue(forKey: eviction.key)
+            }
+            invalidatePathMatchCache(snapshotIdentities: [eviction.value.snapshot.cacheIdentity])
+        }
+        pathMatchSnapshotIdentitiesByScope[scope] = snapshot.cacheIdentity
+        staticPathMatchSnapshotsByScope[scope] = StaticPathMatchSnapshotCacheEntry(
+            snapshot: snapshot,
+            lastAccessSequence: nextStaticPathMatchSnapshotAccessSequenceValue()
+        )
+    }
+
+    private func nextStaticPathMatchSnapshotAccessSequenceValue() -> UInt64 {
+        nextStaticPathMatchSnapshotAccessSequence &+= 1
+        return nextStaticPathMatchSnapshotAccessSequence
+    }
+
     private func pathMatchCacheIdentity(scope: WorkspaceLookupRootScope) -> PathMatchCacheIdentity {
         PathMatchCacheIdentity(
             scopeID: scopeDiscriminator(scope),
             snapshotID: scopedSnapshotGeneration(scope: scope)
         )
     }
+
+    private func pathMatchCacheIdentity(
+        scope: WorkspaceLookupRootScope,
+        rootRefs roots: [WorkspaceRootRef]
+    ) -> PathMatchCacheIdentity {
+        var hasher = Hasher()
+        hasher.combine("explicitRootRefs")
+        hasher.combine(scopeDiscriminator(scope))
+        for root in roots {
+            hasher.combine(root.id)
+            hasher.combine(root.standardizedFullPath)
+            hasher.combine(rootStatesByID[root.id]?.lifetimeID)
+            hasher.combine(catalogGenerationsByRootID[root.id] ?? 0)
+        }
+        return PathMatchCacheIdentity(
+            scopeID: scopeDiscriminator(scope),
+            snapshotID: UInt64(bitPattern: Int64(hasher.finalize()))
+        )
+    }
+
+    #if DEBUG
+        func staticPathMatchSnapshotCacheCountForTesting() -> Int {
+            staticPathMatchSnapshotsByScope.count
+        }
+
+        func sessionCatalogGenerationForTesting(scope: WorkspaceLookupRootScope) -> UInt64? {
+            sessionCatalogGenerationStatesByScope[scope]?.generation
+        }
+    #endif
 
     private func scopedSnapshotGeneration(scope: WorkspaceLookupRootScope) -> UInt64 {
         let validationToken = searchCatalogSnapshotValidationToken(scope: scope)
@@ -6705,6 +6803,9 @@ actor WorkspaceFileContextStore {
         })
         pathMatchSnapshotIdentitiesByScope = pathMatchSnapshotIdentitiesByScope.filter { scope, identity in
             identity == pathMatchCacheIdentity(scope: scope)
+        }
+        staticPathMatchSnapshotsByScope = staticPathMatchSnapshotsByScope.filter { scope, entry in
+            entry.snapshot.cacheIdentity == pathMatchCacheIdentity(scope: scope)
         }
         invalidatePathMatchCache(snapshotIdentities: stalePathMatchIdentities)
     }

@@ -394,7 +394,6 @@
                 await manager.debugRemoveConnection(connectionID)
             }
             let runID = UUID()
-            await manager.registerToolCallObserver(for: runID) { _ in }
             await manager.registerToolEventObserver(
                 for: runID,
                 observer: ServerNetworkManager.ToolEventObserver(onCalled: { _, _, _ in }, onCompleted: nil)
@@ -414,7 +413,6 @@
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
 
-            let expectedToolCallObserverCount = await manager.toolCallObserverCount()
             let expectedToolEventObserverCount = await manager.toolEventObserverCount()
             let result = await manager.handleDebugDiagnosticsTool(
                 connectionID: connectionID,
@@ -432,10 +430,7 @@
             XCTAssertEqual(runtime["consistency"] as? String, "best_effort")
             XCTAssertEqual((runtime["window_count"] as? NSNumber)?.intValue, 1)
             let observers = try XCTUnwrap(runtime["observers"] as? [String: Any])
-            XCTAssertEqual(
-                (observers["tool_call_observer_count"] as? NSNumber)?.intValue,
-                expectedToolCallObserverCount
-            )
+            XCTAssertNil(observers["tool_call_observer_count"])
             XCTAssertEqual(
                 (observers["tool_event_observer_count"] as? NSNumber)?.intValue,
                 expectedToolEventObserverCount

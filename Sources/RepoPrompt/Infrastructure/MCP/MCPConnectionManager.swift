@@ -911,17 +911,65 @@ actor ServerNetworkManager {
         return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
     }
 
-    /// Tool call observers for agent UI feedback (runID-based for stability across handovers)
-    /// Enhanced to support both call (with args) and completion (with result) callbacks
-    private var toolCallObservers: [UUID: [UUID: @Sendable (String) -> Void]] = [:]
+    fileprivate final class ToolEventObserverDeliveryBarrier: @unchecked Sendable {
+        private let lock = NSLock()
+        private var activeDeliveryCount = 0
+        private var idleContinuations: [CheckedContinuation<Void, Never>] = []
 
-    /// Enhanced tool observer that receives args on call and result on completion
+        func beginDeliveries(_ count: Int = 1) {
+            guard count > 0 else { return }
+            lock.lock()
+            activeDeliveryCount += count
+            lock.unlock()
+        }
+
+        func endDelivery() {
+            lock.lock()
+            precondition(activeDeliveryCount > 0)
+            activeDeliveryCount -= 1
+            guard activeDeliveryCount == 0 else {
+                lock.unlock()
+                return
+            }
+            let continuations = idleContinuations
+            idleContinuations.removeAll(keepingCapacity: true)
+            lock.unlock()
+            continuations.forEach { $0.resume() }
+        }
+
+        func waitUntilIdle() async {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                guard activeDeliveryCount > 0 else {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                idleContinuations.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    private struct ToolObserverUnregistrationState {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    /// Enhanced tool observer that receives args on call and result on completion.
+    /// The manager acquires delivery leases for the captured batch before its first
+    /// suspension so unregistration can await callbacks that have not entered yet.
     struct ToolEventObserver: @unchecked Sendable {
         let onCalled: @Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?) async -> Void
         let onCompleted: (@Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?, _ resultJSON: String, _ isError: Bool) async -> Void)?
+        fileprivate let deliveryBarrier = ToolEventObserverDeliveryBarrier()
     }
 
     private var toolEventObservers: [UUID: [UUID: ToolEventObserver]] = [:]
+    private var toolObserverUnregistrationsByRunID: [UUID: ToolObserverUnregistrationState] = [:]
+    #if DEBUG
+        private var debugBeforeToolEventObserverDeliveryForTesting: (@Sendable () async -> Void)?
+    #endif
 
     // Per-connection restriction + routing state
     private var restrictedToolsByConnection: [UUID: Set<String>] = [:]
@@ -3174,31 +3222,30 @@ actor ServerNetworkManager {
         connectionApprovalHandler = handler
     }
 
-    /// Register a tool call observer for a specific discovery run (by runID, survives connection handovers)
-    /// Returns a token that can be used for targeted unregistration (optional)
-    @discardableResult
-    func registerToolCallObserver(for runID: UUID, observer: @escaping @Sendable (String) -> Void) -> UUID {
-        let token = UUID()
-        toolCallObservers[runID, default: [:]][token] = observer
-        connectionLog("Registered tool call observer for runID: \(runID) token: \(token)")
-        return token
-    }
-
-    /// Unregister a specific tool call observer by token
-    func unregisterToolCallObserver(for runID: UUID, token: UUID) async {
-        toolCallObservers[runID]?.removeValue(forKey: token)
-        if toolCallObservers[runID]?.isEmpty ?? false {
-            toolCallObservers.removeValue(forKey: runID)
-        }
-        connectionLog("Unregistered tool call observer token \(token) for runID: \(runID)")
-    }
-
-    /// Unregister all tool observers for a specific run.
+    /// Unregister all enhanced tool event observers for a specific run.
     /// This only removes observers and does not mutate run routing state.
     func unregisterToolObservers(for runID: UUID) async {
-        toolCallObservers.removeValue(forKey: runID)
-        toolEventObservers.removeValue(forKey: runID)
-        connectionLog("Unregistered all tool observers for runID: \(runID)")
+        if let unregistration = toolObserverUnregistrationsByRunID[runID] {
+            await unregistration.task.value
+            return
+        }
+
+        let removedObservers = toolEventObservers.removeValue(forKey: runID).map { Array($0.values) } ?? []
+        let unregistrationID = UUID()
+        let task = Task {
+            for observer in removedObservers {
+                await observer.deliveryBarrier.waitUntilIdle()
+            }
+        }
+        toolObserverUnregistrationsByRunID[runID] = ToolObserverUnregistrationState(
+            id: unregistrationID,
+            task: task
+        )
+        await task.value
+        if toolObserverUnregistrationsByRunID[runID]?.id == unregistrationID {
+            toolObserverUnregistrationsByRunID.removeValue(forKey: runID)
+        }
+        connectionLog("Unregistered tool observers for runID: \(runID)")
     }
 
     /// Explicitly clears run-scoped routing/policy state.
@@ -3248,64 +3295,6 @@ actor ServerNetworkManager {
         }
     }
 
-    /// Unregister all tool call observers for a specific discovery run.
-    /// By default this preserves legacy behavior and also clears run routing state.
-    func unregisterToolCallObserver(for runID: UUID, cleanupRouting: Bool = true) async {
-        await unregisterToolObservers(for: runID)
-        guard cleanupRouting else { return }
-        await cleanupRunRoutingState(for: runID)
-    }
-
-    /// Notify all observers registered for a runID that a tool was invoked.
-    /// Returns how many observers were fired.
-    @discardableResult
-    func fireToolCallObservers(runID: UUID, toolName: String) async -> Int {
-        guard let observers = toolCallObservers[runID], !observers.isEmpty else {
-            return 0
-        }
-        #if DEBUG
-            let batchStart = DispatchTime.now().uptimeNanoseconds
-        #endif
-        for (position, entry) in observers.enumerated() {
-            let (token, callback) = entry
-            #if DEBUG
-                let scheduledAt = DispatchTime.now().uptimeNanoseconds
-                let dimensions = EditFlowPerf.Dimensions(
-                    toolName: toolName,
-                    observerToken: token.uuidString,
-                    observerType: "legacy_call",
-                    serialPosition: position,
-                    queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
-                    correlationPath: "not_applicable",
-                    scannedItemCount: 0,
-                    runID: runID.uuidString
-                )
-                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerScheduled, dimensions)
-                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerEntered, dimensions)
-            #endif
-            callback(toolName)
-            #if DEBUG
-                let finishedAt = DispatchTime.now().uptimeNanoseconds
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPToolCall.observerExited,
-                    EditFlowPerf.Dimensions(
-                        toolName: toolName,
-                        observerToken: token.uuidString,
-                        observerType: "legacy_call",
-                        serialPosition: position,
-                        queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
-                        durationMicroseconds: Self.debugElapsedMicroseconds(from: scheduledAt, to: finishedAt),
-                        correlationPath: "not_applicable",
-                        scannedItemCount: 0,
-                        runID: runID.uuidString
-                    )
-                )
-            #endif
-        }
-        connectionLog("Tool call observer fired for runID \(runID) tool \(toolName) count \(observers.count)")
-        return observers.count
-    }
-
     // MARK: - Enhanced Tool Event Observers (with args and results)
 
     /// Register an enhanced tool event observer that receives args on call and result on completion
@@ -3319,17 +3308,7 @@ actor ServerNetworkManager {
 
     /// Unregister all tool event observers for a specific run
     func unregisterToolEventObservers(for runID: UUID) async {
-        toolEventObservers.removeValue(forKey: runID)
-        connectionLog("Unregistered all tool event observers for runID: \(runID)")
-    }
-
-    func toolCallObserverCount(for runID: UUID? = nil) -> Int {
-        if let runID {
-            return toolCallObservers[runID]?.count ?? 0
-        }
-        return toolCallObservers.values.reduce(into: 0) { partialResult, observers in
-            partialResult += observers.count
-        }
+        await unregisterToolObservers(for: runID)
     }
 
     func toolEventObserverCount(for runID: UUID? = nil) -> Int {
@@ -3354,10 +3333,14 @@ actor ServerNetworkManager {
             }
             return 0
         }
+        let observerEntries = Array(observers)
+        observerEntries.forEach { $0.value.deliveryBarrier.beginDeliveries() }
+        defer { observerEntries.forEach { $0.value.deliveryBarrier.endDelivery() } }
         #if DEBUG
             let batchStart = DispatchTime.now().uptimeNanoseconds
+            await debugBeforeToolEventObserverDeliveryForTesting?()
         #endif
-        for (position, entry) in observers.enumerated() {
+        for (position, entry) in observerEntries.enumerated() {
             let (token, observer) = entry
             #if DEBUG
                 let scheduledAt = DispatchTime.now().uptimeNanoseconds
@@ -3416,11 +3399,15 @@ actor ServerNetworkManager {
             }
             return 0
         }
+        let observerEntries = Array(observers)
+        observerEntries.forEach { $0.value.deliveryBarrier.beginDeliveries() }
+        defer { observerEntries.forEach { $0.value.deliveryBarrier.endDelivery() } }
         #if DEBUG
             let batchStart = DispatchTime.now().uptimeNanoseconds
+            await debugBeforeToolEventObserverDeliveryForTesting?()
         #endif
         var firedCount = 0
-        for (position, entry) in observers.enumerated() {
+        for (position, entry) in observerEntries.enumerated() {
             let (token, observer) = entry
             guard let onCompleted = observer.onCompleted else { continue }
             firedCount += 1
@@ -5960,8 +5947,8 @@ actor ServerNetworkManager {
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
-        // Note: toolCallObservers are now keyed by runID, not connectionID
-        // They are cleaned up when the discovery run completes, not when connection is removed
+        // Note: run-scoped tool event observers are cleaned up when the discovery run completes,
+        // not when an individual connection is removed.
         // Note: connectionIDToRunID mapping is managed by MCPServerViewModel, not here
 
         // Release admission slot & limiter
@@ -8802,6 +8789,12 @@ actor ServerNetworkManager {
             return names.sorted()
         }
 
+        func debugSetBeforeToolEventObserverDeliveryForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            debugBeforeToolEventObserverDeliveryForTesting = handler
+        }
+
         @discardableResult
         func debugFireToolCalledObservers(
             runID: UUID,
@@ -10734,7 +10727,7 @@ actor ServerNetworkManager {
                                     let logName = (originalName == toolName) ? toolName : "\(originalName)→\(toolName)"
                                     connectionLog("Tool call: \(logName) [conn=\(connectionID) window=\(windowStr)]")
 
-                                    // Notify tool call observers using the connection's resolved run mapping.
+                                    // Notify enhanced tool event observers using the connection's resolved run mapping.
                                     // Coordination/app-wide routing tools run before a stable window/run context may
                                     // exist, so avoid re-entering MainActor run lookup on that hot path.
                                     observerRunIDForCallbacksFinal = Self.shouldBypassWindowRouting(for: toolName)
@@ -10848,12 +10841,11 @@ actor ServerNetworkManager {
                                         EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
                                         EditFlowPerf.Dimensions(toolName: toolName)
                                     )
-                                    let legacyObserverCount = await self.fireToolCallObservers(runID: runID, toolName: toolName)
                                     let eventObserverCount = await self.fireToolCalledObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments)
                                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.observerCallbacks, observerState)
                                     #if DEBUG
                                         if toolName == "agent_run" {
-                                            print("[ACPAgentRunToolTracking] MCP observer call tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) legacyObservers=\(legacyObserverCount) eventObservers=\(eventObserverCount)")
+                                            print("[ACPAgentRunToolTracking] MCP observer call tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount)")
                                         }
                                     #endif
                                 } else {
