@@ -4,6 +4,7 @@ struct WorkspaceRootBindingProjection: Equatable {
     let sessionID: UUID
     let replacementsByLogicalRootPath: [String: BoundRoot]
     private let visibleLogicalRoots: [WorkspaceRootRef]
+    private let lookupPhysicalRootPaths: Set<String>
 
     struct BoundRoot: Equatable {
         let logicalRoot: WorkspaceRootRef
@@ -11,7 +12,12 @@ struct WorkspaceRootBindingProjection: Equatable {
         let binding: AgentSessionWorktreeBinding
     }
 
-    init(sessionID: UUID, boundRoots: [BoundRoot], visibleLogicalRoots: [WorkspaceRootRef] = []) {
+    init(
+        sessionID: UUID,
+        boundRoots: [BoundRoot],
+        visibleLogicalRoots: [WorkspaceRootRef] = [],
+        lookupPhysicalRootPaths: Set<String>? = nil
+    ) {
         self.sessionID = sessionID
         var replacements: [String: BoundRoot] = [:]
         for boundRoot in boundRoots {
@@ -21,6 +27,8 @@ struct WorkspaceRootBindingProjection: Equatable {
         self.visibleLogicalRoots = visibleLogicalRoots.isEmpty
             ? boundRoots.map(\.logicalRoot)
             : visibleLogicalRoots
+        self.lookupPhysicalRootPaths = lookupPhysicalRootPaths
+            ?? Set(boundRoots.map(\.physicalRoot.standardizedFullPath))
     }
 
     static func logicalAbsolutePath(
@@ -57,7 +65,14 @@ struct WorkspaceRootBindingProjection: Equatable {
     }
 
     var lookupRootScope: WorkspaceLookupRootScope {
-        .sessionBoundWorkspace(canonicalRootPaths: canonicalRootPaths, physicalRootPaths: physicalRootPaths)
+        .sessionBoundWorkspace(
+            canonicalRootPaths: canonicalRootPaths,
+            physicalRootPaths: lookupPhysicalRootPaths
+        )
+    }
+
+    var isFullyMaterialized: Bool {
+        lookupPhysicalRootPaths == physicalRootPaths
     }
 
     var logicalRootRefs: [WorkspaceRootRef] {
@@ -314,6 +329,18 @@ struct WorkspaceRootBindingProjectionMaterializer {
         bindings: [AgentSessionWorktreeBinding]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        return try await prepare(
+            sessionID: sessionID,
+            bindings: bindings,
+            visibleRoots: visibleRoots
+        )
+    }
+
+    private func prepare(
+        sessionID: UUID,
+        bindings: [AgentSessionWorktreeBinding],
+        visibleRoots: [WorkspaceRootRef]
+    ) async throws -> WorkspaceRootBindingProjectionPreparation {
         let ownership = try await store.prepareSessionWorktreeOwnership(
             ownerID: sessionID,
             bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings),
@@ -338,13 +365,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
         })
         var boundRoots: [WorkspaceRootBindingProjection.BoundRoot] = []
         for binding in preparation.bindings {
-            let logicalPath = StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath)
-            let logicalRoot = preparation.visibleRoots.first { $0.standardizedFullPath == logicalPath }
-                ?? WorkspaceRootRef(
-                    id: UUID(),
-                    name: binding.logicalRootName ?? URL(fileURLWithPath: logicalPath).lastPathComponent,
-                    fullPath: logicalPath
-                )
+            let logicalRoot = logicalRoot(for: binding, visibleRoots: preparation.visibleRoots)
             let physicalPath = StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
             guard let physicalRecord = recordsByPath[physicalPath] else {
                 await store.releaseSessionWorktreeOwnership(ownerID: preparation.sessionID)
@@ -383,19 +404,76 @@ struct WorkspaceRootBindingProjectionMaterializer {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding]
     ) async -> WorkspaceRootBindingProjection? {
+        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         do {
-            let preparation = try await prepare(sessionID: sessionID, bindings: bindings)
+            let preparation = try await prepare(
+                sessionID: sessionID,
+                bindings: bindings,
+                visibleRoots: visibleRoots
+            )
             do {
                 let projection = try await commit(preparation)
                 await initializeCodemaps(for: projection)
                 return projection
             } catch {
                 await abort(preparation)
-                return nil
+                return failClosedProjection(
+                    sessionID: sessionID,
+                    bindings: bindings,
+                    visibleRoots: visibleRoots
+                )
             }
         } catch {
-            return nil
+            return failClosedProjection(
+                sessionID: sessionID,
+                bindings: bindings,
+                visibleRoots: visibleRoots
+            )
         }
+    }
+
+    private func failClosedProjection(
+        sessionID: UUID,
+        bindings: [AgentSessionWorktreeBinding],
+        visibleRoots: [WorkspaceRootRef]
+    ) -> WorkspaceRootBindingProjection? {
+        guard !bindings.isEmpty else { return nil }
+        let boundRoots = bindings.map { binding in
+            let logicalRoot = logicalRoot(for: binding, visibleRoots: visibleRoots)
+            let physicalPath = StandardizedPath.absolute(
+                (binding.worktreeRootPath as NSString).expandingTildeInPath
+            )
+            return WorkspaceRootBindingProjection.BoundRoot(
+                logicalRoot: logicalRoot,
+                physicalRoot: WorkspaceRootRef(
+                    id: UUID(),
+                    name: logicalRoot.name,
+                    fullPath: physicalPath
+                ),
+                binding: binding
+            )
+        }
+        return WorkspaceRootBindingProjection(
+            sessionID: sessionID,
+            boundRoots: boundRoots,
+            visibleLogicalRoots: visibleRoots,
+            lookupPhysicalRootPaths: []
+        )
+    }
+
+    private func logicalRoot(
+        for binding: AgentSessionWorktreeBinding,
+        visibleRoots: [WorkspaceRootRef]
+    ) -> WorkspaceRootRef {
+        let logicalPath = StandardizedPath.absolute(
+            (binding.logicalRootPath as NSString).expandingTildeInPath
+        )
+        return visibleRoots.first { $0.standardizedFullPath == logicalPath }
+            ?? WorkspaceRootRef(
+                id: UUID(),
+                name: binding.logicalRootName ?? URL(fileURLWithPath: logicalPath).lastPathComponent,
+                fullPath: logicalPath
+            )
     }
 }
 

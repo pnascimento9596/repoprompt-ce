@@ -276,8 +276,20 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         let visibleLookup = await store.lookupPath("Sources/App.swift", profile: .uiAssisted, rootScope: .visibleWorkspace)
         let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
 
-        XCTAssertNil(materializedProjection)
+        let failClosedProjection = try XCTUnwrap(materializedProjection)
+        let scopedLookup = await store.lookupPath(
+            "Sources/App.swift",
+            profile: .uiAssisted,
+            rootScope: failClosedProjection.lookupRootScope
+        )
+        XCTAssertEqual(failClosedProjection.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
+        XCTAssertFalse(failClosedProjection.isFullyMaterialized)
+        XCTAssertEqual(
+            failClosedProjection.lookupRootScope,
+            .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: [])
+        )
         XCTAssertNotNil(visibleLookup)
+        XCTAssertNil(scopedLookup)
         XCTAssertEqual(ownership.installedOwnerCount, 0)
         XCTAssertEqual(ownership.provisionalOwnerCount, 0)
         XCTAssertEqual(ownership.rootClaimCount, 0)
