@@ -4286,22 +4286,40 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath),
               let workspaceID = activeWorkspaceID,
               let workspace = workspaces.first(where: { $0.id == workspaceID }) else { return }
+        let targets = workspace.composeTabs.map {
+            (identity: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: $0.id), fullPath: standardizedFullPath)
+        }
+        await rebaseSlicesForFilesAcrossTabs(targets: targets) { identity, _, ranges in
+            await asyncTransform(identity.tabID, ranges)
+        }
+    }
 
-        let tabIDs = workspace.composeTabs.map(\.id)
-        for tabID in tabIDs {
+    @MainActor
+    func rebaseSlicesForFilesAcrossTabs(
+        targets: [(identity: WorkspaceSelectionIdentity, fullPath: String)],
+        asyncTransform: @Sendable (WorkspaceSelectionIdentity, String, [LineRange]) async -> [LineRange]
+    ) async {
+        var seen = Set<String>()
+        for target in targets {
+            guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(target.fullPath) else {
+                continue
+            }
+            let dedupeKey = "\(target.identity.workspaceID.uuidString):\(target.identity.tabID.uuidString):\(standardizedFullPath)"
+            guard seen.insert(dedupeKey).inserted else { continue }
             #if DEBUG
                 MCPApplyEditsRebaseProbeRecorder.recordTabInspection(fullPath: standardizedFullPath)
             #endif
-            let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
             for _ in 0 ..< 3 {
-                guard let currentTab = composeTab(for: identity),
+                guard let currentTab = composeTab(for: target.identity),
                       !currentTab.selection.slices.isEmpty
                 else { break }
                 let currentSlices = StoredSelectionPathNormalization.standardizedSlices(currentTab.selection.slices)
                 guard let currentRanges = currentSlices[standardizedFullPath] else { break }
 
-                let nextRanges = await SliceRangeMath.normalize(asyncTransform(tabID, currentRanges))
-                guard var latestTab = composeTab(for: identity) else { break }
+                let nextRanges = await SliceRangeMath.normalize(
+                    asyncTransform(target.identity, standardizedFullPath, currentRanges)
+                )
+                guard var latestTab = composeTab(for: target.identity) else { break }
                 let latestSlices = StoredSelectionPathNormalization.standardizedSlices(latestTab.selection.slices)
                 guard let latestRanges = latestSlices[standardizedFullPath] else { break }
                 guard latestRanges == currentRanges else { continue }
@@ -4314,17 +4332,34 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
                 guard nextSlices != latestTab.selection.slices else { break }
 
-                latestTab.selection = StoredSelection(
-                    selectedPaths: latestTab.selection.selectedPaths,
-                    autoCodemapPaths: latestTab.selection.autoCodemapPaths,
+                let expectedSelection = latestTab.selection
+                let nextSelection = StoredSelection(
+                    selectedPaths: expectedSelection.selectedPaths,
+                    autoCodemapPaths: expectedSelection.autoCodemapPaths,
                     slices: nextSlices,
-                    codemapAutoEnabled: latestTab.selection.codemapAutoEnabled
+                    codemapAutoEnabled: expectedSelection.codemapAutoEnabled
                 )
-                latestTab.lastModified = Date()
+                let persistedSelection: StoredSelection
+                if let selectionCoordinator {
+                    persistedSelection = await selectionCoordinator.persistSelection(
+                        nextSelection,
+                        for: target.identity,
+                        source: .mcpTabContext,
+                        mirrorToUIIfActive: true,
+                        expectedCurrentSelection: expectedSelection
+                    )
+                } else {
+                    latestTab.selection = nextSelection
+                    latestTab.lastModified = Date()
+                    persistedSelection = updateComposeTabStoredOnly(
+                        latestTab,
+                        inWorkspaceID: target.identity.workspaceID
+                    ) ? nextSelection : expectedSelection
+                }
+                guard persistedSelection == nextSelection else { continue }
                 #if DEBUG
                     MCPApplyEditsRebaseProbeRecorder.recordTabWrite(fullPath: standardizedFullPath)
                 #endif
-                _ = updateComposeTabStoredOnly(latestTab, inWorkspaceID: workspaceID)
                 break
             }
         }

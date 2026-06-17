@@ -977,6 +977,8 @@ import RepoPromptShared
                 "root_kind": root.rootKind,
                 "crawl_count": root.crawlCount,
                 "watcher_active": root.watcherActive,
+                "explicit_watcher_demand": root.explicitWatcherDemand,
+                "session_worktree_owner_count": root.sessionWorktreeOwnerCount,
                 "ingress": readSearchIngressPayload(root.ingress),
                 "barrier": readSearchBarrierPayload(root.barrier),
                 "freshness": readSearchFreshnessPayload(root.freshness),

@@ -150,6 +150,28 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         #endif
     }
 
+    func testAgentOwnedHiddenWorktreeWatcherRebases6500LineReadSlicesBeforePostEditReads() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .hiddenWorktreeReadSliceRebase)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testAgentOwnedWorktreeContentSearchCarriesPhysicalCoverageAndPreservesFullSelections() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                try await fixture.installWorktreeBinding()
+                try await runCheckpoint(fixture: fixture, scenario: .worktreeSearchPhysicalCoverage)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testReadAutoSelectionDeclinesWhenBoundTabClosesDuringPersistenceSuspension() async throws {
         #if DEBUG
             try await withFixture { fixture in
@@ -201,12 +223,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case worktreeCoverageCertificateRepeats
             case worktreeCoverageCertificatePersistenceBoundary
             case worktreeCoverageCertificateFailClosed
+            case worktreeSearchPhysicalCoverage
+            case hiddenWorktreeReadSliceRebase
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
                      .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
-                     .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed:
+                     .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
+                     .worktreeSearchPhysicalCoverage, .hiddenWorktreeReadSliceRebase:
                     false
                 default:
                     true
@@ -395,7 +420,404 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertWorktreeCoverageCertificatePersistenceBoundary(fixture: fixture)
             case .worktreeCoverageCertificateFailClosed:
                 try await assertWorktreeCoverageCertificateFailClosed(fixture: fixture)
+            case .worktreeSearchPhysicalCoverage:
+                try await assertWorktreeSearchPhysicalCoverage(fixture: fixture)
+            case .hiddenWorktreeReadSliceRebase:
+                try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
             }
+        }
+
+        func assertHiddenWorktreeReadSliceRebase(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 3)
+            let unrelatedLogicalPath = fixture.rootURL
+                .appendingPathComponent(Fixture.worktreeOnlyRelativePath)
+                .path
+            let targetLogicalPath = fixture.rootURL
+                .appendingPathComponent(Fixture.largeWorktreeRelativePath)
+                .path
+            let fullSet = try await fixture.socketClient.request(
+                id: 4,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [unrelatedLogicalPath],
+                        "mode": "full",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(fullSet, id: 4)
+
+            _ = try await readFile(fixture: fixture, id: 5, path: targetLogicalPath, startLine: 100, limit: 10)
+            _ = try await readFile(fixture: fixture, id: 6, path: targetLogicalPath, startLine: 3200, limit: 10)
+            _ = try await readFile(fixture: fixture, id: 7, path: targetLogicalPath, startLine: 6400, limit: 10)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let originalRanges = [
+                LineRange(start: 100, end: 109),
+                LineRange(start: 3200, end: 3209),
+                LineRange(start: 6400, end: 6409)
+            ]
+            var selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, targetLogicalPath]))
+            XCTAssertNil(selection.slices[unrelatedLogicalPath])
+            XCTAssertEqual(selection.slices[targetLogicalPath], originalRanges)
+
+            var editedLines = (1 ... 6500).map { String(format: "line-%05d", $0) }
+            editedLines.insert(contentsOf: (1 ... 40).map { "begin-insert-\($0)" }, at: 0)
+            editedLines.insert(contentsOf: (1 ... 25).map { "middle-insert-\($0)" }, at: 3039)
+            editedLines.removeSubrange(5064 ..< 5084)
+            let physicalURL = try fixture.worktreeLargeFileURL
+            let replacementURL = physicalURL.deletingLastPathComponent()
+                .appendingPathComponent(".SessionWorktree6500.swift.atomic-\(UUID().uuidString)")
+            try (editedLines.joined(separator: "\n") + "\n").write(
+                to: replacementURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            _ = try FileManager.default.replaceItemAt(physicalURL, withItemAt: replacementURL)
+            let accepted = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_001
+                )]
+            )
+            XCTAssertNotNil(accepted)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+            let fence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [physicalURL.path]
+            )
+            XCTAssertTrue(fixture.window.workspaceFilesViewModel.isSliceRebaseFenceCurrent(fence))
+
+            let expectedRanges = [
+                LineRange(start: 140, end: 149),
+                LineRange(start: 3265, end: 3274),
+                LineRange(start: 6445, end: 6454)
+            ]
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, targetLogicalPath]))
+            XCTAssertNil(selection.slices[unrelatedLogicalPath])
+            XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
+
+            // `manage_selection get` flushes pending active-UI state before replying. Hidden
+            // worktree-only paths cannot materialize in the visible file tree, so the MCP-owned
+            // canonical selection fence must advance with the watcher-driven rebase rather than
+            // accepting the empty visible projection as a newer selection.
+            fixture.window.selectionCoordinator.flushPendingUISelectionToActiveTab()
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, targetLogicalPath]))
+            XCTAssertNil(selection.slices[unrelatedLogicalPath])
+            XCTAssertEqual(selection.slices[targetLogicalPath], expectedRanges)
+            XCTAssertNil(fixture.window.workspaceFilesViewModel.findFileByFullPath(physicalURL.path))
+            let physicalRootPath = try fixture.worktreeRootPath
+            XCTAssertFalse(fixture.window.workspaceFilesViewModel.rootFolders.contains {
+                $0.standardizedFullPath == StandardizedPath.absolute(physicalRootPath)
+            })
+
+            // Pause a successor after it computes from the old partition, then remove the
+            // target selection and partition entry. The deferred commit must not resurrect it.
+            let staleCommitGate = PersistentAsyncGate()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting { path in
+                guard path == physicalURL.path else { return }
+                await staleCommitGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting(nil)
+                Task { await staleCommitGate.release() }
+            }
+            let staleReplacementURL = physicalURL.deletingLastPathComponent()
+                .appendingPathComponent(".SessionWorktree6500.swift.stale-\(UUID().uuidString)")
+            let staleReplacementText = try String(contentsOf: physicalURL, encoding: .utf8)
+                + "tail-stale-race\n"
+            try staleReplacementText.write(to: staleReplacementURL, atomically: false, encoding: .utf8)
+            _ = try FileManager.default.replaceItemAt(physicalURL, withItemAt: staleReplacementURL)
+            let staleAccepted = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_002
+                )]
+            )
+            XCTAssertNotNil(staleAccepted)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+            try await requireGateStarted(staleCommitGate)
+
+            let identity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            let currentSelection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(for: identity)?.selection
+            )
+            let removedTargetSelection = StoredSelection(
+                selectedPaths: [unrelatedLogicalPath],
+                codemapAutoEnabled: currentSelection.codemapAutoEnabled
+            )
+            let persisted = await fixture.window.selectionCoordinator.persistSelection(
+                removedTargetSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: false,
+                expectedCurrentSelection: currentSelection
+            )
+            XCTAssertEqual(persisted, removedTargetSelection)
+            let partitionScope = PartitionScope(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            try await fixture.window.workspaceFilesViewModel._testPersistSlicesForScope(
+                rootPath: physicalRootPath,
+                scope: partitionScope,
+                relativePath: Fixture.largeWorktreeRelativePath,
+                ranges: []
+            )
+            await staleCommitGate.release()
+            fixture.window.workspaceFilesViewModel.setHiddenSessionSliceRebaseWillCommitHandlerForTesting(nil)
+            let staleFence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [physicalURL.path]
+            )
+            XCTAssertTrue(fixture.window.workspaceFilesViewModel.isSliceRebaseFenceCurrent(staleFence))
+            let afterStaleCommit = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(for: identity)?.selection
+            )
+            XCTAssertEqual(afterStaleCommit.selectedPaths, [unrelatedLogicalPath])
+            XCTAssertNil(afterStaleCommit.slices[targetLogicalPath])
+            let stalePartition = await fixture.window.workspaceFilesViewModel._testLoadSlicesForScope(
+                rootPath: physicalRootPath,
+                scope: partitionScope,
+                relativePath: Fixture.largeWorktreeRelativePath
+            )
+            XCTAssertNil(stalePartition)
+
+            let matchingFullSet = try await fixture.socketClient.request(
+                id: 8,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [targetLogicalPath],
+                        "mode": "full",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(matchingFullSet, id: 8)
+            _ = try await readFile(
+                fixture: fixture,
+                id: 9,
+                path: targetLogicalPath,
+                startLine: 140,
+                limit: 10
+            )
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let preservedFull = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(preservedFull.selectedPaths, [targetLogicalPath])
+            XCTAssertNil(preservedFull.slices[targetLogicalPath])
+        }
+
+        func assertWorktreeSearchPhysicalCoverage(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 3)
+
+            let unrelatedLogicalPath = fixture.rootURL
+                .appendingPathComponent(Fixture.worktreeOnlyRelativePath)
+                .path
+            let fullSet = try await fixture.socketClient.request(
+                id: 4,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [unrelatedLogicalPath],
+                        "mode": "full",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(fullSet, id: 4)
+
+            let physicalURL = try fixture.worktreeSearchCreatedFileURL
+            var originalLines = (1 ... 29).map { "search-line-\($0)" }
+            originalLines[3] = "WATCHER_BEGIN_ANCHOR_9F3A7C"
+            originalLines[14] = "WATCHER_MIDDLE_ANCHOR_9F3A7C"
+            originalLines[26] = "WATCHER_END_ANCHOR_9F3A7C"
+            try (originalLines.joined(separator: "\n") + "\n").write(
+                to: physicalURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            let created = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_101
+                )]
+            )
+            XCTAssertNotNil(created)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+
+            let searchPattern = "WATCHER_(BEGIN|MIDDLE|END)_ANCHOR_9F3A7C"
+            let response = try await fixture.socketClient.request(
+                id: 5,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.search,
+                    "arguments": [
+                        "pattern": searchPattern,
+                        "mode": "content",
+                        "regex": true,
+                        "context_lines": 2
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(response, id: 5)
+            XCTAssertTrue(response.contains(Fixture.searchCreatedRelativePath), response)
+            XCTAssertFalse(try response.contains(fixture.worktreeRootPath), response)
+
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let trace = try XCTUnwrap(fixture.window.mcpServer.fileSearchAutoSelectionTraceForTesting())
+            XCTAssertEqual(trace.contentGroupCount, 1)
+            XCTAssertEqual(trace.logicalEntryCount, 1)
+            XCTAssertEqual(trace.resolvedPhysicalPathCount, 1)
+            XCTAssertTrue(trace.hasCoverageIdentity)
+            XCTAssertTrue(trace.accepted)
+
+            let matchingLogicalPath = fixture.rootURL
+                .appendingPathComponent(Fixture.searchCreatedRelativePath)
+                .path
+            let originalRanges = [
+                LineRange(start: 2, end: 6),
+                LineRange(start: 13, end: 17),
+                LineRange(start: 25, end: 29)
+            ]
+            var selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, matchingLogicalPath]))
+            XCTAssertNil(selection.slices[unrelatedLogicalPath])
+            XCTAssertEqual(selection.slices[matchingLogicalPath], originalRanges)
+
+            var editedLines = originalLines
+            editedLines.insert(contentsOf: (1 ... 4).map { "top-insert-\($0)" }, at: 0)
+            editedLines.insert(contentsOf: (1 ... 3).map { "middle-insert-\($0)" }, at: 13)
+            editedLines.removeSubrange(26 ... 27)
+            let replacementURL = physicalURL.deletingLastPathComponent()
+                .appendingPathComponent(".SearchCreated.swift.atomic-\(UUID().uuidString)")
+            try (editedLines.joined(separator: "\n") + "\n").write(
+                to: replacementURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            _ = try FileManager.default.replaceItemAt(physicalURL, withItemAt: replacementURL)
+            let modified = try await fixture.window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+                rootID: fixture.installedWorktreeRootID,
+                events: [(
+                    absolutePath: physicalURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 8_900_000_000_000_000_102
+                )]
+            )
+            XCTAssertNotNil(modified)
+            _ = await fixture.window.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: physicalURL.path,
+                fallbackScope: .allLoaded
+            )
+            let fence = await fixture.window.workspaceFilesViewModel.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [physicalURL.path]
+            )
+            XCTAssertTrue(fixture.window.workspaceFilesViewModel.isSliceRebaseFenceCurrent(fence))
+
+            let expectedRanges = [
+                LineRange(start: 6, end: 10),
+                LineRange(start: 20, end: 24),
+                LineRange(start: 30, end: 34)
+            ]
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, matchingLogicalPath]))
+            XCTAssertNil(selection.slices[unrelatedLogicalPath])
+            XCTAssertEqual(selection.slices[matchingLogicalPath], expectedRanges)
+
+            fixture.window.selectionCoordinator.flushPendingUISelectionToActiveTab()
+            selection = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(Set(selection.selectedPaths), Set([unrelatedLogicalPath, matchingLogicalPath]))
+            XCTAssertNil(selection.slices[unrelatedLogicalPath])
+            XCTAssertEqual(selection.slices[matchingLogicalPath], expectedRanges)
+
+            let matchingFullSet = try await fixture.socketClient.request(
+                id: 6,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [matchingLogicalPath],
+                        "mode": "full",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(matchingFullSet, id: 6)
+            let repeatSearch = try await fixture.socketClient.request(
+                id: 7,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.search,
+                    "arguments": [
+                        "pattern": searchPattern,
+                        "mode": "content",
+                        "regex": true,
+                        "context_lines": 2
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(repeatSearch, id: 7)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let preservedFull = try XCTUnwrap(
+                fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            )
+            XCTAssertEqual(preservedFull.selectedPaths, [matchingLogicalPath])
+            XCTAssertNil(preservedFull.slices[matchingLogicalPath])
         }
 
         func assertWorktreeCoverageCertificateRepeats(fixture: Fixture) async throws {
@@ -1656,6 +2078,24 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         func assertSearchWorkspaceContextDrain(fixture: Fixture) async throws {
+            try await clearSelection(fixture: fixture, id: 5)
+            let searchNeedle = "persistentAgentModeSearchContextNeedle"
+            let searchFixtureContent = [
+                "line 1", "line 2", "line 3", "line 4", searchNeedle,
+                "line 6", "line 7", "line 8", "line 9"
+            ].joined(separator: "\n") + "\n"
+            let lookup = await fixture.window.workspaceFileContextStore.lookupPath(
+                fixture.fileURL.path,
+                profile: .mcpRead,
+                rootScope: .visibleWorkspace
+            )
+            let file = try XCTUnwrap(lookup?.file)
+            try await fixture.window.workspaceFileContextStore.editFile(
+                rootID: file.rootID,
+                relativePath: file.standardizedRelativePath,
+                newContent: searchFixtureContent
+            )
+
             let gate = PersistentAsyncGate()
             fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
                 await gate.markStartedAndWaitForRelease()
@@ -1672,7 +2112,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     params: [
                         "name": MCPWindowToolName.search,
                         "arguments": [
-                            "pattern": "persistentAgentModeCheckpoint",
+                            "pattern": searchNeedle,
                             "mode": "content",
                             "regex": false,
                             "context_lines": 2
@@ -1717,6 +2157,44 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let contextResponse = try await contextTask.value
             try Self.assertSuccessfulResponse(contextResponse, id: 7)
             XCTAssertTrue(contextResponse.contains("PersistentAgentModeFixture.swift"), contextResponse)
+            let searchSliceSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            XCTAssertEqual(
+                searchSliceSelection?.slices[fixture.fileURL.path],
+                [LineRange(start: 3, end: 7)]
+            )
+
+            let fullSet = try await fixture.socketClient.request(
+                id: 8,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [fixture.fileURL.path],
+                        "mode": "full",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(fullSet, id: 8)
+            let repeatSearch = try await fixture.socketClient.request(
+                id: 9,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.search,
+                    "arguments": [
+                        "pattern": searchNeedle,
+                        "mode": "content",
+                        "regex": false,
+                        "context_lines": 2
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(repeatSearch, id: 9)
+            await assertReadFileAutoSelectionSettled(fixture: fixture)
+            let preservedFullSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            XCTAssertEqual(preservedFullSelection?.selectedPaths, [fixture.fileURL.path])
+            XCTAssertNil(preservedFullSelection?.slices[fixture.fileURL.path])
         }
 
         func assertTabCloseDuringAutoSelectionPersistence(fixture: Fixture) async throws {
@@ -2113,6 +2591,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         """
         static let liveRelativePath = "Tests/RepoPromptTests/MCP/GeneratedOracleExportFileWriterTests.swift"
         static let worktreeOnlyRelativePath = "Tests/RepoPromptTests/MCP/WorktreeOnlySelection.swift"
+        static let largeWorktreeRelativePath = "Tests/RepoPromptTests/MCP/SessionWorktree6500.swift"
+        static let searchCreatedRelativePath = "Tests/RepoPromptTests/MCP/SearchCreated.swift"
         static func liveContents() throws -> (logical: String, worktree: String) {
             let targetURL = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -2448,6 +2928,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let worktreeFileURL = worktreeRootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
             let worktreeLiveFileURL = worktreeRootURL.appendingPathComponent(Self.liveRelativePath)
             let worktreeOnlyFileURL = worktreeRootURL.appendingPathComponent(Self.worktreeOnlyRelativePath)
+            let largeWorktreeFileURL = worktreeRootURL.appendingPathComponent(Self.largeWorktreeRelativePath)
             try FileManager.default.createDirectory(
                 at: worktreeFileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
@@ -2460,12 +2941,24 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 at: worktreeOnlyFileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            try FileManager.default.createDirectory(
+                at: largeWorktreeFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
             let liveContents = try Self.liveContents()
             try Self.sentinelContent.write(to: worktreeFileURL, atomically: true, encoding: .utf8)
             try liveContents.worktree.write(to: worktreeLiveFileURL, atomically: true, encoding: .utf8)
             try "let worktreeOnlySelection = true\n".write(
                 to: worktreeOnlyFileURL,
                 atomically: true,
+                encoding: .utf8
+            )
+            let largeWorktreeText = (1 ... 6500)
+                .map { String(format: "line-%05d", $0) }
+                .joined(separator: "\n") + "\n"
+            try largeWorktreeText.write(
+                to: largeWorktreeFileURL,
+                atomically: false,
                 encoding: .utf8
             )
             let worktreeRoot = try await window.workspaceFileContextStore.loadRoot(
@@ -2489,12 +2982,43 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             worktreeBinding = binding
             installWorktreeBindingProvider(binding)
+            window.workspaceFilesViewModel.setSessionWorktreeBindingsProvider { sessionID in
+                sessionID == Self.agentSessionID ? [binding] : []
+            }
+            let projection = try await WorkspaceRootBindingProjectionMaterializer(
+                store: window.workspaceFileContextStore
+            ).materialize(sessionID: Self.agentSessionID, bindings: [binding])
+            XCTAssertNotNil(projection)
         }
 
         private func installWorktreeBindingProvider(_ binding: AgentSessionWorktreeBinding) {
             window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
                 guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
                 return .hydrated([binding])
+            }
+        }
+
+        var installedWorktreeRootID: UUID {
+            get throws {
+                try XCTUnwrap(worktreeRootID)
+            }
+        }
+
+        var worktreeLargeFileURL: URL {
+            get throws {
+                try XCTUnwrap(worktreeRootURL).appendingPathComponent(Self.largeWorktreeRelativePath)
+            }
+        }
+
+        var worktreeSearchCreatedFileURL: URL {
+            get throws {
+                try XCTUnwrap(worktreeRootURL).appendingPathComponent(Self.searchCreatedRelativePath)
+            }
+        }
+
+        var worktreeRootPath: String {
+            get throws {
+                try XCTUnwrap(worktreeRootURL).path
             }
         }
 

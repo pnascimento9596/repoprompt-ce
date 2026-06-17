@@ -1,3 +1,4 @@
+import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -556,6 +557,111 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
                 store: store,
                 manager: manager
             )
+        }
+
+        @MainActor
+        func testAtomicReplacementWatcherRebases6500LineSlicesForAttachedRoot() async throws {
+            let rootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SelectionSliceAttachedRoot-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            let relativePath = "Fixtures/SessionWorktree6500.swift"
+            let fileURL = rootURL.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let originalLines = (1 ... 6500).map { String(format: "line-%05d", $0) }
+            try (originalLines.joined(separator: "\n") + "\n").write(to: fileURL, atomically: false, encoding: .utf8)
+
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let rootID = root.id
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
+            XCTAssertTrue(attachedPublisherIngress)
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            await manager.setCodeScanEnabled(false)
+            _ = try manager.attachRootShell(for: root, workspaceID: UUID())
+            manager.setActiveTabID(UUID())
+            addTeardownBlock {
+                await store.stopWatchingRoot(id: rootID)
+                await manager.unloadAllRootFolders()
+                try? FileManager.default.removeItem(at: rootURL)
+            }
+
+            let originalRanges = [
+                LineRange(start: 100, end: 109, description: "beginning"),
+                LineRange(start: 3200, end: 3209, description: "middle"),
+                LineRange(start: 6400, end: 6409, description: "end")
+            ]
+            _ = try await manager.setSelectionSlices(
+                entries: [WorkspaceFilesViewModel.SelectionSliceInput(path: fileURL.path, ranges: originalRanges)],
+                mode: .set,
+                persistWorkspace: false
+            )
+            let maybeOriginalFile = await store.file(rootID: rootID, relativePath: relativePath)
+            let originalFile = try XCTUnwrap(maybeOriginalFile)
+
+            var editedLines = originalLines
+            editedLines.insert(contentsOf: (1 ... 40).map { "begin-insert-\($0)" }, at: 0)
+            editedLines.insert(contentsOf: (1 ... 25).map { "middle-insert-\($0)" }, at: 3039)
+            editedLines.removeSubrange(5064 ..< 5084)
+            let replacementURL = fileURL.deletingLastPathComponent()
+                .appendingPathComponent(".SessionWorktree6500.swift.atomic-\(UUID().uuidString)")
+            try (editedLines.joined(separator: "\n") + "\n").write(
+                to: replacementURL,
+                atomically: false,
+                encoding: .utf8
+            )
+            _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: replacementURL)
+
+            let accepted = try await store.acceptWatcherPayloadForTesting(
+                rootID: rootID,
+                events: [(
+                    absolutePath: fileURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemRenamed
+                            | kFSEventStreamEventFlagItemCreated
+                            | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 9_000_000_000_000_000_000
+                )]
+            )
+            XCTAssertNotNil(accepted)
+            _ = await store.awaitAppliedIngressForExplicitRequest(
+                userPath: fileURL.path,
+                fallbackScope: .visibleWorkspace
+            )
+            let maybeStoreSnapshot = await store.debugApplyEditsRebaseProbePathSnapshot(
+                fullPath: fileURL.path,
+                rootScope: .visibleWorkspace
+            )
+            let storeSnapshot = try XCTUnwrap(maybeStoreSnapshot)
+            let projectionCaughtUp = await manager.debugWaitForAppliedIndexGeneration(
+                rootID: rootID,
+                targetGeneration: storeSnapshot.producedAppliedIndexGeneration,
+                deadline: ContinuousClock.now.advanced(by: .seconds(5))
+            )
+            XCTAssertTrue(projectionCaughtUp)
+            let fence = await manager.waitForPendingSliceRebasesAndCaptureFence(
+                affectingCandidatePaths: [fileURL.path]
+            )
+            XCTAssertTrue(manager.isSliceRebaseFenceCurrent(fence))
+
+            let expectedRanges = [
+                LineRange(start: 140, end: 149, description: "beginning"),
+                LineRange(start: 3265, end: 3274, description: "middle"),
+                LineRange(start: 6445, end: 6454, description: "end")
+            ]
+            let maybeRebasedFile = await store.file(rootID: rootID, relativePath: relativePath)
+            let rebasedFile = try XCTUnwrap(maybeRebasedFile)
+            XCTAssertEqual(rebasedFile.id, originalFile.id)
+            XCTAssertEqual(
+                manager.currentSlicesByRootForTesting()[root.standardizedFullPath]?[relativePath]?.ranges,
+                expectedRanges
+            )
+            XCTAssertEqual(manager.snapshotSelection().slices[fileURL.path], expectedRanges)
+            XCTAssertEqual(manager.getSelectionSlicesSnapshot()[originalFile.id], expectedRanges)
         }
     #endif
 

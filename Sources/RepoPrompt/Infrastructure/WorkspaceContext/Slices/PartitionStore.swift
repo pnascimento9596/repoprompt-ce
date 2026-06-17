@@ -146,11 +146,12 @@ actor PartitionStore {
     }
 
     func load(forRoot rootPath: String, scope: PartitionScope) async -> PartitionData {
+        loadData(forRoot: rootPath, scope: scope)
+    }
+
+    private func loadData(forRoot rootPath: String, scope: PartitionScope) -> PartitionData {
         let primaryURL = partitionURL(forRoot: rootPath, scope: scope)
-        if let partition = loadPartition(at: primaryURL) {
-            return partition
-        }
-        return PartitionData.empty()
+        return loadPartition(at: primaryURL) ?? PartitionData.empty()
     }
 
     func save(
@@ -158,6 +159,14 @@ actor PartitionStore {
         scope: PartitionScope,
         data: PartitionData
     ) async throws {
+        try saveData(forRoot: rootPath, scope: scope, data: data)
+    }
+
+    private func saveData(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        data: PartitionData
+    ) throws {
         try Task.checkCancellation()
         let url = partitionURL(forRoot: rootPath, scope: scope)
 
@@ -186,9 +195,48 @@ actor PartitionStore {
         updates: [String: SliceUpdate],
         mode: SliceMutationMode
     ) async throws -> [String: StoredSlices] {
+        try applyBody(
+            forRoot: rootPath,
+            scope: scope,
+            updates: updates,
+            mode: mode,
+            expectedCurrent: nil
+        ) ?? [:]
+    }
+
+    /// Atomically applies file-scoped updates only when the persisted inputs still match.
+    @discardableResult
+    func applyIfCurrent(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        updates: [String: SliceUpdate],
+        mode: SliceMutationMode,
+        expectedCurrent: [String: StoredSlices]
+    ) async throws -> [String: StoredSlices]? {
+        try applyBody(
+            forRoot: rootPath,
+            scope: scope,
+            updates: updates,
+            mode: mode,
+            expectedCurrent: expectedCurrent
+        )
+    }
+
+    private func applyBody(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        updates: [String: SliceUpdate],
+        mode: SliceMutationMode,
+        expectedCurrent: [String: StoredSlices]?
+    ) throws -> [String: StoredSlices]? {
         try Task.checkCancellation()
-        var data = await load(forRoot: rootPath, scope: scope)
+        var data = loadData(forRoot: rootPath, scope: scope)
         try Task.checkCancellation()
+        if let expectedCurrent,
+           !expectedCurrent.allSatisfy({ data.files[$0.key] == $0.value })
+        {
+            return nil
+        }
         switch mode {
         case .set:
             var next: [String: StoredSlices] = [:]
@@ -276,7 +324,7 @@ actor PartitionStore {
         }
 
         try Task.checkCancellation()
-        try await save(forRoot: rootPath, scope: scope, data: data)
+        try saveData(forRoot: rootPath, scope: scope, data: data)
         try Task.checkCancellation()
         return data.files
     }

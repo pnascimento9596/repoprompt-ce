@@ -1211,7 +1211,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let currentLifetimeFile = await store.file(rootID: record.id, relativePath: "Late.swift")
             XCTAssertNotNil(currentLifetimeFile)
             await store.unloadRoot(id: record.id)
-            let reloaded = try await store.loadRoot(path: root.path)
+            _ = try await store.loadRoot(path: root.path)
         }
 
         @MainActor
@@ -1233,6 +1233,148 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             XCTAssertEqual(event?.rootID, record.id)
             XCTAssertEqual(event?.requiresFullResync, true)
+        }
+
+        func testSessionWorktreeOwnershipIsIdempotentSharedAndLastReleaseUnloads() async throws {
+            let root = try makeTemporaryRoot(name: "SessionWorktreeOwnership")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            let ownerA = UUID()
+            let ownerB = UUID()
+            let fingerprint = "shared-binding"
+
+            let first = try await store.prepareSessionWorktreeOwnership(
+                ownerID: ownerA,
+                bindingFingerprint: fingerprint,
+                physicalRootPaths: [root.path]
+            )
+            let firstRoots = try await store.commitSessionWorktreeOwnership(first)
+            let rootID = try XCTUnwrap(firstRoots.first?.rootID)
+            let firstWatcherActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            XCTAssertTrue(firstWatcherActive)
+
+            let repeated = try await store.prepareSessionWorktreeOwnership(
+                ownerID: ownerA,
+                bindingFingerprint: fingerprint,
+                physicalRootPaths: [root.path]
+            )
+            XCTAssertTrue(repeated.reusesInstalledOwnership)
+            let repeatedRoots = try await store.commitSessionWorktreeOwnership(repeated)
+            XCTAssertEqual(repeatedRoots, firstRoots)
+
+            let second = try await store.prepareSessionWorktreeOwnership(
+                ownerID: ownerB,
+                bindingFingerprint: fingerprint,
+                physicalRootPaths: [root.path]
+            )
+            let secondRoots = try await store.commitSessionWorktreeOwnership(second)
+            XCTAssertEqual(secondRoots.map(\.rootID), [rootID])
+
+            let sharedDiagnostics = await store.readSearchRootDiagnosticsSnapshot()
+            let sharedRoot = try XCTUnwrap(sharedDiagnostics.first { $0.rootID == rootID })
+            XCTAssertEqual(sharedRoot.crawlCount, 1)
+            XCTAssertTrue(sharedRoot.watcherActive)
+            XCTAssertFalse(sharedRoot.explicitWatcherDemand)
+            XCTAssertEqual(sharedRoot.sessionWorktreeOwnerCount, 2)
+
+            await store.releaseSessionWorktreeOwnership(ownerID: ownerA)
+            let rootsAfterFirstRelease = await store.roots()
+            XCTAssertTrue(rootsAfterFirstRelease.contains { $0.id == rootID })
+            let watcherAfterFirstRelease = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            XCTAssertTrue(watcherAfterFirstRelease)
+            let oneOwnerDiagnostics = await store.readSearchRootDiagnosticsSnapshot()
+            XCTAssertEqual(oneOwnerDiagnostics.first { $0.rootID == rootID }?.sessionWorktreeOwnerCount, 1)
+
+            await store.releaseSessionWorktreeOwnership(ownerID: ownerB)
+            let rootsAfterLastRelease = await store.roots()
+            XCTAssertFalse(rootsAfterLastRelease.contains { $0.id == rootID })
+            let finalOwnership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(finalOwnership.installedOwnerCount, 0)
+            XCTAssertEqual(finalOwnership.provisionalOwnerCount, 0)
+            XCTAssertEqual(finalOwnership.rootClaimCount, 0)
+        }
+
+        func testSessionWorktreeOwnershipReleaseDuringRootLoadUnloadsLateRoot() async throws {
+            let root = try makeTemporaryRoot(name: "SessionWorktreeOwnershipReleaseDuringLoad")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            let ownerID = UUID()
+            let loadGate = AsyncGate()
+            await store.setRootLoadWillStartHandler { _ in
+                await loadGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                Task { await store.setRootLoadWillStartHandler(nil) }
+            }
+
+            let preparationTask = Task {
+                try await store.prepareSessionWorktreeOwnership(
+                    ownerID: ownerID,
+                    bindingFingerprint: "release-during-load",
+                    physicalRootPaths: [root.path]
+                )
+            }
+            await loadGate.waitUntilStarted()
+            await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
+            await loadGate.release()
+
+            do {
+                _ = try await preparationTask.value
+                XCTFail("Expected the released preparation to become stale")
+            } catch let error as WorkspaceSessionWorktreeOwnershipError {
+                XCTAssertEqual(error, .staleUpdate)
+            }
+
+            await store.setRootLoadWillStartHandler(nil)
+            let loadedRoots = await store.roots()
+            XCTAssertTrue(loadedRoots.isEmpty)
+            let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownership.installedOwnerCount, 0)
+            XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+            XCTAssertEqual(ownership.rootClaimCount, 0)
+        }
+
+        func testStartWatchingMissingRootThrowsWithoutRetainingDemand() async throws {
+            let store = WorkspaceFileContextStore()
+            let missingRootID = UUID()
+
+            do {
+                try await store.startWatchingRoot(id: missingRootID)
+                XCTFail("Expected a missing root to reject watcher demand")
+            } catch let error as WorkspaceFileContextStoreError {
+                XCTAssertEqual(error, .rootNotLoaded(missingRootID))
+            }
+
+            let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownership.explicitWatcherDemandCount, 0)
+            let loadedRoots = await store.roots()
+            XCTAssertTrue(loadedRoots.isEmpty)
+        }
+
+        func testSessionWorktreeOwnershipActivationFailureRollsBackClaimsAndRoot() async throws {
+            let root = try makeTemporaryRoot(name: "SessionWorktreeOwnershipActivationFailure")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
+
+            do {
+                _ = try await store.prepareSessionWorktreeOwnership(
+                    ownerID: UUID(),
+                    bindingFingerprint: "activation-failure",
+                    physicalRootPaths: [root.path]
+                )
+                XCTFail("Expected session-worktree watcher activation to fail")
+            } catch let error as FileSystemWatcherActivationError {
+                XCTAssertEqual(error, .streamStartFailed(path: root.path))
+            }
+
+            let rootsAfterFailure = await store.roots()
+            XCTAssertTrue(rootsAfterFailure.isEmpty)
+            let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownership.installedOwnerCount, 0)
+            XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+            XCTAssertEqual(ownership.rootClaimCount, 0)
+            await store.setWatcherActivationFailureForNewServicesForTesting(nil)
         }
 
         func testWatcherActivationFailureThrowsAndRollsBackStoreLifecycle() async throws {
@@ -7054,6 +7196,62 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(Set(finalAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path])
         }
     #endif
+
+    func testValidatedReadAndSearchSnapshotsPublishExactPreEditSourceAndFenceFileIdentity() async throws {
+        let rootURL = try makeTemporaryRoot(name: "SliceRebaseSource")
+        let readURL = rootURL.appendingPathComponent("Read.swift")
+        let searchURL = rootURL.appendingPathComponent("Search.swift")
+        let readOriginal = "read-one\nread-two\nread-three\n"
+        let searchOriginal = "search-one\nsearch-two\nsearch-three\n"
+        try write(readOriginal, to: readURL)
+        try write(searchOriginal, to: searchURL)
+
+        let store = WorkspaceFileContextStore()
+        let root = try await store.loadRoot(path: rootURL.path, kind: .sessionWorktree)
+        let maybeReadRecord = await store.file(rootID: root.id, relativePath: "Read.swift")
+        let readRecord = try XCTUnwrap(maybeReadRecord)
+        let maybeSearchRecord = await store.file(rootID: root.id, relativePath: "Search.swift")
+        let searchRecord = try XCTUnwrap(maybeSearchRecord)
+        let readSnapshot = try await store.interactiveReadSnapshot(for: readRecord)
+        XCTAssertEqual(readSnapshot?.preparedContent.linesWithEndings.joined(), readOriginal)
+        let searchSnapshot = try await store.searchContentSnapshot(for: searchRecord)
+        XCTAssertTrue(searchSnapshot.isFresh)
+        XCTAssertEqual(searchSnapshot.content, searchOriginal)
+
+        let stream = await store.appliedIndexEvents()
+        let eventTask = Task { () -> [WorkspaceAppliedIndexBatchEvent] in
+            var events: [WorkspaceAppliedIndexBatchEvent] = []
+            for await event in stream where !event.modifiedFileIDs.isEmpty {
+                events.append(event)
+                if events.count == 3 { return events }
+            }
+            return events
+        }
+
+        _ = try await store.editFile(rootID: root.id, relativePath: "Read.swift", newContent: "read-edited\n")
+        _ = try await store.editFile(rootID: root.id, relativePath: "Search.swift", newContent: "search-edited\n")
+        try await store.deleteFile(rootID: root.id, relativePath: "Read.swift")
+        _ = try await store.createFile(rootID: root.id, relativePath: "Read.swift", content: "replacement\n")
+        let maybeReplacementRecord = await store.file(rootID: root.id, relativePath: "Read.swift")
+        let replacementRecord = try XCTUnwrap(maybeReplacementRecord)
+        XCTAssertNotEqual(replacementRecord.id, readRecord.id)
+        _ = try await store.editFile(rootID: root.id, relativePath: "Read.swift", newContent: "replacement-edited\n")
+
+        let events = await eventTask.value
+        XCTAssertEqual(events.count, 3)
+        let readEvent = try XCTUnwrap(events.first { $0.modifiedFileIDs.contains(readRecord.id) })
+        let searchEvent = try XCTUnwrap(events.first { $0.modifiedFileIDs.contains(searchRecord.id) })
+        let replacementEvent = try XCTUnwrap(events.first { $0.modifiedFileIDs.contains(replacementRecord.id) })
+        let rootLifetimeID = try XCTUnwrap(readEvent.rootLifetimeID)
+        XCTAssertEqual(searchEvent.rootLifetimeID, rootLifetimeID)
+        XCTAssertEqual(replacementEvent.rootLifetimeID, rootLifetimeID)
+        XCTAssertEqual(readEvent.modifiedFileSourceSnapshotsByID[readRecord.id]?.text, readOriginal)
+        XCTAssertEqual(searchEvent.modifiedFileSourceSnapshotsByID[searchRecord.id]?.text, searchOriginal)
+        XCTAssertNil(replacementEvent.modifiedFileSourceSnapshotsByID[replacementRecord.id])
+        XCTAssertEqual(readEvent.modifiedFileSourceSnapshotsByID[readRecord.id]?.rootLifetimeID, rootLifetimeID)
+        XCTAssertEqual(readEvent.modifiedFileSourceSnapshotsByID[readRecord.id]?.fileID, readRecord.id)
+        XCTAssertEqual(readEvent.modifiedFileSourceSnapshotsByID[readRecord.id]?.fullPath, readRecord.standardizedFullPath)
+    }
 
     private final class LockedFileSystemPublications: @unchecked Sendable {
         private let lock = NSLock()

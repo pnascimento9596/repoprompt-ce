@@ -608,10 +608,10 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
     func testFinishDrainsAcceptedWorkAndRejectsLaterEnqueues() async {
         let gate = CoordinatorAsyncGate()
         let recorder = CoordinatorRecorder()
-        let coordinator = makeCoordinator(recorder: recorder) { _, batch in
+        let coordinator = makeCoordinator(recorder: recorder) { key, batch in
             await gate.markStartedAndWaitForRelease()
             await recorder.recordCanonical(batch)
-            return .unchanged
+            return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(mirrorKey: key.mirrorKey)
         }
         let key = contextKey()
 
@@ -630,6 +630,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(recordedBatches.count, 1)
         await Task.yield()
         XCTAssertEqual(coordinator.debugSnapshot().canonicalLaneCount, 0)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorLaneCount, 0)
         XCTAssertEqual(coordinator.debugSnapshot().closingContextCount, 0)
     }
 

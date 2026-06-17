@@ -193,7 +193,13 @@ struct MCPWindowToolDependencies {
         _ metadata: MCPServerViewModel.RequestMetadata
     ) async -> Void
     typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async -> MCPReadFileAutoSelectionCoordinator.DrainResult
-    typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (_ mode: SearchMode, _ contextLines: Int, _ reply: ToolResultDTOs.SearchResultDTO, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void
+    typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (
+        _ mode: SearchMode,
+        _ contextLines: Int,
+        _ reply: ToolResultDTOs.SearchResultDTO,
+        _ resolvedPhysicalPaths: [String],
+        _ metadata: MCPServerViewModel.RequestMetadata
+    ) async -> Void
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
     typealias ResolveCopyPreset = @MainActor @Sendable (_ selector: MCPServerViewModel.CopyPresetSelector) -> CopyPreset?

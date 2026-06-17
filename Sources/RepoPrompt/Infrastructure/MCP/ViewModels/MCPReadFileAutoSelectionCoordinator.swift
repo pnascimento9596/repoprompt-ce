@@ -969,6 +969,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 for: key,
                 workerID: workerID
             )
+            cleanupMirrorLaneIfSettled(key)
         }
         while var lane = mirrorLanes[key], let queued = lane.pending {
             lane.pending = nil
@@ -1118,6 +1119,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             waiterID: waiterID
         )
         waiter.continuation.resume(returning: .cancelled)
+        cleanupMirrorLaneIfSettled(key)
     }
 
     private func emitCanonicalDiagnostic(
@@ -1195,5 +1197,15 @@ final class MCPReadFileAutoSelectionCoordinator {
         closingContexts.remove(key)
         invalidatedContexts.remove(key)
         retiringContexts.remove(key)
+        cleanupMirrorLaneIfSettled(key.mirrorKey)
+    }
+
+    private func cleanupMirrorLaneIfSettled(_ key: TabMirrorKey) {
+        guard !mirrorWorkers.contains(key),
+              mirrorLanes[key]?.pending == nil,
+              mirrorLanes[key]?.waiters.isEmpty != false,
+              !canonicalLanes.keys.contains(where: { $0.mirrorKey == key })
+        else { return }
+        mirrorLanes.removeValue(forKey: key)
     }
 }

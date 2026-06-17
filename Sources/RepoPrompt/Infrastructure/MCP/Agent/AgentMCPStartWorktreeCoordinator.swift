@@ -170,7 +170,14 @@ struct AgentMCPStartWorktreeCoordinator {
                         standardizedPath($0.logicalRootPath) == standardizedPath(context.logicalRoot.standardizedFullPath)
                     }
                 )
-                _ = try agentModeVM.applyWorktreeBinding(binding, toSessionID: targetSessionID)
+                var desiredBindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
+                    .filter { standardizedPath($0.logicalRootPath) != standardizedPath(context.logicalRoot.standardizedFullPath) }
+                desiredBindings.append(binding)
+                _ = try await agentModeVM.transitionWorktreeBindings(
+                    desiredBindings,
+                    forSessionID: targetSessionID,
+                    intent: .initialSend
+                )
             } catch {
                 throw preparationError(error)
             }

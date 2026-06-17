@@ -268,31 +268,19 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         )
         let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "missing")
 
+        let sessionID = UUID()
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
+            sessionID: sessionID,
             bindings: [binding]
         )
-        let projection = try XCTUnwrap(materializedProjection)
-        let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
-        let physicalSelection = lookupContext.physicalizeSelection(StoredSelection(
-            selectedPaths: ["Sources/App.swift"],
-            codemapAutoEnabled: false
-        ))
-        let physicalPath = try XCTUnwrap(physicalSelection.selectedPaths.first)
-
-        let boundLookup = await store.lookupPath(physicalPath, profile: .uiAssisted, rootScope: lookupContext.rootScope)
         let visibleLookup = await store.lookupPath("Sources/App.swift", profile: .uiAssisted, rootScope: .visibleWorkspace)
-        let scopedRoots = await store.rootRefs(scope: lookupContext.rootScope)
-        let availability = await store.rootScopeAvailability(lookupContext.rootScope)
+        let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
 
-        XCTAssertEqual(physicalPath, unloadablePhysicalRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path)
-        XCTAssertNil(boundLookup)
+        XCTAssertNil(materializedProjection)
         XCTAssertNotNil(visibleLookup)
-        XCTAssertFalse(scopedRoots.contains { $0.standardizedFullPath == logicalRoot.standardizedFullPath })
-        XCTAssertEqual(
-            availability,
-            .sessionWorktreeUnavailable(missingPhysicalRootPaths: [unloadablePhysicalRoot.standardizedFileURL.path])
-        )
+        XCTAssertEqual(ownership.installedOwnerCount, 0)
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        XCTAssertEqual(ownership.rootClaimCount, 0)
     }
 
     func testMaterializerInitializesSessionWorktreeCodemapsIdempotently() async throws {

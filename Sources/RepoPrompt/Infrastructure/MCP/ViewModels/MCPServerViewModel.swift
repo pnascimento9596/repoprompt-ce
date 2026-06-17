@@ -218,6 +218,9 @@ final class MCPServerViewModel: ObservableObject {
 
     func registerAgentWorktreeBindingsProvider(_ provider: @escaping @MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState) {
         agentWorktreeBindingStateProvider = provider
+        // The async resolver is paired with the provider that registered it. A later provider
+        // replacement must not let the stale resolver overwrite that provider's hydrated state.
+        agentWorktreeBindingStateResolver = nil
     }
 
     func registerAgentWorktreeBindingsResolver(
@@ -974,9 +977,15 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return .cancelled }
             return await drainReadFileAutoSelection(metadata: metadata, requirement: requirement)
         },
-        enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, metadata in
+        enqueueFileSearchAutoSelection: { [weak self] mode, contextLines, reply, resolvedPhysicalPaths, metadata in
             guard let self else { return }
-            await enqueueFileSearchAutoSelection(mode: mode, contextLines: contextLines, reply: reply, metadata: metadata)
+            await enqueueFileSearchAutoSelection(
+                mode: mode,
+                contextLines: contextLines,
+                reply: reply,
+                resolvedPhysicalPaths: resolvedPhysicalPaths,
+                metadata: metadata
+            )
         },
         workspaceContextMessage: { [weak self] operation, path in
             guard let self else { return "Window deallocated while resolving workspace context." }
@@ -3338,6 +3347,20 @@ final class MCPServerViewModel: ObservableObject {
             readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)
         }
 
+        struct DebugFileSearchAutoSelectionTrace: Equatable {
+            let contentGroupCount: Int
+            let logicalEntryCount: Int
+            let resolvedPhysicalPathCount: Int
+            let hasCoverageIdentity: Bool
+            let accepted: Bool
+        }
+
+        private(set) var debugFileSearchAutoSelectionTrace: DebugFileSearchAutoSelectionTrace?
+
+        func fileSearchAutoSelectionTraceForTesting() -> DebugFileSearchAutoSelectionTrace? {
+            debugFileSearchAutoSelectionTrace
+        }
+
         @MainActor
         var readFileAutoSelectionMirrorGateForTesting: (() async -> Void)?
 
@@ -4031,6 +4054,7 @@ final class MCPServerViewModel: ObservableObject {
         mode: SearchMode,
         contextLines: Int,
         reply: ToolResultDTOs.SearchResultDTO,
+        resolvedPhysicalPaths: [String],
         metadata: RequestMetadata
     ) async {
         let shapeEligibility = EditFlowPerf.begin(
@@ -4108,8 +4132,26 @@ final class MCPServerViewModel: ObservableObject {
             )
             return
         }
+        let intent = MCPReadFileAutoSelectionCoordinator.Intent.slices(entries: entries)
+        let coverageIdentity = MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: intent,
+            resolvedPaths: resolvedPhysicalPaths
+        )
         let key = readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
-        let accepted = readFileAutoSelectionCoordinator.enqueue(intent: .slices(entries: entries), for: key)
+        let accepted = readFileAutoSelectionCoordinator.enqueue(
+            intent: intent,
+            coverageIdentity: coverageIdentity,
+            for: key
+        )
+        #if DEBUG
+            debugFileSearchAutoSelectionTrace = DebugFileSearchAutoSelectionTrace(
+                contentGroupCount: reply.contentMatchGroups.count,
+                logicalEntryCount: entries.count,
+                resolvedPhysicalPathCount: resolvedPhysicalPaths.count,
+                hasCoverageIdentity: coverageIdentity != nil,
+                accepted: accepted
+            )
+        #endif
         EditFlowPerf.end(
             EditFlowPerf.Stage.Search.AutoSelect.mutation,
             mutation,
