@@ -457,6 +457,24 @@ final class AgentModeViewModel: ObservableObject {
 
     // MARK: - Session Management
 
+    struct SessionIndexOwner: Equatable {
+        let workspaceID: UUID?
+        let activationEpoch: UInt64
+    }
+
+    private struct SessionIndexRefreshToken: Equatable {
+        let owner: SessionIndexOwner
+        let generation: UInt64
+    }
+
+    typealias SidebarPrioritizedIndexBuilder = @Sendable (
+        AgentSessionSidebarBuildRequest
+    ) async throws -> AgentSessionSidebarBuildResult
+    typealias SidebarIndexStreamBuilder = @Sendable (
+        AgentSessionSidebarBuildRequest,
+        Int
+    ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
+
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
             syncSidebarUIState(refresh: true, reason: .sessionList)
@@ -530,6 +548,14 @@ final class AgentModeViewModel: ObservableObject {
     weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var mcpServer: MCPServerViewModel?
     private let dataService = AgentSessionDataService.shared
+    private var sidebarPrioritizedIndexBuilder: SidebarPrioritizedIndexBuilder = { request in
+        try await AgentSessionDataService.shared.buildPrioritizedSidebarIndex(request)
+    }
+
+    private var sidebarIndexStreamBuilder: SidebarIndexStreamBuilder = { request, batchSize in
+        await AgentSessionDataService.shared.buildSidebarIndexStream(request, batchSize: batchSize)
+    }
+
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
@@ -577,6 +603,22 @@ final class AgentModeViewModel: ObservableObject {
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     private var sessionListCacheTask: Task<Void, Never>?
     private var sessionListCacheGeneration: UInt64 = 0
+    private var sessionIndexActivationEpoch: UInt64 = 0
+    private var latestSessionIndexOwner: SessionIndexOwner?
+    private var sessionIndexOwner: SessionIndexOwner?
+    private var sessionListSortDatesOwner: SessionIndexOwner?
+    private var sessionListCacheReadyOwner: SessionIndexOwner?
+    private var sidebarRestoreFrozenOrderOwner: SessionIndexOwner?
+    private var activeSessionIndexRefreshToken: SessionIndexRefreshToken?
+    private var activeSessionIndexRefreshWorkspace: WorkspaceModel?
+    private var activeSessionIndexRefreshValidTabIDs: Set<UUID> = []
+    private var activeSessionIndexRefreshBoundSessionIDByTabID: [UUID: UUID] = [:]
+    private var activeSessionIndexRefreshBaselineEntries: [UUID: AgentSessionIndexEntry] = [:]
+    private var activeSessionIndexRefreshPrioritizedEntries: [UUID: AgentSessionIndexEntry] = [:]
+    private var activeSessionIndexRefreshFullEntries: [UUID: AgentSessionIndexEntry] = [:]
+    private var activeSessionIndexRefreshHasPublishedFullBatch = false
+    private var sessionIndexLocalUpserts: [UUID: AgentSessionIndexEntry] = [:]
+    private var sessionIndexLocalRemovals: Set<UUID> = []
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
     private var workspaceSwitchBackgroundCleanupTasks: [UUID: Task<Void, Never>] = [:]
@@ -598,6 +640,7 @@ final class AgentModeViewModel: ObservableObject {
     private var isAgentModeActive = false
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
+        private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
         private var test_terminalPublicationOverride: ((
@@ -609,6 +652,7 @@ final class AgentModeViewModel: ObservableObject {
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     private static let sessionSidebarRestoreBatchSize = 32
+    private nonisolated static let sessionSidebarRestoreRetryLimit = 1
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
@@ -647,6 +691,18 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setCurrentTabIDOverride(_ tabID: UUID?) {
             test_currentTabIDOverride = tabID
+        }
+
+        func test_setSidebarAutoArchiveDependencies(
+            promptManager: PromptViewModel,
+            workspaceManager: WorkspaceManagerViewModel
+        ) {
+            self.promptManager = promptManager
+            self.workspaceManager = workspaceManager
+        }
+
+        func test_setSidebarAutoArchiveActive(_ isActive: Bool) {
+            isAgentModeActive = isActive
         }
 
         func test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(_ value: Bool) {
@@ -704,6 +760,10 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
+        func test_ensureSessionBoundToTab(_ session: TabSession) -> UUID? {
+            ensureSessionBoundToTab(session)
+        }
+
         func test_bindingResolution(sessionID: UUID) -> PersistentBindingResolution {
             persistentBindingResolution(for: sessionID)
         }
@@ -741,6 +801,85 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_shouldAcceptSidebarIndexEntry(_ entry: AgentSessionIndexEntry) -> Bool {
             shouldAcceptSidebarIndexEntry(entry)
+        }
+
+        func test_setSidebarIndexBuilders(
+            prioritized: @escaping SidebarPrioritizedIndexBuilder,
+            stream: @escaping SidebarIndexStreamBuilder
+        ) {
+            sidebarPrioritizedIndexBuilder = prioritized
+            sidebarIndexStreamBuilder = stream
+        }
+
+        func test_receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
+            receiveWorkspaceSwitchNotification(workspace)
+        }
+
+        func test_handleWorkspaceSwitch(
+            _ workspace: WorkspaceModel?,
+            owner: SessionIndexOwner
+        ) async {
+            await handleWorkspaceSwitch(workspace, owner: owner)
+        }
+
+        func test_refreshSessionListCache(for workspace: WorkspaceModel) {
+            guard let owner = sessionIndexOwner else { return }
+            refreshSessionListCache(for: workspace, owner: owner)
+        }
+
+        func test_waitForSessionListCacheRefresh() async {
+            while let task = sessionListCacheTask {
+                await task.value
+                await Task.yield()
+            }
+        }
+
+        func test_setActiveWorkspaceIDForSessionIndex(_ workspaceID: UUID?) {
+            test_activeWorkspaceIDForSessionIndexOverride = workspaceID
+        }
+
+        var test_sessionIndexOwner: SessionIndexOwner? {
+            sessionIndexOwner
+        }
+
+        var test_activeSessionIndexRefreshGeneration: UInt64? {
+            activeSessionIndexRefreshToken?.generation
+        }
+
+        var test_ownerValidatedSessionIndex: [UUID: AgentSessionIndexEntry] {
+            ownerValidatedSessionIndex
+        }
+
+        var test_ownerValidatedSessionListCacheReady: Bool {
+            ownerValidatedSessionListCacheReady
+        }
+
+        var test_ownerValidatedSidebarRestoreFrozenOrderCount: Int {
+            ownerValidatedSidebarRestoreFrozenOrderByTabID.count
+        }
+
+        func test_installSessionIndexSnapshot(
+            _ entries: [UUID: AgentSessionIndexEntry],
+            owner: SessionIndexOwner,
+            latestOwner: SessionIndexOwner,
+            activeWorkspace: WorkspaceModel
+        ) {
+            latestSessionIndexOwner = latestOwner
+            sessionIndexOwner = owner
+            sessionListSortDatesOwner = owner
+            sessionListCacheReadyOwner = owner
+            lastKnownWorkspaceSnapshot = activeWorkspace
+            test_activeWorkspaceIDForSessionIndexOverride = activeWorkspace.id
+            sessionIndex = entries
+            rebuildSessionSortDatesFromIndex()
+            sessionListCacheReady = true
+        }
+
+        func test_sessionTreeCascadePlan(
+            forComposeTabIDs tabIDs: Set<UUID>,
+            reason: PromptViewModel.ComposeTabRemovalReason
+        ) -> PromptViewModel.AgentSessionCascadePlan {
+            sessionTreeCascadePlan(forComposeTabIDs: tabIDs, reason: reason)
         }
 
         func test_flushPendingUIRefresh() {
@@ -2116,8 +2255,9 @@ final class AgentModeViewModel: ObservableObject {
         // Observe workspace changes
         workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
             guard let self else { return }
+            let owner = receiveWorkspaceSwitchNotification(workspace)
             Task { @MainActor in
-                await self.handleWorkspaceSwitch(workspace)
+                await self.handleWorkspaceSwitch(workspace, owner: owner)
             }
         }
 
@@ -2258,19 +2398,19 @@ final class AgentModeViewModel: ObservableObject {
         composeTabIDs: Set<UUID>,
         stashedTabIDs: Set<UUID>
     ) -> Set<UUID> {
+        let currentWorkspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
         let composeTabsByID = Dictionary(
-            uniqueKeysWithValues: (promptManager?.currentComposeTabs ?? workspaceManager?.activeWorkspace?.composeTabs ?? [])
+            uniqueKeysWithValues: (promptManager?.currentComposeTabs ?? currentWorkspace?.composeTabs ?? [])
                 .map { ($0.id, $0) }
         )
         let stashedTabsByID = Dictionary(
-            uniqueKeysWithValues: (workspaceManager?.activeWorkspace?.stashedTabs ?? [])
+            uniqueKeysWithValues: (currentWorkspace?.stashedTabs ?? [])
                 .map { ($0.id, $0) }
         )
         var rootSessionIDs: Set<UUID> = []
         for tabID in composeTabIDs {
             let composeTab = composeTabsByID[tabID]
-            if let sessionID = sessions[tabID]?.activeAgentSessionID
-                ?? composeTab?.activeAgentSessionID
+            if let sessionID = composeTab.flatMap({ authoritativeSessionID(for: $0) })
                 ?? preferredSidebarEntry(for: tabID, tabName: composeTab?.name)?.id
             {
                 rootSessionIDs.insert(sessionID)
@@ -2278,7 +2418,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         for stashedTabID in stashedTabIDs {
             guard let stashedTab = stashedTabsByID[stashedTabID] else { continue }
-            if let sessionID = stashedTab.tab.activeAgentSessionID
+            if let sessionID = authoritativeSessionID(for: stashedTab.tab)
                 ?? preferredSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name)?.id
             {
                 rootSessionIDs.insert(sessionID)
@@ -2288,8 +2428,19 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func sessionTreeNodes() -> [UUID: SessionTreeNode] {
-        let composeTabs = promptManager?.currentComposeTabs ?? workspaceManager?.activeWorkspace?.composeTabs ?? []
-        let stashedTabs = workspaceManager?.activeWorkspace?.stashedTabs ?? []
+        let currentWorkspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
+        let composeTabs = promptManager?.currentComposeTabs ?? currentWorkspace?.composeTabs ?? []
+        let stashedTabs = currentWorkspace?.stashedTabs ?? []
+        let validComposeTabIDs = Set(composeTabs.map(\.id))
+        let validStashedTabIDs = Set(stashedTabs.map(\.tab.id))
+        let allTabs = composeTabs + stashedTabs.map(\.tab)
+        var explicitSessionIDByTabID: [UUID: UUID] = [:]
+        var explicitTabIDBySessionID: [UUID: UUID] = [:]
+        for tab in allTabs {
+            guard let sessionID = authoritativeSessionID(for: tab) else { continue }
+            explicitSessionIDByTabID[tab.id] = sessionID
+            explicitTabIDBySessionID[sessionID] = tab.id
+        }
         var nodes: [UUID: SessionTreeNode] = [:]
 
         func merge(
@@ -2314,30 +2465,48 @@ final class AgentModeViewModel: ObservableObject {
             nodes[sessionID] = node
         }
 
-        for session in sessions.values {
+        for session in sessions.values where validComposeTabIDs.contains(session.tabID) {
             guard let sessionID = session.activeAgentSessionID else { continue }
+            if let explicitSessionID = explicitSessionIDByTabID[session.tabID],
+               explicitSessionID != sessionID
+            {
+                continue
+            }
             merge(
                 sessionID: sessionID,
-                parentSessionID: session.parentSessionID,
+                parentSessionID: session.hasLoadedPersistedState ? session.parentSessionID : nil,
                 composeTabID: session.tabID
             )
         }
-        for entry in sessionIndex.values {
+        for entry in ownerValidatedSessionIndex.values {
+            guard validComposeTabIDs.contains(entry.tabID) || validStashedTabIDs.contains(entry.tabID) else {
+                continue
+            }
+            if let explicitSessionID = explicitSessionIDByTabID[entry.tabID],
+               explicitSessionID != entry.id
+            {
+                continue
+            }
+            if let explicitTabID = explicitTabIDBySessionID[entry.id],
+               explicitTabID != entry.tabID
+            {
+                continue
+            }
             merge(
                 sessionID: entry.id,
                 parentSessionID: entry.parentSessionID,
-                composeTabID: entry.tabID
+                composeTabID: validComposeTabIDs.contains(entry.tabID) ? entry.tabID : nil
             )
         }
         for tab in composeTabs {
-            if let sessionID = tab.activeAgentSessionID
+            if let sessionID = explicitSessionIDByTabID[tab.id]
                 ?? preferredSidebarEntry(for: tab.id, tabName: tab.name)?.id
             {
                 merge(sessionID: sessionID, parentSessionID: nil, composeTabID: tab.id)
             }
         }
         for stashedTab in stashedTabs {
-            if let sessionID = stashedTab.tab.activeAgentSessionID
+            if let sessionID = explicitSessionIDByTabID[stashedTab.tab.id]
                 ?? preferredSidebarEntry(for: stashedTab.tab.id, tabName: stashedTab.tab.name)?.id
             {
                 merge(sessionID: sessionID, parentSessionID: nil, stashedTabID: stashedTab.id)
@@ -2472,8 +2641,13 @@ final class AgentModeViewModel: ObservableObject {
         else {
             return
         }
-        sessionListCacheReady = false
-        refreshSessionListCache(for: workspace)
+        guard let owner = sessionIndexOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return
+        }
+        setSessionListCacheReady(false, for: owner)
+        refreshSessionListCache(for: workspace, owner: owner)
     }
 
     /// Toggle whether agent mode UI is active (used to defer heavy session loads).
@@ -2496,9 +2670,7 @@ final class AgentModeViewModel: ObservableObject {
             stopCursorModelsSubscription()
             sidebarAutoArchiveTask?.cancel()
             sidebarAutoArchiveTask = nil
-            sessionListCacheTask?.cancel()
-            sessionListCacheTask = nil
-            sessionListCacheGeneration &+= 1
+            cancelSessionIndexRefresh(releaseFrozenOrder: true)
             return
         }
         lastProcessedTabID = nil
@@ -2511,9 +2683,13 @@ final class AgentModeViewModel: ObservableObject {
         #endif
         pendingTabIDForLoad = nil
         activeSessionLoadInProgressTabID = targetTabID
-        if let workspace = workspaceManager?.activeWorkspace {
-            sessionListCacheReady = false
-            refreshSessionListCache(for: workspace)
+        if let workspace = workspaceManager?.activeWorkspace,
+           let owner = sessionIndexOwner,
+           isSessionIndexOwnerCurrent(owner),
+           owner.workspaceID == workspace.id
+        {
+            setSessionListCacheReady(false, for: owner)
+            refreshSessionListCache(for: workspace, owner: owner)
         }
         #if DEBUG
             let tabChangeStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -2542,9 +2718,7 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
-        sessionListCacheTask?.cancel()
-        sessionListCacheTask = nil
-        sessionListCacheGeneration &+= 1
+        cancelSessionIndexRefresh(releaseFrozenOrder: true)
         let tabIDs = Array(sessions.keys)
         await withTaskGroup(of: Void.self) { group in
             for tabID in tabIDs {
@@ -2677,6 +2851,10 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    func authoritativeSessionID(for tab: ComposeTabState) -> UUID? {
+        sessions[tab.id]?.activeAgentSessionID ?? tab.activeAgentSessionID
+    }
+
     func explicitActiveSessionID(for tabID: UUID) -> UUID? {
         if let sessionID = sessions[tabID]?.activeAgentSessionID {
             return sessionID
@@ -2770,7 +2948,7 @@ final class AgentModeViewModel: ObservableObject {
         newSession.selectedReasoningEffortRaw = selectedReasoningEffortRaw
         newSession.autoEditEnabled = ApplyEditsApprovalStore.globalDefaultAutoEditEnabled()
         if let sessionID = explicitActiveSessionID(for: tabID),
-           let indexEntry = sessionIndex[sessionID]
+           let indexEntry = ownerValidatedSessionIndex[sessionID]
         {
             seedUnhydratedSession(newSession, from: indexEntry)
         }
@@ -2918,11 +3096,11 @@ final class AgentModeViewModel: ObservableObject {
     private func seedSortMetadataForUnhydratedSession(_ session: TabSession, tabID: UUID) {
         guard session.activeAgentSessionID != nil, !session.hasLoadedPersistedState else { return }
         if let sessionID = session.activeAgentSessionID,
-           let indexEntry = sessionIndex[sessionID]
+           let indexEntry = ownerValidatedSessionIndex[sessionID]
         {
             seedUnhydratedSession(session, from: indexEntry)
         }
-        if let cachedLastUserMessageAt = sessionListSortDates[tabID] {
+        if let cachedLastUserMessageAt = ownerValidatedSessionListSortDates[tabID] {
             session.lastUserMessageAt = cachedLastUserMessageAt
         }
         if let tabLastModified = promptManager?.currentComposeTabs.first(where: { $0.id == tabID })?.lastModified
@@ -3087,6 +3265,33 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    private func handleSidebarRefreshBindingMutation(
+        tabID: UUID,
+        sessionID: UUID?
+    ) {
+        guard let token = activeSessionIndexRefreshToken,
+              isSessionIndexOwnerCurrent(token.owner),
+              activeSessionIndexRefreshValidTabIDs.contains(tabID)
+        else {
+            return
+        }
+        let expectedSessionID = activeSessionIndexRefreshBoundSessionIDByTabID[tabID]
+        guard expectedSessionID != sessionID else { return }
+
+        let workspace = currentWorkspaceSnapshot(for: token.owner)
+            ?? activeSessionIndexRefreshWorkspace
+        cancelSessionIndexRefresh(releaseFrozenOrder: false, owner: token.owner)
+        setSessionListCacheReady(false, for: token.owner)
+        guard let workspace,
+              workspace.id == token.owner.workspaceID,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
+            releaseSidebarRestoreFrozenOrder(for: token.owner)
+            return
+        }
+        refreshSessionListCache(for: workspace, owner: token.owner)
+    }
+
     /// Single mutation path for the runtime binding between a compose tab and a
     /// persistent Agent session. Workspace metadata mirrors this identity but is
     /// never used as a generation source.
@@ -3103,7 +3308,13 @@ final class AgentModeViewModel: ObservableObject {
 
         let previousSessionID = session.activeAgentSessionID
         if updateWorkspaceMetadata, let workspaceManager {
-            let currentWorkspaceSessionID = workspaceManager.activeAgentSessionID(forTabID: session.tabID)
+            let workspaceID = workspaceManager.activeWorkspaceID
+                ?? sessionIndexOwner?.workspaceID
+                ?? lastKnownWorkspaceSnapshot?.id
+            let currentWorkspaceSessionID = workspaceManager.activeAgentSessionID(
+                forTabID: session.tabID,
+                inWorkspaceID: workspaceID
+            )
             guard currentWorkspaceSessionID == previousSessionID else {
                 #if DEBUG
                     AgentModePerfDiagnostics.event(
@@ -3118,11 +3329,14 @@ final class AgentModeViewModel: ObservableObject {
                 #endif
                 return nil
             }
-            _ = workspaceManager.compareAndSetActiveAgentSessionID(
+            guard workspaceManager.compareAndSetActiveAgentSessionID(
                 expected: previousSessionID,
                 replacement: sessionID,
-                forTabID: session.tabID
-            )
+                forTabID: session.tabID,
+                inWorkspaceID: workspaceID
+            ) else {
+                return nil
+            }
         }
 
         if invalidateAsyncWork {
@@ -3134,10 +3348,11 @@ final class AgentModeViewModel: ObservableObject {
             AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0)
         }
         session.installPersistentSessionBinding(binding)
+        handleSidebarRefreshBindingMutation(
+            tabID: session.tabID,
+            sessionID: sessionID
+        )
 
-        sessionListCacheGeneration &+= 1
-        sessionListCacheTask?.cancel()
-        sessionListCacheTask = nil
         if session.tabID == currentTabID {
             publishLoadingTranscriptPresentation(tabID: session.tabID)
         }
@@ -3158,18 +3373,17 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Single creation point for attaching an Agent session identity to a compose tab.
     @discardableResult
-    private func ensureSessionBoundToTab(_ session: TabSession) -> UUID {
+    private func ensureSessionBoundToTab(_ session: TabSession) -> UUID? {
         if let existing = session.activeAgentSessionID {
             return existing
         }
         let created = UUID()
-        _ = installPersistentSessionBinding(
+        return installPersistentSessionBinding(
             sessionID: created,
             on: session,
             updateWorkspaceMetadata: true,
             invalidateAsyncWork: true
-        )
-        return created
+        )?.sessionID
     }
 
     private func persistentBindingResolution(for sessionID: UUID) -> PersistentBindingResolution {
@@ -3231,7 +3445,7 @@ final class AgentModeViewModel: ObservableObject {
         if let tabID = authoritativeCandidates.first {
             return .unique(tabID: tabID)
         }
-        if let indexedTabID = sessionIndex[sessionID]?.tabID,
+        if let indexedTabID = ownerValidatedSessionIndex[sessionID]?.tabID,
            workspaceManager?.composeTab(with: indexedTabID) != nil,
            liveClaims[indexedTabID] == nil,
            workspaceClaims[indexedTabID]?.isEmpty != false
@@ -3768,8 +3982,7 @@ final class AgentModeViewModel: ObservableObject {
             confidence: session.codexContextUsage?.lastTotalTokens != nil ? .bestEffort : .inferred,
             compactedAt: session.contextCompactedAt
         )
-        sessionIndex[payload.restoredIndexEntry.id] = payload.restoredIndexEntry
-        rebuildSessionSortDatesFromIndex()
+        applyLocalSessionIndexUpsert(payload.restoredIndexEntry)
 
         if payload.needsReloadMigrationSave {
             session.isDirty = true
@@ -4664,7 +4877,7 @@ final class AgentModeViewModel: ObservableObject {
         let resolvedSessionID = context.sessionID
         let resolvedSessionName: String? = {
             if let name = workspaceManager?.composeTabName(with: session.tabID) { return name }
-            if let name = sessionIndex[resolvedSessionID]?.name { return name }
+            if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name { return name }
             return "Agent Session"
         }()
         let failureReason = AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: resolvedStatusText)
@@ -4937,7 +5150,7 @@ final class AgentModeViewModel: ObservableObject {
             return parsedUUID
         }
         // Check session index
-        if sessionIndex[parsedUUID] != nil {
+        if ownerValidatedSessionIndex[parsedUUID] != nil {
             return parsedUUID
         }
         // Fall back to persisted
@@ -4993,8 +5206,11 @@ final class AgentModeViewModel: ObservableObject {
         to session: TabSession,
         inheritWorktreeBindings: Bool = true
     ) {
-        guard let parentSessionID else { return }
-        let sessionID = ensureSessionBoundToTab(session)
+        guard let parentSessionID,
+              let sessionID = ensureSessionBoundToTab(session)
+        else {
+            return
+        }
         let assignedParent: Bool
         let effectiveParentSessionID: UUID
         if let existingParentSessionID = session.parentSessionID {
@@ -5512,22 +5728,22 @@ final class AgentModeViewModel: ObservableObject {
 
     func updateWorktreeBindingSummariesInIndex(for session: TabSession) {
         guard let sessionID = session.activeAgentSessionID,
-              var entry = sessionIndex[sessionID]
+              var entry = ownerValidatedSessionIndex[sessionID]
         else {
             return
         }
         entry.worktreeBindingSummaries = session.worktreeBindings.worktreeBindingSummaries
-        sessionIndex[sessionID] = entry
+        applyLocalSessionIndexUpsert(entry)
     }
 
     func updateWorktreeMergeSummariesInIndex(for session: TabSession) {
         guard let sessionID = session.activeAgentSessionID,
-              var entry = sessionIndex[sessionID]
+              var entry = ownerValidatedSessionIndex[sessionID]
         else {
             return
         }
         entry.activeWorktreeMergeSummaries = session.worktreeMergeOperations.activeWorktreeMergeSummaries
-        sessionIndex[sessionID] = entry
+        applyLocalSessionIndexUpsert(entry)
     }
 
     private func repairSpawnParentSessionIndex(
@@ -5535,7 +5751,7 @@ final class AgentModeViewModel: ObservableObject {
         sessionID: UUID,
         parentSessionID: UUID
     ) {
-        if let existingEntry = sessionIndex[sessionID] {
+        if let existingEntry = ownerValidatedSessionIndex[sessionID] {
             let repairedEntry = AgentSessionIndexEntry(
                 id: existingEntry.id,
                 tabID: session.tabID,
@@ -5555,8 +5771,7 @@ final class AgentModeViewModel: ObservableObject {
                 activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
             )
             guard repairedEntry != existingEntry else { return }
-            sessionIndex[sessionID] = repairedEntry
-            rebuildSessionSortDatesFromIndex()
+            applyLocalSessionIndexUpsert(repairedEntry)
             return
         }
         upsertSessionIndex(
@@ -5585,7 +5800,7 @@ final class AgentModeViewModel: ObservableObject {
         inheritWorktreeBindings: Bool = false
     ) async throws -> MCPSessionTarget {
         if let sessionID {
-            let indexedParentSessionID = sessionIndex[sessionID]?.parentSessionID
+            let indexedParentSessionID = ownerValidatedSessionIndex[sessionID]?.parentSessionID
             let existingTabID: UUID? = switch persistentBindingResolution(for: sessionID) {
             case let .unique(tabID): tabID
             case .notFound: nil
@@ -5624,7 +5839,15 @@ final class AgentModeViewModel: ObservableObject {
                 throw MCPError.invalidParams("Tab '\(tabID.uuidString)' was not found.")
             }
             let hydrated = await ensureSessionReady(tabID: tabID)
-            let resolvedSessionID = createIfNeeded ? ensureSessionBoundToTab(hydrated) : hydrated.activeAgentSessionID
+            let resolvedSessionID: UUID?
+            if createIfNeeded {
+                guard let installedSessionID = ensureSessionBoundToTab(hydrated) else {
+                    throw MCPError.invalidParams("The target tab could not be bound to an agent session.")
+                }
+                resolvedSessionID = installedSessionID
+            } else {
+                resolvedSessionID = hydrated.activeAgentSessionID
+            }
             if parentSessionID != nil {
                 applySpawnParentSessionID(
                     parentSessionID,
@@ -5640,7 +5863,9 @@ final class AgentModeViewModel: ObservableObject {
         }
         let createdTabID = try await mcpCreateBackgroundSessionTab(name: sessionName)
         let hydrated = await ensureSessionReady(tabID: createdTabID)
-        let createdSessionID = ensureSessionBoundToTab(hydrated)
+        guard let createdSessionID = ensureSessionBoundToTab(hydrated) else {
+            throw MCPError.invalidParams("The new tab could not be bound to an agent session.")
+        }
         applySpawnParentSessionID(
             parentSessionID,
             to: hydrated,
@@ -5668,7 +5893,7 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let resolvedSessionID = sessionID
-        let indexedParentSessionID = sessionIndex[resolvedSessionID]?.parentSessionID
+        let indexedParentSessionID = ownerValidatedSessionIndex[resolvedSessionID]?.parentSessionID
         applySpawnParentSessionID(
             hydrated.parentSessionID ?? indexedParentSessionID ?? parentSessionID,
             to: hydrated,
@@ -5897,7 +6122,7 @@ final class AgentModeViewModel: ObservableObject {
                 sessionID: sessionID,
                 cleanupSessionStore: true
             )
-            if let entry = sessionIndex[sessionID], entry.tabID == target.tabID {
+            if let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == target.tabID {
                 removeSessionIndex(sessionID: sessionID)
             }
         }
@@ -8873,7 +9098,7 @@ final class AgentModeViewModel: ObservableObject {
             return AgentSession.validatedName(composeName)
         }
         if let sessionID = boundSessionID(for: tabID),
-           let entry = sessionIndex[sessionID]
+           let entry = ownerValidatedSessionIndex[sessionID]
         {
             return AgentSession.validatedName(entry.name)
         }
@@ -8924,7 +9149,7 @@ final class AgentModeViewModel: ObservableObject {
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
     ) {
-        sessionIndex[sessionID] = AgentSessionIndexEntry(
+        applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
             id: sessionID,
             tabID: tabID,
             name: name,
@@ -8941,8 +9166,7 @@ final class AgentModeViewModel: ObservableObject {
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
-        )
-        rebuildSessionSortDatesFromIndex()
+        ))
     }
 
     private func cleanupMCPRunRoutingIfPresent(
@@ -8958,16 +9182,14 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func removeSessionIndex(sessionID: UUID) {
-        sessionIndex.removeValue(forKey: sessionID)
-        rebuildSessionSortDatesFromIndex()
+        applyLocalSessionIndexRemoval(sessionID: sessionID)
     }
 
     private func removeSessionIndex(forTabID tabID: UUID) {
-        let ids = sessionIndex.values.filter { $0.tabID == tabID }.map(\.id)
+        let ids = ownerValidatedSessionIndex.values.filter { $0.tabID == tabID }.map(\.id)
         for id in ids {
-            sessionIndex.removeValue(forKey: id)
+            applyLocalSessionIndexRemoval(sessionID: id)
         }
-        rebuildSessionSortDatesFromIndex()
     }
 
     private func rebuildSessionSortDatesFromIndex() {
@@ -8991,6 +9213,7 @@ final class AgentModeViewModel: ObservableObject {
                 sortDates[tabID] = date
             }
         }
+        sessionListSortDatesOwner = sessionIndexOwner
         if sessionListSortDates != sortDates {
             sessionListSortDates = sortDates
         }
@@ -9004,6 +9227,234 @@ final class AgentModeViewModel: ObservableObject {
                 ]
             )
         #endif
+    }
+
+    private var activeWorkspaceIDForSessionIndexOwnership: UUID? {
+        #if DEBUG
+            if let test_activeWorkspaceIDForSessionIndexOverride {
+                return test_activeWorkspaceIDForSessionIndexOverride
+            }
+        #endif
+        return workspaceManager?.activeWorkspaceID ?? lastKnownWorkspaceSnapshot?.id
+    }
+
+    private func receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
+        sessionIndexActivationEpoch &+= 1
+        let owner = SessionIndexOwner(
+            workspaceID: workspace?.id,
+            activationEpoch: sessionIndexActivationEpoch
+        )
+        latestSessionIndexOwner = owner
+        return owner
+    }
+
+    private func isWorkspaceActivationCurrent(
+        _ owner: SessionIndexOwner,
+        workspace: WorkspaceModel?
+    ) -> Bool {
+        guard latestSessionIndexOwner == owner,
+              owner.workspaceID == workspace?.id
+        else {
+            return false
+        }
+        if let workspaceManager {
+            return workspaceManager.activeWorkspaceID == owner.workspaceID
+        }
+        #if DEBUG
+            if let test_activeWorkspaceIDForSessionIndexOverride {
+                return test_activeWorkspaceIDForSessionIndexOverride == owner.workspaceID
+            }
+        #endif
+        return true
+    }
+
+    private func isSessionIndexOwnerCurrent(_ owner: SessionIndexOwner) -> Bool {
+        guard latestSessionIndexOwner == owner,
+              sessionIndexOwner == owner
+        else {
+            return false
+        }
+        return activeWorkspaceIDForSessionIndexOwnership == owner.workspaceID
+    }
+
+    var ownerValidatedSessionIndex: [UUID: AgentSessionIndexEntry] {
+        guard let owner = sessionIndexOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return [:]
+        }
+        return sessionIndex
+    }
+
+    var ownerValidatedSessionListSortDates: [UUID: Date] {
+        guard let owner = sessionListSortDatesOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return [:]
+        }
+        return sessionListSortDates
+    }
+
+    var ownerValidatedSessionListCacheReady: Bool {
+        guard let owner = sessionListCacheReadyOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return false
+        }
+        return sessionListCacheReady
+    }
+
+    func sidebarAutoArchiveOwner(workspaceID: UUID) -> SessionIndexOwner? {
+        guard sessionListCacheReady,
+              let owner = sessionListCacheReadyOwner,
+              owner.workspaceID == workspaceID,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return nil
+        }
+        return owner
+    }
+
+    var ownerValidatedSidebarRestoreFrozenOrderByTabID: [UUID: Int] {
+        guard let owner = sidebarRestoreFrozenOrderOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return [:]
+        }
+        return sidebarRestoreFrozenOrderByTabID
+    }
+
+    private func releaseSidebarRestoreFrozenOrder(for owner: SessionIndexOwner) {
+        guard sidebarRestoreFrozenOrderOwner == owner else { return }
+        sidebarRestoreFrozenOrderByTabID.removeAll()
+        sidebarRestoreFrozenOrderOwner = nil
+    }
+
+    private func setSessionListCacheReady(_ ready: Bool, for owner: SessionIndexOwner) {
+        guard isSessionIndexOwnerCurrent(owner) else { return }
+        sessionListCacheReadyOwner = owner
+        sessionListCacheReady = ready
+    }
+
+    private func cancelSessionIndexRefresh(
+        releaseFrozenOrder: Bool,
+        owner: SessionIndexOwner? = nil
+    ) {
+        let refreshOwner = owner ?? activeSessionIndexRefreshToken?.owner
+        if let token = activeSessionIndexRefreshToken,
+           isSessionIndexOwnerCurrent(token.owner)
+        {
+            publishSessionIndexReplacement(activeSessionIndexRefreshBaselineEntries, token: token)
+        }
+        sessionListCacheTask?.cancel()
+        sessionListCacheTask = nil
+        activeSessionIndexRefreshToken = nil
+        activeSessionIndexRefreshWorkspace = nil
+        activeSessionIndexRefreshValidTabIDs.removeAll()
+        activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
+        activeSessionIndexRefreshBaselineEntries.removeAll()
+        activeSessionIndexRefreshPrioritizedEntries.removeAll()
+        activeSessionIndexRefreshFullEntries.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        if releaseFrozenOrder, let refreshOwner {
+            releaseSidebarRestoreFrozenOrder(for: refreshOwner)
+        }
+    }
+
+    private func installSessionIndexOwner(
+        _ owner: SessionIndexOwner,
+        workspace: WorkspaceModel?
+    ) {
+        guard isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
+        cancelSessionIndexRefresh(releaseFrozenOrder: false)
+        sessionIndexOwner = owner
+        sessionListSortDatesOwner = owner
+        sessionListCacheReadyOwner = owner
+        sessionIndexLocalUpserts.removeAll()
+        sessionIndexLocalRemovals.removeAll()
+        sessionIndex.removeAll()
+        sessionListSortDates.removeAll()
+        sessionListCacheReady = false
+        if let workspace {
+            sidebarRestoreFrozenOrderByTabID = makeSidebarRestoreFrozenOrder(for: workspace)
+            sidebarRestoreFrozenOrderOwner = owner
+        } else {
+            sidebarRestoreFrozenOrderByTabID.removeAll()
+            sidebarRestoreFrozenOrderOwner = nil
+        }
+        lastSidebarContentFingerprint = nil
+    }
+
+    private func sessionIndexEntriesApplyingLocalOverlay(
+        to base: [UUID: AgentSessionIndexEntry]
+    ) -> [UUID: AgentSessionIndexEntry] {
+        var result = base
+        for (sessionID, entry) in sessionIndexLocalUpserts {
+            result[sessionID] = entry
+        }
+        for sessionID in sessionIndexLocalRemovals {
+            result.removeValue(forKey: sessionID)
+        }
+        return result
+    }
+
+    private func publishSessionIndexReplacement(
+        _ base: [UUID: AgentSessionIndexEntry],
+        token: SessionIndexRefreshToken
+    ) {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
+            return
+        }
+        let replacement = sessionIndexEntriesApplyingLocalOverlay(to: base)
+        if sessionIndex != replacement {
+            sessionIndex = replacement
+        }
+        rebuildSessionSortDatesFromIndex()
+    }
+
+    private func applyLocalSessionIndexUpsert(_ entry: AgentSessionIndexEntry) {
+        guard let owner = sessionIndexOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return
+        }
+        sessionIndexLocalRemovals.remove(entry.id)
+        sessionIndexLocalUpserts[entry.id] = entry
+        var updated = sessionIndex
+        updated[entry.id] = entry
+        if sessionIndex != updated {
+            sessionIndex = updated
+        }
+        rebuildSessionSortDatesFromIndex()
+    }
+
+    private func applyLocalSessionIndexRemoval(sessionID: UUID) {
+        guard let owner = sessionIndexOwner,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return
+        }
+        sessionIndexLocalUpserts.removeValue(forKey: sessionID)
+        sessionIndexLocalRemovals.insert(sessionID)
+        if sessionIndex.removeValue(forKey: sessionID) != nil {
+            rebuildSessionSortDatesFromIndex()
+        }
+    }
+
+    private func currentWorkspaceSnapshot(for owner: SessionIndexOwner) -> WorkspaceModel? {
+        if let workspace = workspaceManager?.activeWorkspace,
+           workspace.id == owner.workspaceID
+        {
+            return workspace
+        }
+        if let workspace = lastKnownWorkspaceSnapshot,
+           workspace.id == owner.workspaceID
+        {
+            return workspace
+        }
+        return nil
     }
 
     // MARK: - Workspace Handling
@@ -9133,10 +9584,22 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
+        let owner = receiveWorkspaceSwitchNotification(workspace)
+        await handleWorkspaceSwitch(workspace, owner: owner)
+    }
+
+    private func handleWorkspaceSwitch(
+        _ workspace: WorkspaceModel?,
+        owner: SessionIndexOwner
+    ) async {
+        guard isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
+        lastKnownWorkspaceSnapshot = workspace
+        installSessionIndexOwner(owner, workspace: workspace)
+        guard isSessionIndexOwnerCurrent(owner) else { return }
         #if DEBUG
             let workspaceSwitchStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let workspaceSwitchInitialSessions = sessions.count
-            let workspaceSwitchInitialActiveTabID = promptManager?.activeComposeTabID ?? workspace?.activeComposeTabID
+            let workspaceSwitchInitialActiveTabID = workspace?.activeComposeTabID
             WorkspaceRestorePerfLog.event(
                 "agentMode.workspaceSwitch.begin",
                 fields: [
@@ -9152,8 +9615,7 @@ final class AgentModeViewModel: ObservableObject {
         if workspace?.isSystemWorkspace == false {
             finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: false)
         }
-        lastKnownWorkspaceSnapshot = workspace
-        let initialActiveTabID = promptManager?.activeComposeTabID ?? workspace?.activeComposeTabID
+        let initialActiveTabID = workspace?.activeComposeTabID
         workspaceSwitchInFlight = workspace != nil
         activeSessionLoadInProgressTabID = initialActiveTabID
         if workspace != nil {
@@ -9169,9 +9631,6 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
-        sessionListCacheTask?.cancel()
-        sessionListCacheTask = nil
-        sessionListCacheGeneration &+= 1
 
         #if DEBUG
             let teardownStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -9207,10 +9666,6 @@ final class AgentModeViewModel: ObservableObject {
         tabsWithActiveAgentRun.removeAll()
         mcpControlledTabIDs.removeAll()
         tabDraftText.removeAll()
-        sessionIndex.removeAll()
-        sessionListSortDates.removeAll()
-        sessionListCacheReady = false
-        lastSidebarContentFingerprint = nil
         sidebarObservedRunStateByTabID.removeAll()
         await applyEditsApprovalStore.cleanupWindowScopes(
             windowID: windowID,
@@ -9220,6 +9675,11 @@ final class AgentModeViewModel: ObservableObject {
             targets: cleanupTargets,
             reason: "workspace_switch"
         )
+        guard isWorkspaceActivationCurrent(owner, workspace: workspace),
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return
+        }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "agentMode.workspaceSwitch.clearState",
@@ -9233,7 +9693,6 @@ final class AgentModeViewModel: ObservableObject {
         scheduleSkillCatalogRefresh()
 
         guard let workspace else {
-            sidebarRestoreFrozenOrderByTabID.removeAll()
             activeSessionLoadInProgressTabID = nil
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
@@ -9248,20 +9707,19 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             return
         }
-        sidebarRestoreFrozenOrderByTabID = makeSidebarRestoreFrozenOrder(for: workspace)
-        refreshSessionListCache(for: workspace)
+        refreshSessionListCache(for: workspace, owner: owner)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "agentMode.workspaceSwitch.refreshScheduled",
                 fields: [
                     "windowID": "\(windowID)",
                     "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
-                    "activeTabID": WorkspaceRestorePerfLog.shortID(promptManager?.activeComposeTabID ?? workspace.activeComposeTabID),
+                    "activeTabID": WorkspaceRestorePerfLog.shortID(workspace.activeComposeTabID),
                     "frozenOrderTabs": "\(sidebarRestoreFrozenOrderByTabID.count)"
                 ]
             )
         #endif
-        let resolvedActiveTabID = promptManager?.activeComposeTabID ?? workspace.activeComposeTabID
+        let resolvedActiveTabID = workspace.activeComposeTabID
         if let resolvedActiveTabID {
             activeSessionLoadInProgressTabID = resolvedActiveTabID
             onTabChanged(resolvedActiveTabID, allowDuringWorkspaceSwitch: true)
@@ -9325,6 +9783,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private func invalidateSidebarRestoreOrdering() {
         sidebarRestoreFrozenOrderByTabID.removeAll()
+        sidebarRestoreFrozenOrderOwner = nil
     }
 
     nonisolated static func shouldSkipSessionListCacheRefresh(
@@ -9334,12 +9793,14 @@ final class AgentModeViewModel: ObservableObject {
         workspace.isSystemWorkspace && isInitialSystemWorkspaceRefreshDeferred
     }
 
-    private func refreshSessionListCache(for workspace: WorkspaceModel) {
-        if Self.shouldSkipSessionListCacheRefresh(
-            for: workspace,
-            isInitialSystemWorkspaceRefreshDeferred: initialSystemWorkspaceSessionListRefreshDeferralReason != nil
-        ) {
-            completeSkippedSessionListCacheRefresh(for: workspace, reason: initialSystemWorkspaceSessionListRefreshDeferralReason ?? "initialSystemWorkspaceDeferred")
+    private func refreshSessionListCache(
+        for workspace: WorkspaceModel,
+        owner explicitOwner: SessionIndexOwner? = nil
+    ) {
+        guard let owner = explicitOwner ?? sessionIndexOwner,
+              owner.workspaceID == workspace.id,
+              isSessionIndexOwnerCurrent(owner)
+        else {
             return
         }
 
@@ -9352,9 +9813,6 @@ final class AgentModeViewModel: ObservableObject {
         for tab in persistedTabs {
             tabNameByID[tab.id] = tab.name
         }
-        if let liveTabNames = workspaceManager?.composeTabNameLookup(forWorkspaceID: workspace.id) {
-            tabNameByID.merge(liveTabNames) { _, live in live }
-        }
         let validTabIDs = Set(tabNameByID.keys)
         var boundSessionIDByTabID: [UUID: UUID] = [:]
         boundSessionIDByTabID.reserveCapacity(persistedTabs.count)
@@ -9363,7 +9821,14 @@ final class AgentModeViewModel: ObservableObject {
                 boundSessionIDByTabID[tab.id] = activeAgentSessionID
             }
         }
-        let prioritizedTabID = promptManager?.activeComposeTabID ?? workspace.activeComposeTabID ?? activeSessionLoadInProgressTabID
+        for session in sessions.values where validTabIDs.contains(session.tabID) {
+            if let sessionID = session.activeAgentSessionID {
+                boundSessionIDByTabID[session.tabID] = sessionID
+            } else {
+                boundSessionIDByTabID.removeValue(forKey: session.tabID)
+            }
+        }
+        let prioritizedTabID = workspace.activeComposeTabID
         let fullRequest = AgentSessionSidebarBuildRequest(
             workspace: workspace,
             tabNameByID: tabNameByID,
@@ -9377,26 +9842,49 @@ final class AgentModeViewModel: ObservableObject {
                 fields: [
                     "windowID": "\(windowID)",
                     "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                    "activationEpoch": "\(owner.activationEpoch)",
                     "duration": requestBuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
                     "persistedTabs": "\(persistedTabs.count)",
                     "validTabs": "\(validTabIDs.count)",
                     "boundSessions": "\(boundSessionIDByTabID.count)",
-                    "frozenOrderTabs": "\(sidebarRestoreFrozenOrderByTabID.count)",
+                    "frozenOrderTabs": "\(ownerValidatedSidebarRestoreFrozenOrderByTabID.count)",
                     "hasPrioritizedTab": "\(prioritizedTabID != nil)",
                     "prioritizedTabID": WorkspaceRestorePerfLog.shortID(prioritizedTabID),
                     "isSystemWorkspace": "\(workspace.isSystemWorkspace)",
                     "deferralArmed": "\(initialSystemWorkspaceSessionListRefreshDeferralReason != nil)"
                 ]
             )
-            WorkspaceRestorePerfLog.log(
-                "agentSessionIndex.refreshStart windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) persistedTabs=\(persistedTabs.count) validTabs=\(validTabIDs.count) boundSessions=\(boundSessionIDByTabID.count) prioritizedTabID=\(prioritizedTabID?.uuidString.prefix(8).description ?? "nil")"
-            )
         #endif
-        sessionListCacheGeneration &+= 1
-        let generation = sessionListCacheGeneration
-        sessionListCacheTask?.cancel()
 
-        sessionListCacheTask = Task.detached(priority: .userInitiated) { [weak self, dataService] in
+        cancelSessionIndexRefresh(releaseFrozenOrder: false, owner: owner)
+        sessionListCacheGeneration &+= 1
+        let token = SessionIndexRefreshToken(owner: owner, generation: sessionListCacheGeneration)
+        activeSessionIndexRefreshToken = token
+        activeSessionIndexRefreshWorkspace = workspace
+        activeSessionIndexRefreshValidTabIDs = validTabIDs
+        activeSessionIndexRefreshBoundSessionIDByTabID = boundSessionIDByTabID
+        activeSessionIndexRefreshBaselineEntries = sessionIndex
+        activeSessionIndexRefreshPrioritizedEntries.removeAll()
+        activeSessionIndexRefreshFullEntries.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        setSessionListCacheReady(false, for: owner)
+
+        if Self.shouldSkipSessionListCacheRefresh(
+            for: workspace,
+            isInitialSystemWorkspaceRefreshDeferred: initialSystemWorkspaceSessionListRefreshDeferralReason != nil
+        ) {
+            completeSkippedSessionListCacheRefresh(
+                for: workspace,
+                token: token,
+                reason: initialSystemWorkspaceSessionListRefreshDeferralReason ?? "initialSystemWorkspaceDeferred"
+            )
+            return
+        }
+
+        let prioritizedBuilder = sidebarPrioritizedIndexBuilder
+        let streamBuilder = sidebarIndexStreamBuilder
+        let restoreBatchSize = Self.sessionSidebarRestoreBatchSize
+        sessionListCacheTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             #if DEBUG
                 let taskStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -9412,7 +9900,7 @@ final class AgentModeViewModel: ObservableObject {
                     #if DEBUG
                         let prioritizedStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
                     #endif
-                    let prioritizedResult = try await dataService.buildPrioritizedSidebarIndex(
+                    let prioritizedResult = try await prioritizedBuilder(
                         AgentSessionSidebarBuildRequest(
                             workspace: workspace,
                             tabNameByID: [prioritizedTabID: prioritizedTabName],
@@ -9423,9 +9911,6 @@ final class AgentModeViewModel: ObservableObject {
                     #if DEBUG
                         if let prioritizedStartMS {
                             prioritizedDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prioritizedStartMS)
-                            WorkspaceRestorePerfLog.log(
-                                "agentSessionIndex.prioritizedBuilt mode=targeted windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) generation=\(generation) entries=\(prioritizedResult.entriesBySessionID.count) preferredTabs=\(prioritizedResult.preferredSessionIDByTabID.count) duration=\(WorkspaceRestorePerfLog.formatMS(prioritizedDurationMS ?? 0))"
-                            )
                         }
                     #endif
                     guard !Task.isCancelled else { return }
@@ -9434,69 +9919,108 @@ final class AgentModeViewModel: ObservableObject {
                             entriesBySessionID: prioritizedResult.entriesBySessionID,
                             preferredSessionIDByTabID: prioritizedResult.preferredSessionIDByTabID
                         ),
-                        generation: generation
+                        token: token,
+                        isFullRefresh: false
                     )
                 }
                 await Task.yield()
                 guard await notePrioritizedActiveSessionRestoreStatus(
-                    generation: generation,
+                    token: token,
                     prioritizedTabID: prioritizedTabID
                 ) else {
                     return
                 }
 
-                #if DEBUG
-                    let streamStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-                #endif
-                let stream = await dataService.buildSidebarIndexStream(
-                    fullRequest,
-                    batchSize: Self.sessionSidebarRestoreBatchSize
-                )
-                for try await batch in stream {
-                    #if DEBUG
-                        streamBatchCount += 1
-                        streamEntryCount += batch.entriesBySessionID.count
-                    #endif
-                    guard !Task.isCancelled else { return }
-                    await applySidebarIndexBatch(batch, generation: generation)
-                }
-                guard !Task.isCancelled else { return }
-                #if DEBUG
-                    if let streamStartMS {
-                        streamDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: streamStartMS)
+                var streamRetryCount = 0
+                while true {
+                    do {
+                        #if DEBUG
+                            let streamStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                        #endif
+                        let stream = await streamBuilder(fullRequest, restoreBatchSize)
+                        for try await batch in stream {
+                            #if DEBUG
+                                streamBatchCount += 1
+                                streamEntryCount += batch.entriesBySessionID.count
+                            #endif
+                            guard !Task.isCancelled else { return }
+                            await applySidebarIndexBatch(
+                                batch,
+                                token: token,
+                                isFullRefresh: true
+                            )
+                        }
+                        guard !Task.isCancelled else { return }
+                        #if DEBUG
+                            if let streamStartMS {
+                                streamDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: streamStartMS)
+                            }
+                        #endif
+                        break
+                    } catch {
+                        guard !Task.isCancelled else { return }
+                        guard streamRetryCount < Self.sessionSidebarRestoreRetryLimit,
+                              await prepareSidebarIndexStreamRetry(token: token)
+                        else {
+                            throw error
+                        }
+                        streamRetryCount += 1
+                        #if DEBUG
+                            WorkspaceRestorePerfLog.log(
+                                "agentSessionIndex.refreshRetry windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) retry=\(streamRetryCount) error=\(String(describing: error))"
+                            )
+                        #endif
+                        await Task.yield()
                     }
+                }
+                #if DEBUG
                     if let taskStartMS {
                         WorkspaceRestorePerfLog.log(
-                            "agentSessionIndex.refreshComplete windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) generation=\(generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) prioritized=\(prioritizedDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun") stream=\(streamDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured") total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS))"
+                            "agentSessionIndex.refreshComplete windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) retries=\(streamRetryCount) prioritized=\(prioritizedDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun") stream=\(streamDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured") total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS))"
                         )
                     }
                 #endif
-                await applySidebarIndexCompletion(generation: generation)
+                await applySidebarIndexCompletion(token: token)
             } catch {
                 guard !Task.isCancelled else { return }
                 #if DEBUG
                     if let taskStartMS {
                         WorkspaceRestorePerfLog.log(
-                            "agentSessionIndex.refreshFailure windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) generation=\(generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS)) error=\(String(describing: error))"
+                            "agentSessionIndex.refreshFailure windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS)) error=\(String(describing: error))"
                         )
                     }
                 #endif
-                await applySidebarIndexFailure(generation: generation)
+                await applySidebarIndexFailure(token: token)
             }
         }
     }
 
-    private func completeSkippedSessionListCacheRefresh(for workspace: WorkspaceModel, reason: String) {
-        sessionListCacheTask?.cancel()
+    private func completeSkippedSessionListCacheRefresh(
+        for workspace: WorkspaceModel,
+        token: SessionIndexRefreshToken,
+        reason: String
+    ) {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner),
+              workspace.id == token.owner.workspaceID
+        else {
+            return
+        }
+        activeSessionIndexRefreshBaselineEntries.removeAll()
+        activeSessionIndexRefreshPrioritizedEntries.removeAll()
+        activeSessionIndexRefreshFullEntries.removeAll()
+        publishSessionIndexReplacement([:], token: token)
         sessionListCacheTask = nil
-        sessionListCacheGeneration &+= 1
-        sessionIndex.removeAll()
-        sessionListSortDates.removeAll()
-        sessionListCacheReady = true
-        sidebarRestoreFrozenOrderByTabID.removeAll()
+        activeSessionIndexRefreshToken = nil
+        activeSessionIndexRefreshWorkspace = nil
+        activeSessionIndexRefreshValidTabIDs.removeAll()
+        activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        setSessionListCacheReady(true, for: token.owner)
+        releaseSidebarRestoreFrozenOrder(for: token.owner)
         #if DEBUG
             WorkspaceRestorePerfLog.log(
-                "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
+                "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(token.owner.activationEpoch) generation=\(token.generation) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
             )
         #endif
     }
@@ -9518,73 +10042,83 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    private func shouldAcceptSidebarIndexEntry(
+        _ entry: AgentSessionIndexEntry,
+        token: SessionIndexRefreshToken
+    ) -> Bool {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner),
+              activeSessionIndexRefreshValidTabIDs.contains(entry.tabID)
+        else {
+            return false
+        }
+        if let explicitSessionID = activeSessionIndexRefreshBoundSessionIDByTabID[entry.tabID] {
+            return explicitSessionID == entry.id
+        }
+        if activeSessionIndexRefreshBoundSessionIDByTabID.contains(where: { tabID, sessionID in
+            sessionID == entry.id && tabID != entry.tabID
+        }) {
+            return false
+        }
+        if let liveBinding = sessions[entry.tabID]?.activeAgentSessionID {
+            return liveBinding == entry.id
+        }
+        return true
+    }
+
     private func applySidebarIndexBatch(
         _ batch: AgentSessionSidebarBuildBatch,
-        generation: UInt64
+        token: SessionIndexRefreshToken,
+        isFullRefresh: Bool
     ) {
         #if DEBUG
             let applyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        guard sessionListCacheGeneration == generation else {
-            #if DEBUG
-                WorkspaceRestorePerfLog.event(
-                    "agentSessionIndex.applyBatchSkipped",
-                    fields: [
-                        "windowID": "\(windowID)",
-                        "generation": "\(generation)",
-                        "currentGeneration": "\(sessionListCacheGeneration)",
-                        "entries": "\(batch.entriesBySessionID.count)",
-                        "preferredTabs": "\(batch.preferredSessionIDByTabID.count)",
-                        "reason": "staleGeneration"
-                    ]
-                )
-            #endif
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
             return
         }
-        #if DEBUG
-            let sessionIndexBeforeCount = sessionIndex.count
-            let sortDatesBeforeCount = sessionListSortDates.count
-            let mergeStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-        #endif
+        var acceptedEntries: [UUID: AgentSessionIndexEntry] = [:]
         var updatedTabIDs: Set<UUID> = []
-        var nextSessionIndex = sessionIndex
-        for (sessionID, entry) in batch.entriesBySessionID where shouldAcceptSidebarIndexEntry(entry) {
-            nextSessionIndex[sessionID] = entry
+        for (sessionID, entry) in batch.entriesBySessionID
+            where shouldAcceptSidebarIndexEntry(entry, token: token)
+        {
+            acceptedEntries[sessionID] = entry
             updatedTabIDs.insert(entry.tabID)
         }
-        if nextSessionIndex != sessionIndex {
-            sessionIndex = nextSessionIndex
-        }
-        for (tabID, _) in batch.preferredSessionIDByTabID {
+        for tabID in batch.preferredSessionIDByTabID.keys
+            where activeSessionIndexRefreshValidTabIDs.contains(tabID)
+        {
             updatedTabIDs.insert(tabID)
         }
-        #if DEBUG
-            let mergeDurationMS = mergeStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            let sortDateStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-        #endif
-        rebuildSessionSortDatesFromIndex()
-        #if DEBUG
-            let sortDateDurationMS = sortDateStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
-            let resumeStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-        #endif
+
+        if isFullRefresh {
+            activeSessionIndexRefreshFullEntries.merge(acceptedEntries) { _, new in new }
+            activeSessionIndexRefreshHasPublishedFullBatch = true
+            var provisional = activeSessionIndexRefreshBaselineEntries
+            provisional.merge(activeSessionIndexRefreshPrioritizedEntries) { _, new in new }
+            provisional.merge(activeSessionIndexRefreshFullEntries) { _, new in new }
+            publishSessionIndexReplacement(provisional, token: token)
+        } else if !activeSessionIndexRefreshHasPublishedFullBatch {
+            activeSessionIndexRefreshPrioritizedEntries.merge(acceptedEntries) { _, new in new }
+            var provisional = activeSessionIndexRefreshBaselineEntries
+            provisional.merge(activeSessionIndexRefreshPrioritizedEntries) { _, new in new }
+            publishSessionIndexReplacement(provisional, token: token)
+        }
         let resumeTriggered = resumePendingActiveSessionLoadIfNeeded(updatedTabIDs: updatedTabIDs)
         #if DEBUG
-            let resumeDurationMS = resumeStartMS.map { WorkspaceRestorePerfLog.elapsedMS(since: $0) }
             WorkspaceRestorePerfLog.event(
                 "agentSessionIndex.applyBatch",
                 fields: [
                     "windowID": "\(windowID)",
-                    "generation": "\(generation)",
+                    "activationEpoch": "\(token.owner.activationEpoch)",
+                    "generation": "\(token.generation)",
+                    "isFullRefresh": "\(isFullRefresh)",
                     "entries": "\(batch.entriesBySessionID.count)",
-                    "preferredTabs": "\(batch.preferredSessionIDByTabID.count)",
+                    "acceptedEntries": "\(acceptedEntries.count)",
                     "updatedTabs": "\(updatedTabIDs.count)",
-                    "sessionIndexBefore": "\(sessionIndexBeforeCount)",
                     "sessionIndexAfter": "\(sessionIndex.count)",
-                    "sortDatesBefore": "\(sortDatesBeforeCount)",
-                    "sortDatesAfter": "\(sessionListSortDates.count)",
-                    "mergeDuration": mergeDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "sortDateDuration": sortDateDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
-                    "resumeDuration": resumeDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured",
                     "resumeTriggered": "\(resumeTriggered)",
                     "total": applyStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
@@ -9610,23 +10144,64 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    private func applySidebarIndexCompletion(generation: UInt64) {
-        guard sessionListCacheGeneration == generation else { return }
+    private func prepareSidebarIndexStreamRetry(token: SessionIndexRefreshToken) -> Bool {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
+            return false
+        }
+
+        activeSessionIndexRefreshFullEntries.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        var provisional = activeSessionIndexRefreshBaselineEntries
+        provisional.merge(activeSessionIndexRefreshPrioritizedEntries) { _, new in new }
+        publishSessionIndexReplacement(provisional, token: token)
+        return true
+    }
+
+    private func applySidebarIndexCompletion(token: SessionIndexRefreshToken) {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
+            return
+        }
+        publishSessionIndexReplacement(activeSessionIndexRefreshFullEntries, token: token)
         sessionListCacheTask = nil
-        sessionListCacheReady = true
-        sidebarRestoreFrozenOrderByTabID.removeAll()
+        activeSessionIndexRefreshToken = nil
+        activeSessionIndexRefreshWorkspace = nil
+        activeSessionIndexRefreshValidTabIDs.removeAll()
+        activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
+        activeSessionIndexRefreshBaselineEntries.removeAll()
+        activeSessionIndexRefreshPrioritizedEntries.removeAll()
+        activeSessionIndexRefreshFullEntries.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        setSessionListCacheReady(true, for: token.owner)
+        releaseSidebarRestoreFrozenOrder(for: token.owner)
         scheduleSidebarAutoArchive(reason: .sessionListReady)
     }
 
-    private func applySidebarIndexFailure(generation: UInt64) {
-        guard sessionListCacheGeneration == generation else { return }
+    private func applySidebarIndexFailure(token: SessionIndexRefreshToken) {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
+            return
+        }
+        publishSessionIndexReplacement(activeSessionIndexRefreshBaselineEntries, token: token)
         sessionListCacheTask = nil
-        sessionListCacheReady = true
-        sidebarRestoreFrozenOrderByTabID.removeAll()
+        activeSessionIndexRefreshToken = nil
+        activeSessionIndexRefreshWorkspace = nil
+        activeSessionIndexRefreshValidTabIDs.removeAll()
+        activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
+        activeSessionIndexRefreshBaselineEntries.removeAll()
+        activeSessionIndexRefreshPrioritizedEntries.removeAll()
+        activeSessionIndexRefreshFullEntries.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        setSessionListCacheReady(false, for: token.owner)
+        releaseSidebarRestoreFrozenOrder(for: token.owner)
     }
 
     private func notePrioritizedActiveSessionRestoreStatus(
-        generation: UInt64,
+        token: SessionIndexRefreshToken,
         prioritizedTabID: UUID?
     ) -> Bool {
         #if DEBUG
@@ -9636,7 +10211,7 @@ final class AgentModeViewModel: ObservableObject {
                     "agentSessionIndex.activeRestoreWait",
                     fields: [
                         "windowID": "\(windowID)",
-                        "generation": "\(generation)",
+                        "generation": "\(token.generation)",
                         "prioritizedTabID": WorkspaceRestorePerfLog.shortID(prioritizedTabID),
                         "outcome": outcome,
                         "waited": "\(waited)",
@@ -9646,13 +10221,16 @@ final class AgentModeViewModel: ObservableObject {
             }
         #endif
         guard let prioritizedTabID else {
-            let shouldContinue = sessionListCacheGeneration == generation
+            let shouldContinue = activeSessionIndexRefreshToken == token
+                && isSessionIndexOwnerCurrent(token.owner)
             #if DEBUG
                 logActiveRestoreWait(outcome: "noPrioritizedTab", waited: false)
             #endif
             return shouldContinue
         }
-        guard sessionListCacheGeneration == generation else {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
             #if DEBUG
                 logActiveRestoreWait(outcome: "generationChangedBeforeStatus", waited: false)
             #endif
@@ -9665,7 +10243,8 @@ final class AgentModeViewModel: ObservableObject {
             return true
         }
         guard sessions[prioritizedTabID]?.persistedLoadTask != nil else {
-            let shouldContinue = sessionListCacheGeneration == generation
+            let shouldContinue = activeSessionIndexRefreshToken == token
+                && isSessionIndexOwnerCurrent(token.owner)
             #if DEBUG
                 logActiveRestoreWait(outcome: "notWaitingNoPersistedLoadTask", waited: false)
             #endif
@@ -9884,7 +10463,9 @@ final class AgentModeViewModel: ObservableObject {
         if session.activeAgentSessionID == nil, !hasConversationContent {
             return
         }
-        let sessionID = ensureSessionBoundToTab(session)
+        guard let sessionID = ensureSessionBoundToTab(session) else {
+            return
+        }
         session.saveRequestGeneration &+= 1
         if saveInFlightSessionIDs.contains(sessionID) {
             saveRequestedWhileInFlightSessionIDs.insert(sessionID)
@@ -12494,7 +13075,9 @@ final class AgentModeViewModel: ObservableObject {
                 handleObservedMCPStateChange(for: session)
             }
         }
-        _ = ensureSessionBoundToTab(session)
+        guard ensureSessionBoundToTab(session) != nil else {
+            return .failed(message: "The tab could not be bound to an agent session.")
+        }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         await prepareMCPWaitTrackingForRunStart(session: session)
         let augmentedInitialMessage = await augmentUserMessageForProviderSend(
@@ -14533,10 +15116,10 @@ final class AgentModeViewModel: ObservableObject {
 
         let sessionID = boundSessionID(for: tabID)
         if let sessionID,
-           var entry = sessionIndex[sessionID]
+           var entry = ownerValidatedSessionIndex[sessionID]
         {
             entry.name = validatedName
-            sessionIndex[sessionID] = entry
+            applyLocalSessionIndexUpsert(entry)
         }
 
         if let session = sessions[tabID] {
@@ -14600,7 +15183,7 @@ final class AgentModeViewModel: ObservableObject {
         #endif
         let cleanupRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
         var affectedTabIDs = knownTabIDs
-        if let indexedTabID = sessionIndex[sessionID]?.tabID {
+        if let indexedTabID = ownerValidatedSessionIndex[sessionID]?.tabID {
             affectedTabIDs.insert(indexedTabID)
         }
 
@@ -14835,7 +15418,7 @@ final class AgentModeViewModel: ObservableObject {
             return true
         }
         // Check cached metadata from disk (includes sessions without user messages)
-        if sessionIndex.values.contains(where: { $0.tabID == tabID }) {
+        if ownerValidatedSessionIndex.values.contains(where: { $0.tabID == tabID }) {
             return true
         }
         // Check if tab has a persisted agent session ID via workspaceManager
@@ -15128,7 +15711,9 @@ final class AgentModeViewModel: ObservableObject {
             defersProviderLockUntilSend: true,
             isStagedForSend: false
         )
-        _ = ensureSessionBoundToTab(destSession)
+        guard ensureSessionBoundToTab(destSession) != nil else {
+            throw PersistentBindingMutationError.staleTransition
+        }
 
         // 6) Persist destination session/tab mapping
         scheduleSave(for: destTabID)

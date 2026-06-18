@@ -114,7 +114,7 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertNil(weakManager.value)
     }
 
-    func testUnregisterDisposesPerWindowCodexModelSubscribersAndStopsOwnedClient() async throws {
+    func testUnregisterDisposesPerWindowCodexModelSubscribersAndStopsOwnedClient() async {
         let client = WindowClosePollingClientSpy()
         let pollingService = CodexModelPollingService(
             client: client,
@@ -128,58 +128,45 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         let manager = WindowStatesManager.shared
         manager.registerWindowState(window)
 
-        try await waitUntil("initial API settings load to settle", timeout: .seconds(15)) {
-            window.apiSettingsViewModel.test_hasFinishedInitialStoredDataLoad
-        }
+        await window.apiSettingsViewModel.loadStoredDataIfNeeded()
+        await waitForPendingMainQueueWork()
         await window.apiSettingsViewModel.test_cancelAndDrainCodexModelsSubscription()
         await window.contextBuilderAgentViewModel.test_cancelAndDrainCodexModelsSubscription()
-        try await waitUntil("startup model subscribers to detach") {
-            await pollingService.test_subscriberCount() == 0
-        }
+        guard await waitForSubscriberCount(0, pollingService: pollingService) else { return }
 
-        window.apiSettingsViewModel.isCodexConnected = true
-        window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(
-            verifiedProviders: [.codexExec]
-        )
         XCTAssertFalse(window.isClosing)
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
         window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
         window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
-        try await waitUntil("two per-window subscribers to attach") {
-            await pollingService.test_subscriberCount() == 2
-        }
+        guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }
         let attachedSubscriberCount = await pollingService.test_subscriberCount()
-        XCTAssertEqual(
-            attachedSubscriberCount,
-            2,
-            "apiTask=\(window.apiSettingsViewModel.test_hasCodexModelsSubscriptionTask) contextBuilderTask=\(window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)"
-        )
-        try await waitUntil("an in-flight polling request to enter") {
-            let observation = await client.requestObservation()
-            return observation.activeRequestCount == 1
-                && observation.enteredRequestCount > observation.exitedRequestCount
-        }
+        XCTAssertEqual(attachedSubscriberCount, 2)
+        guard await waitForClientObservation(
+            "an in-flight polling request to enter",
+            client: client,
+            matching: { !$0.isQuiescent && $0.activeRequestCount == 1 }
+        ) else { return }
         let requestObservationBeforeClose = await client.requestObservation()
-        let stopCallCountBeforeClose = await client.stopCallCount
+        let stopCallCountBeforeClose = requestObservationBeforeClose.stopCallCount
         XCTAssertFalse(requestObservationBeforeClose.isQuiescent)
 
         unregisterTrackedWindow(window)
 
-        try await waitUntil("window-close subscribers to detach") {
-            await pollingService.test_subscriberCount() == 0
-        }
-        try await waitUntil("window-close polling request exit and client stop") {
-            let observation = await client.requestObservation()
-            let stopCallCount = await client.stopCallCount
-            return observation.isQuiescent
-                && observation.activeRequestCount == 0
-                && observation.exitedRequestCount > requestObservationBeforeClose.exitedRequestCount
-                && stopCallCount > stopCallCountBeforeClose
-        }
+        guard await waitForSubscriberCount(0, pollingService: pollingService) else { return }
+        guard await waitForClientObservation(
+            "window-close polling request exit and client stop",
+            client: client,
+            matching: {
+                $0.isQuiescent
+                    && $0.activeRequestCount == 0
+                    && $0.exitedRequestCount > requestObservationBeforeClose.exitedRequestCount
+                    && $0.stopCallCount > stopCallCountBeforeClose
+            }
+        ) else { return }
 
         let subscriberCount = await pollingService.test_subscriberCount()
         let requestObservationAfterClose = await client.requestObservation()
-        let stopCallCountAfterClose = await client.stopCallCount
+        let stopCallCountAfterClose = requestObservationAfterClose.stopCallCount
         XCTAssertTrue(window.isClosing)
         XCTAssertEqual(subscriberCount, 0)
         XCTAssertGreaterThan(stopCallCountAfterClose, stopCallCountBeforeClose)
@@ -238,20 +225,61 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         explicitlyUnregisteredWindowIDs.insert(ObjectIdentifier(window))
     }
 
-    private func waitUntil(
-        _ description: String,
-        timeout: Duration = .seconds(5),
-        condition: @escaping @MainActor () async -> Bool
-    ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while await !condition() {
-            guard clock.now < deadline else {
-                XCTFail("Timed out waiting for \(description)")
-                return
+    private func waitForPendingMainQueueWork() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
             }
-            try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    private func waitForSubscriberCount(
+        _ expectedCount: Int,
+        pollingService: CodexModelPollingService
+    ) async -> Bool {
+        let reachedExpectedCount = expectation(description: "subscriber count reaches \(expectedCount)")
+        reachedExpectedCount.assertForOverFulfill = false
+        let updates = await pollingService.test_subscriberCountUpdates()
+        let observationTask = Task { @MainActor in
+            var didFulfill = false
+            for await count in updates where count == expectedCount && !didFulfill {
+                didFulfill = true
+                reachedExpectedCount.fulfill()
+            }
+        }
+
+        await fulfillment(of: [reachedExpectedCount], timeout: 5)
+        observationTask.cancel()
+        await observationTask.value
+
+        let actualCount = await pollingService.test_subscriberCount()
+        XCTAssertEqual(actualCount, expectedCount)
+        return actualCount == expectedCount
+    }
+
+    private func waitForClientObservation(
+        _ description: String,
+        client: WindowClosePollingClientSpy,
+        matching predicate: @escaping @MainActor (WindowClosePollingClientSpy.RequestObservation) -> Bool
+    ) async -> Bool {
+        let reachedExpectedState = expectation(description: description)
+        reachedExpectedState.assertForOverFulfill = false
+        let updates = await client.requestObservationUpdates()
+        let observationTask = Task { @MainActor in
+            var didFulfill = false
+            for await observation in updates where predicate(observation) && !didFulfill {
+                didFulfill = true
+                reachedExpectedState.fulfill()
+            }
+        }
+
+        await fulfillment(of: [reachedExpectedState], timeout: 5)
+        observationTask.cancel()
+        await observationTask.value
+
+        let finalObservation = await client.requestObservation()
+        XCTAssertTrue(predicate(finalObservation), description)
+        return predicate(finalObservation)
     }
 }
 
@@ -621,6 +649,7 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
         let enteredRequestCount: Int
         let exitedRequestCount: Int
         let activeRequestCount: Int
+        let stopCallCount: Int
 
         var isQuiescent: Bool {
             activeRequestCount == 0
@@ -633,15 +662,18 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
     private var enteredRequestCount = 0
     private var exitedRequestCount = 0
     private(set) var stopCallCount = 0
+    private var requestObservationObservers: [UUID: AsyncStream<RequestObservation>.Continuation] = [:]
 
     func listModels(limit _: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         let requestID = UUID()
         activeRequestIDs.insert(requestID)
         enteredRequestCount += 1
+        publishRequestObservation()
         defer {
             activeRequestIDs.remove(requestID)
             cancelledRequestIDs.remove(requestID)
             exitedRequestCount += 1
+            publishRequestObservation()
         }
 
         return try await withTaskCancellationHandler {
@@ -661,8 +693,20 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
         RequestObservation(
             enteredRequestCount: enteredRequestCount,
             exitedRequestCount: exitedRequestCount,
-            activeRequestCount: activeRequestIDs.count
+            activeRequestCount: activeRequestIDs.count,
+            stopCallCount: stopCallCount
         )
+    }
+
+    func requestObservationUpdates() -> AsyncStream<RequestObservation> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<RequestObservation>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        requestObservationObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeRequestObservationObserver(id) }
+        }
+        continuation.yield(requestObservation())
+        return stream
     }
 
     func failPendingRequestsAsStopped() {
@@ -676,6 +720,7 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
     func stop() async {
         stopCallCount += 1
         failPendingRequestsAsStopped()
+        publishRequestObservation()
     }
 
     private func cancelRequest(_ requestID: UUID) {
@@ -684,5 +729,16 @@ private actor WindowClosePollingClientSpy: CodexModelListingClient {
         } else if activeRequestIDs.contains(requestID) {
             cancelledRequestIDs.insert(requestID)
         }
+    }
+
+    private func publishRequestObservation() {
+        let observation = requestObservation()
+        for continuation in requestObservationObservers.values {
+            continuation.yield(observation)
+        }
+    }
+
+    private func removeRequestObservationObserver(_ id: UUID) {
+        requestObservationObservers.removeValue(forKey: id)
     }
 }

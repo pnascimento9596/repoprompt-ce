@@ -2743,7 +2743,8 @@ class PromptViewModel: ObservableObject {
         withIDs ids: Set<UUID>,
         preferredActiveID: UUID? = nil,
         reason: ComposeTabRemovalReason = .close,
-        expandCascade: Bool = true
+        expandCascade: Bool = true,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard !ids.isEmpty else { return }
         guard
@@ -2752,6 +2753,17 @@ class PromptViewModel: ObservableObject {
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
         else { return }
 
+        func mutationContextIsCurrent() -> Bool {
+            guard manager.activeWorkspace?.id == workspace.id,
+                  manager.workspaces.indices.contains(index),
+                  manager.workspaces[index].id == workspace.id
+            else {
+                return false
+            }
+            return isMutationContextCurrent?() ?? true
+        }
+
+        guard mutationContextIsCurrent() else { return }
         var tabs = manager.workspaces[index].composeTabs
         let tabsBeforeClose = tabs
         let originalCount = tabs.count
@@ -2759,6 +2771,7 @@ class PromptViewModel: ObservableObject {
         var stashedTabIDsToDelete: Set<UUID> = []
         if expandCascade, let composeTabCascadeResolver {
             let cascadePlan = await composeTabCascadeResolver(ids, reason)
+            guard mutationContextIsCurrent() else { return }
             resolvedIDs.formUnion(cascadePlan.composeTabIDs)
             if reason == .close {
                 stashedTabIDsToDelete.formUnion(cascadePlan.stashedTabIDs)
@@ -2781,8 +2794,11 @@ class PromptViewModel: ObservableObject {
         }()
 
         // Notify listeners BEFORE mutation so they can cancel running tasks
+        guard mutationContextIsCurrent() else { return }
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
+        guard mutationContextIsCurrent() else { return }
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
+        guard mutationContextIsCurrent() else { return }
         #if DEBUG
             for tabID in tabsBeingClosed {
                 AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
@@ -3036,11 +3052,16 @@ class PromptViewModel: ObservableObject {
 
     @discardableResult
     @MainActor
-    func autoArchiveComposeTabsForSidebarPolicy(withIDs ids: Set<UUID>) async -> Set<UUID> {
-        guard !ids.isEmpty else { return [] }
+    func autoArchiveComposeTabsForSidebarPolicy(
+        withIDs ids: Set<UUID>,
+        expectedWorkspaceID: UUID,
+        isArchiveContextCurrent: @escaping @MainActor () -> Bool
+    ) async -> Set<UUID> {
+        guard !ids.isEmpty, isArchiveContextCurrent() else { return [] }
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
+            workspace.id == expectedWorkspaceID,
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
         else { return [] }
 
@@ -3065,10 +3086,20 @@ class PromptViewModel: ObservableObject {
                 }
 
             for tabID in requestedOpenIDs {
+                guard isArchiveContextCurrent(),
+                      manager.activeWorkspace?.id == expectedWorkspaceID
+                else {
+                    return ([], [])
+                }
                 guard tabID != activeTabID else { continue }
                 guard composeTabAutoStashEligibilityProvider?(tabID) ?? true else { continue }
 
                 let affectedTabIDs = await autoStashAffectedComposeTabIDs(for: tabID)
+                guard isArchiveContextCurrent(),
+                      manager.activeWorkspace?.id == expectedWorkspaceID
+                else {
+                    return ([], [])
+                }
                 guard canAutoStashAffectedComposeTabs(affectedTabIDs, among: tabs, excluding: activeTabID) else {
                     continue
                 }
@@ -3104,13 +3135,27 @@ class PromptViewModel: ObservableObject {
             activeTabID: refreshedActiveTabID
         )
         guard !refreshedPlan.rootIDs.isEmpty else { return [] }
+        guard isArchiveContextCurrent(),
+              manager.activeWorkspace?.id == expectedWorkspaceID
+        else {
+            return []
+        }
 
         await closeComposeTabs(
             withIDs: refreshedPlan.affectedOpenTabIDs,
             reason: .stash,
-            expandCascade: false
+            expandCascade: false,
+            isMutationContextCurrent: {
+                isArchiveContextCurrent()
+                    && manager.activeWorkspace?.id == expectedWorkspaceID
+            }
         )
-        guard manager.workspaces.indices.contains(index) else { return [] }
+        guard isArchiveContextCurrent(),
+              manager.activeWorkspace?.id == expectedWorkspaceID,
+              manager.workspaces.indices.contains(index)
+        else {
+            return []
+        }
         let remainingOpenTabIDs = Set(manager.workspaces[index].composeTabs.map(\.id))
         return refreshedPlan.affectedOpenTabIDs.subtracting(remainingOpenTabIDs)
     }

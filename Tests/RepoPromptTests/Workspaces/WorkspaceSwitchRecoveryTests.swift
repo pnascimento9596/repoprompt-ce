@@ -329,6 +329,12 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         )
         let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
         XCTAssertTrue(sourceSwitchResult.didSwitch)
+        try await waitUntil {
+            composition.agentModeViewModel.test_sessionIndexOwner?.workspaceID == source.id
+        }
+        let sourceSessionIndexOwner = try XCTUnwrap(
+            composition.agentModeViewModel.test_sessionIndexOwner
+        )
         let loadedRoots = await store.roots()
         let loadedRoot = try XCTUnwrap(loadedRoots.first)
         try await store.startWatchingRoot(id: loadedRoot.id)
@@ -388,6 +394,16 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(manager.activeWorkspaceID, fallbackID)
         XCTAssertFalse(manager.isSwitchingWorkspace)
         XCTAssertNil(manager.activeWorkspaceSwitch)
+        try await waitUntil {
+            composition.agentModeViewModel.test_sessionIndexOwner?.workspaceID == fallbackID
+        }
+        let recoverySessionIndexOwner = try XCTUnwrap(
+            composition.agentModeViewModel.test_sessionIndexOwner
+        )
+        XCTAssertGreaterThan(
+            recoverySessionIndexOwner.activationEpoch,
+            sourceSessionIndexOwner.activationEpoch
+        )
 
         await watcherStopGate.release()
         manager.setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(nil)
@@ -574,6 +590,12 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         )
         let activationResult = await manager.switchWorkspace(to: active, saveState: false)
         XCTAssertTrue(activationResult.didSwitch)
+        try await waitUntil {
+            composition.agentModeViewModel.test_sessionIndexOwner?.workspaceID == active.id
+        }
+        let originalSessionIndexOwner = try XCTUnwrap(
+            composition.agentModeViewModel.test_sessionIndexOwner
+        )
 
         var replacement = active
         replacement.repoPaths = [rootB.path]
@@ -583,6 +605,21 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let result = await manager.reactivateWorkspaceAfterReplacement(replacement)
         XCTAssertEqual(result, .switched)
         XCTAssertEqual(manager.activeWorkspaceID, replacement.id)
+        try await waitUntil {
+            guard let owner = composition.agentModeViewModel.test_sessionIndexOwner else {
+                return false
+            }
+            return owner.workspaceID == replacement.id
+                && owner.activationEpoch > originalSessionIndexOwner.activationEpoch
+        }
+        let replacementSessionIndexOwner = try XCTUnwrap(
+            composition.agentModeViewModel.test_sessionIndexOwner
+        )
+        XCTAssertEqual(replacementSessionIndexOwner.workspaceID, originalSessionIndexOwner.workspaceID)
+        XCTAssertGreaterThan(
+            replacementSessionIndexOwner.activationEpoch,
+            originalSessionIndexOwner.activationEpoch
+        )
         let roots = await store.roots()
         XCTAssertEqual(roots.map(\.standardizedFullPath), [rootB.standardizedFileURL.path])
     }
