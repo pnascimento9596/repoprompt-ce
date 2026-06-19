@@ -9503,13 +9503,13 @@ final class AgentModeViewModel: ObservableObject {
         guard !targets.isEmpty else { return }
         let cleanupID = UUID()
         let task = Task(priority: .utility) { @MainActor [weak self] in
-            await Task.yield()
-            guard let self else { return }
             #if DEBUG
                 defer {
-                    test_workspaceSwitchBackgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
+                    self?.test_workspaceSwitchBackgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
                 }
             #endif
+            await Task.yield()
+            guard let self else { return }
             for target in targets {
                 await teardownMCPControl(
                     for: target.session,
