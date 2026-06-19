@@ -2360,7 +2360,7 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Whether the client is one of the built-in always-trusted defaults,
     /// which cannot be removed from the allow-list.
-    nonisolated func isBuiltInTrustedClient(_ clientID: String) -> Bool {
+    nonisolated func isBuiltInAlwaysAllowedClient(_ clientID: String) -> Bool {
         ServerController.isBuiltInAlwaysAllowedClient(clientID)
     }
 
