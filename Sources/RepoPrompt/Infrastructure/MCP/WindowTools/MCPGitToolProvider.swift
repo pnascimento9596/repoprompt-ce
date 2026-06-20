@@ -166,8 +166,12 @@ private struct MCPGitArtifactRepoOutcome {
     let diff: Reply.DiffDTO?
     let manifest: GitDiffSnapshotManifest?
     let snapshotDir: String?
-    let publishedSnapshotPath: String?
-    let primaryArtifactCandidates: [String]
+    let publishedArtifacts: GitDiffPublishedArtifactSet?
+}
+
+private struct MCPGitArtifactReadinessPreparation {
+    let autoSelectedAliases: [String]
+    let warningsBySnapshotDir: [String: String]
 }
 
 private struct MCPGitDiffRepoOutcome {
@@ -183,6 +187,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
     private let runtime: MCPWindowToolRuntime
     private let dependencies: MCPWindowToolDependencies
+    private var stagedAdvertisementsByInvocation: [UUID: [GitDiffPublishedArtifact]] = [:]
 
     init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
         self.runtime = runtime
@@ -337,22 +342,71 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             )
         ) { [self] _, args in
             let connectionID = ServerNetworkManager.currentConnectionID
-            let reply = try await executeGitTool(args: args, connectionID: connectionID)
-            return try await MCPProviderProjectionWorker.encode(
-                reply,
-                toolName: MCPWindowToolName.git
+            let invocationID = UUID()
+            do {
+                let reply = try await executeGitTool(
+                    args: args,
+                    connectionID: connectionID,
+                    advertisementInvocationID: invocationID
+                )
+                let encoded = try await MCPProviderProjectionWorker.encode(
+                    reply,
+                    toolName: MCPWindowToolName.git
+                )
+                try Task.checkCancellation()
+                if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
+                    do {
+                        _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
+                            MCPWindowToolName.git,
+                            advertised
+                        )
+                    } catch {
+                        await dependencies.invalidateAdvertisedGitArtifactsForCurrentTab(
+                            MCPWindowToolName.git
+                        )
+                        throw MCPError.internalError(
+                            "Git artifacts were published, but their advertised aliases could not be authorized: \(error.localizedDescription)"
+                        )
+                    }
+                }
+                return encoded
+            } catch {
+                await discardStagedAdvertisement(invocationID: invocationID)
+                throw error
+            }
+        }
+    }
+
+    private func takeStagedAdvertisement(
+        invocationID: UUID
+    ) -> [GitDiffPublishedArtifact]? {
+        stagedAdvertisementsByInvocation.removeValue(forKey: invocationID)
+    }
+
+    private func discardStagedAdvertisement(invocationID: UUID) {
+        stagedAdvertisementsByInvocation.removeValue(forKey: invocationID)
+    }
+
+    private func executeGitTool(
+        args: [String: Value],
+        connectionID: UUID?,
+        advertisementInvocationID: UUID
+    ) async throws -> ToolResultDTOs.GitToolReplyDTO {
+        let operation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "status"
+        return try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation) { [self] in
+            try await executeGitToolBody(
+                args: args,
+                connectionID: connectionID,
+                advertisementInvocationID: advertisementInvocationID
             )
         }
     }
 
-    private func executeGitTool(args: [String: Value], connectionID: UUID?) async throws -> ToolResultDTOs.GitToolReplyDTO {
-        let operation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "status"
-        return try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation) { [self] in
-            try await executeGitToolBody(args: args, connectionID: connectionID)
-        }
-    }
-
-    private func executeGitToolBody(args: [String: Value], connectionID: UUID?) async throws -> ToolResultDTOs.GitToolReplyDTO {
+    private func executeGitToolBody(
+        args: [String: Value],
+        connectionID: UUID?,
+        advertisementInvocationID: UUID
+    ) async throws -> ToolResultDTOs.GitToolReplyDTO {
         typealias Reply = ToolResultDTOs.GitToolReplyDTO
 
         enum GitOp: String {
@@ -434,21 +488,115 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             return merged.isEmpty ? nil : merged.joined(separator: "\n")
         }
 
-        func autoSelectPrimaryGitDiffArtifacts(paths: [String]) async -> [String] {
-            guard !paths.isEmpty else { return [] }
-            do {
-                let context = try await dependencies.requireCurrentTabContext(MCPWindowToolName.git)
-                let result = await dependencies.addPrimaryGitDiffArtifactsToSelection(context.selection, paths)
-                if result.selection != context.selection {
-                    try await dependencies.updateCurrentTabContext(MCPWindowToolName.git) { current in
-                        current.selection = result.selection
-                    }
-                }
-                return result.autoSelectedPaths
-            } catch {
-                dependencies.logDebug("Auto-select git artifacts skipped: \(error.localizedDescription)")
-                return []
+        func artifactIngressFailureDescription(
+            _ status: WorkspacePublishedGitArtifactIngressOutcomeStatus
+        ) -> String {
+            switch status {
+            case .cataloged:
+                "cataloged"
+            case .missingOnDisk:
+                "missing on disk"
+            case let .ineligible(reason):
+                "ineligible: \(reason.description)"
+            case .invalidRelativePath:
+                "invalid relative path"
+            case .outsideExpectedRoot:
+                "outside the exact Git-data root"
+            case .staleRoot:
+                "stale Git-data root"
+            case let .duplicateOf(path):
+                "duplicate of \(path)"
+            case let .materializationFailed(reason):
+                "catalog materialization failed: \(reason)"
             }
+        }
+
+        func preparePublishedArtifacts(
+            _ publishedSets: [GitDiffPublishedArtifactSet]
+        ) async throws -> MCPGitArtifactReadinessPreparation {
+            guard !publishedSets.isEmpty else {
+                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                return MCPGitArtifactReadinessPreparation(
+                    autoSelectedAliases: [],
+                    warningsBySnapshotDir: [:]
+                )
+            }
+            try Task.checkCancellation()
+
+            var warningParts: [String: [String]] = [:]
+            let root: WorkspaceRootRef
+            do {
+                root = try await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                for published in publishedSets {
+                    warningParts[published.snapshotRef.snapshotDirRel, default: []].append(
+                        "Git artifact readiness: snapshot was published, but the exact Git-data root could not be loaded (\(error.localizedDescription)); no primary artifact was auto-selected."
+                    )
+                }
+                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                return MCPGitArtifactReadinessPreparation(
+                    autoSelectedAliases: [],
+                    warningsBySnapshotDir: warningParts.mapValues { $0.joined(separator: "\n") }
+                )
+            }
+
+            try Task.checkCancellation()
+            let ingress = await dependencies.promptVM.workspaceFileContextStore.ingressPublishedGitArtifacts(
+                WorkspacePublishedGitArtifactIngressRequest(
+                    root: root,
+                    artifacts: publishedSets.flatMap(\.orderedArtifacts)
+                )
+            )
+            try Task.checkCancellation()
+
+            var readyCandidates: [GitDiffPublishedArtifact] = []
+            var advertisedCandidates: [GitDiffPublishedArtifact] = []
+            for published in publishedSets {
+                readyCandidates.append(contentsOf: ingress.selectionReadyArtifacts(for: published))
+                advertisedCandidates.append(contentsOf: ingress.advertisementReadyArtifacts(for: published))
+                for artifact in published.orderedArtifacts {
+                    guard let failure = ingress.failuresByArtifact[artifact] else { continue }
+                    let label = artifact.clientAlias ?? artifact.gitDataRelativePath
+                    warningParts[published.snapshotRef.snapshotDirRel, default: []].append(
+                        "Git artifact readiness: \(label) was not selection-ready (\(artifactIngressFailureDescription(failure)))."
+                    )
+                }
+            }
+
+            var autoSelectedAliases: [String] = []
+            if !readyCandidates.isEmpty {
+                do {
+                    let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
+                        MCPWindowToolName.git,
+                        readyCandidates
+                    )
+                    autoSelectedAliases = commit.autoSelectedAliases
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    let affectedSnapshotRefs = Set(publishedSets.compactMap { published -> String? in
+                        ingress.selectionReadyArtifacts(for: published).isEmpty
+                            ? nil
+                            : published.snapshotRef.snapshotDirRel
+                    })
+                    for snapshotRef in affectedSnapshotRefs {
+                        warningParts[snapshotRef, default: []].append(
+                            "Git artifact readiness: cataloged primary artifacts could not be committed to the canonical tab selection (\(error.localizedDescription)); autoSelected was omitted."
+                        )
+                    }
+                    dependencies.logDebug("Auto-select Git artifacts skipped: \(error.localizedDescription)")
+                }
+            }
+
+            try Task.checkCancellation()
+            stagedAdvertisementsByInvocation[advertisementInvocationID] = advertisedCandidates
+
+            return MCPGitArtifactReadinessPreparation(
+                autoSelectedAliases: autoSelectedAliases,
+                warningsBySnapshotDir: warningParts.mapValues { $0.joined(separator: "\n") }
+            )
         }
 
         typealias SnapshotRef = GitDiffSnapshotStore.GitDiffSnapshotRef
@@ -857,8 +1005,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                                     diff: nil,
                                     manifest: nil,
                                     snapshotDir: nil,
-                                    publishedSnapshotPath: nil,
-                                    primaryArtifactCandidates: []
+                                    publishedArtifacts: nil
                                 )
                             }
 
@@ -913,8 +1060,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                                 diff: projection.diff,
                                 manifest: manifest,
                                 snapshotDir: snapshotDirRel,
-                                publishedSnapshotPath: snapshotDirURL.path,
-                                primaryArtifactCandidates: projection.primaryArtifactCandidates
+                                publishedArtifacts: projection.publishedArtifacts
                             )
                         } catch {
                             return MCPGitArtifactRepoOutcome(
@@ -927,16 +1073,14 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                                 diff: nil,
                                 manifest: nil,
                                 snapshotDir: nil,
-                                publishedSnapshotPath: nil,
-                                primaryArtifactCandidates: []
+                                publishedArtifacts: nil
                             )
                         }
                     }
 
                     let perRepoResults = outcomes.map(\.result)
                     let collectedDiffs = outcomes.compactMap(\.diff)
-                    let publishedSnapshotPaths = outcomes.compactMap(\.publishedSnapshotPath)
-                    let primaryArtifactCandidates = outcomes.flatMap(\.primaryArtifactCandidates)
+                    let publishedSets = outcomes.compactMap(\.publishedArtifacts)
                     var manifestsBySnapshotDir: [String: GitDiffSnapshotManifest] = [:]
                     for outcome in outcomes {
                         if let snapshotDir = outcome.snapshotDir, let manifest = outcome.manifest {
@@ -944,18 +1088,12 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                         }
                     }
 
-                    await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
-                    if let publishedSnapshotPath = publishedSnapshotPaths.first {
-                        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
-                            userPath: publishedSnapshotPath,
-                            fallbackScope: .visibleWorkspacePlusGitData
-                        )
-                    }
-                    let autoSelectedPrimaryArtifacts = await autoSelectPrimaryGitDiffArtifacts(paths: primaryArtifactCandidates)
+                    let readiness = try await preparePublishedArtifacts(publishedSets)
                     let decoratedRepoResults = try await MCPGitToolProjection.decorateArtifactRepoResults(
                         perRepoResults,
                         manifestsBySnapshotDir: manifestsBySnapshotDir,
-                        autoSelectedPaths: autoSelectedPrimaryArtifacts
+                        autoSelectedPaths: readiness.autoSelectedAliases,
+                        readinessWarningsBySnapshotDir: readiness.warningsBySnapshotDir
                     )
                     let aggregate = try await MCPGitToolProjection.makeAggregateDTO(
                         from: collectedDiffs,
@@ -989,11 +1127,6 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
                 let snapshotID = manifest.snapshotID
                 let snapshotDirURL = store.snapshotDir(workspaceDirectory: workspaceDirectory, repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
-                await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
-                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
-                    userPath: snapshotDirURL.path,
-                    fallbackScope: .visibleWorkspacePlusGitData
-                )
                 let snapshotDirRel = store.snapshotRelativePath(repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
                 let projection = try await MCPGitToolProjection.makeArtifactProjection(
                     snapshotDirURL: snapshotDirURL,
@@ -1005,9 +1138,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     inlineMode: inlineMode,
                     inlineMaxLines: inlineMaxLines
                 )
-                let autoSelectedPrimaryArtifacts = await autoSelectPrimaryGitDiffArtifacts(
-                    paths: projection.primaryArtifactCandidates
-                )
+                let readiness = try await preparePublishedArtifacts([projection.publishedArtifacts])
+                let autoSelectedPrimaryArtifacts = readiness.autoSelectedAliases
                 let primaryArtifacts = try await MCPGitToolProjection.makePrimaryArtifactsDTO(
                     snapshotDir: snapshotDirRel,
                     artifacts: projection.artifacts,
@@ -1015,7 +1147,11 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     autoSelectedPaths: autoSelectedPrimaryArtifacts
                 )
                 let primaryWorktree = await requestContext.worktreeDTO(for: repoURL)
-                let combinedWarning = combineWarnings([artifactDiffWarning, buildWorktreeWarning(from: primaryWorktree)])
+                let combinedWarning = combineWarnings([
+                    artifactDiffWarning,
+                    buildWorktreeWarning(from: primaryWorktree),
+                    readiness.warningsBySnapshotDir[snapshotDirRel]
+                ])
 
                 return Reply(
                     op: "diff",

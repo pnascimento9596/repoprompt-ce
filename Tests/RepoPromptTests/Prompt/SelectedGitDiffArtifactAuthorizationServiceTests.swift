@@ -86,6 +86,42 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             .authorized(path: fixture.allPatchURL.path, kind: .patch, readability: .readable),
             .authorized(path: fixture.listedPatchURL.path, kind: .patch, readability: .readable)
         ])
+        XCTAssertEqual(
+            result.displayAliasesByAbsolutePath[fixture.mapURL.path],
+            "_git_data/repos/repo-storage/2026-06-19/1851/MAP.txt"
+        )
+        XCTAssertEqual(
+            result.displayAliasesByAbsolutePath[fixture.allPatchURL.path],
+            "_git_data/repos/repo-storage/2026-06-19/1851/diff/all.patch"
+        )
+    }
+
+    func testExactPathAuthorizationMatchesSelectedPathAuthorization() async throws {
+        let fixture = try await makeUnboundFixture()
+        let paths = [
+            fixture.mapURL.path,
+            fixture.allPatchURL.path,
+            fixture.listedPatchURL.path
+        ]
+        let selected = await authorize(fixture, selectedPaths: paths)
+        let exact = await SelectedGitDiffArtifactAuthorizationService()
+            .authorizeExactPaths(
+                ExactSelectedGitArtifactAuthorizationRequest(
+                    exactAbsolutePaths: paths,
+                    capability: fixture.capability,
+                    store: fixture.store
+                )
+            )
+
+        XCTAssertEqual(
+            exact.entries.map(\.file.standardizedFullPath),
+            selected.entries.map(\.file.standardizedFullPath)
+        )
+        XCTAssertEqual(exact.dispositions, selected.dispositions)
+        XCTAssertEqual(
+            Set(exact.dispositionsByAbsolutePath.keys),
+            Set(paths)
+        )
     }
 
     func testRejectsUnlistedPatchAndNonArtifactWithoutRawFallback() async throws {
@@ -104,6 +140,13 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             result.consumedSelectionPaths,
             Set([fixture.unlistedPatchURL.path, fixture.manifestURL.path])
         )
+        XCTAssertEqual(result.rejectedDisplayDiagnostics.count, 2)
+        XCTAssertTrue(result.rejectedDisplayDiagnostics.allSatisfy {
+            $0.hasPrefix("_git_data/")
+        })
+        XCTAssertTrue(result.rejectedDisplayDiagnostics.contains {
+            $0.contains("patch is not listed")
+        })
     }
 
     func testRejectsMismatchedTabRepoKeyAndSnapshotIdentity() async throws {
@@ -148,6 +191,105 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
         )
     }
 
+    func testVisibleLinkedWorktreeRequiresExactLiveRootIdentityAndTabProvenance() async throws {
+        let fixture = try await makeVisibleLinkedFixture()
+        XCTAssertTrue(fixture.capability.boundCheckouts.isEmpty)
+        XCTAssertEqual(fixture.capability.visibleRootCheckouts.count, 1)
+        XCTAssertEqual(fixture.capability.visibleRootCheckouts.first?.kind, .linkedWorktree)
+
+        let authorized = await authorize(fixture, selectedPaths: [fixture.allPatchURL.path])
+        XCTAssertEqual(
+            authorized.dispositions,
+            [.authorized(path: fixture.allPatchURL.path, kind: .patch, readability: .readable)]
+        )
+
+        let legacy = try await makeVisibleLinkedFixture(omitManifestTab: true)
+        let legacyResult = await authorize(legacy, selectedPaths: [legacy.allPatchURL.path])
+        XCTAssertEqual(
+            legacyResult.dispositions,
+            [.rejected(path: legacy.allPatchURL.path, reason: .legacyTabNotAllowed)]
+        )
+
+        let consumer = makeDelegationConsumer(workspaceID: fixture.capability.workspaceID)
+        let delegated = makeDelegatedCapability(
+            fixture,
+            consumer: consumer,
+            selectedPaths: [fixture.allPatchURL.path]
+        )
+        XCTAssertEqual(delegated.visibleRootCheckouts, fixture.capability.visibleRootCheckouts)
+        let delegatedResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(
+            delegatedResult.dispositions,
+            [.authorized(path: fixture.allPatchURL.path, kind: .patch, readability: .readable)]
+        )
+    }
+
+    func testVisibleLinkedWorktreeRejectsSiblingIdentityAndReloadedRootGeneration() async throws {
+        let fixture = try await makeVisibleLinkedFixture()
+        let layout = try XCTUnwrap(
+            GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: fixture.repoRoot)
+        )
+        let siblingRoot = fixture.workspace.appendingPathComponent("SiblingWorktree", isDirectory: true)
+        let siblingGitDir = layout.commonDir.appendingPathComponent("worktrees/sibling", isDirectory: true)
+        try FileManager.default.createDirectory(at: siblingGitDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: siblingRoot, withIntermediateDirectories: true)
+        try FileSystemTestSupport.write(
+            "gitdir: \(siblingGitDir.path)\n",
+            to: siblingRoot.appendingPathComponent(".git")
+        )
+        try FileSystemTestSupport.write("../..\n", to: siblingGitDir.appendingPathComponent("commondir"))
+        _ = try await fixture.store.loadRoot(path: siblingRoot.path, kind: .primaryWorkspace)
+        let siblingIdentities = await FrozenVisibleGitCheckoutResolver(vcsService: VCSService()).resolve(
+            workspaceRootPaths: [siblingRoot.path],
+            bindings: [],
+            store: fixture.store
+        )
+        let siblingCapability = SelectedGitArtifactCapability(
+            workspaceID: fixture.capability.workspaceID,
+            workspaceDirectoryPath: fixture.workspace.path,
+            gitDataRoot: fixture.capability.gitDataRoot,
+            creatorTabID: fixture.capability.creatorTabID,
+            sessionID: fixture.capability.sessionID,
+            boundCheckouts: [],
+            visibleRootCheckouts: siblingIdentities,
+            canonicalWorkspaceRootPaths: [siblingRoot.path]
+        )
+        let siblingResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: siblingCapability
+        )
+        XCTAssertEqual(
+            siblingResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .checkoutProvenanceMismatch)]
+        )
+
+        let lifetimeService = SelectedGitDiffArtifactAuthorizationService()
+        let wasCurrent = await lifetimeService.visibleRootCheckoutsAreCurrent(
+            capability: fixture.capability,
+            store: fixture.store
+        )
+        XCTAssertTrue(wasCurrent)
+        let frozenRoot = try XCTUnwrap(fixture.capability.visibleRootCheckouts.first?.workspaceRoot)
+        await fixture.store.unloadRoot(id: frozenRoot.id)
+        _ = try await fixture.store.loadRoot(path: fixture.repoRoot.path, kind: .primaryWorkspace)
+        let remainsCurrent = await lifetimeService.visibleRootCheckoutsAreCurrent(
+            capability: fixture.capability,
+            store: fixture.store
+        )
+        XCTAssertFalse(remainsCurrent)
+        let staleResult = await authorize(fixture, selectedPaths: [fixture.allPatchURL.path])
+        XCTAssertEqual(
+            staleResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .checkoutProvenanceMismatch)]
+        )
+    }
+
     func testBoundWorktreeRequiresMatchingManifestLayoutRepositoryAndWorktreeIdentity() async throws {
         let fixture = try await makeBoundFixture()
         let authorized = await authorize(fixture, selectedPaths: [fixture.allPatchURL.path])
@@ -185,6 +327,212 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
         XCTAssertEqual(
             mismatched.dispositions,
             [.rejected(path: fixture.allPatchURL.path, reason: .checkoutProvenanceMismatch)]
+        )
+    }
+
+    func testDelegatedCanonicalAuthorizationRequiresExactLaunchSelectionAndConsumer() async throws {
+        let fixture = try await makeUnboundFixture()
+        let consumer = makeDelegationConsumer(workspaceID: fixture.capability.workspaceID)
+        let delegated = makeDelegatedCapability(
+            fixture,
+            consumer: consumer,
+            selectedPaths: [fixture.mapURL.path, fixture.allPatchURL.path]
+        )
+
+        let authorized = await authorize(
+            fixture,
+            selectedPaths: [fixture.mapURL.path, fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(authorized.dispositions, [
+            .authorized(path: fixture.mapURL.path, kind: .map, readability: .readable),
+            .authorized(path: fixture.allPatchURL.path, kind: .patch, readability: .readable)
+        ])
+
+        let unselected = await authorize(
+            fixture,
+            selectedPaths: [fixture.listedPatchURL.path],
+            capability: delegated,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(
+            unselected.dispositions,
+            [.rejected(path: fixture.listedPatchURL.path, reason: .notInDelegatedSelection)]
+        )
+
+        let wrongRun = SelectedGitArtifactDelegationConsumer(
+            workspaceID: consumer.workspaceID,
+            tabID: consumer.tabID,
+            agentSessionID: consumer.agentSessionID,
+            agentRunID: UUID(),
+            boundCheckouts: consumer.boundCheckouts
+        )
+        let mismatchedConsumer = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: wrongRun
+        )
+        XCTAssertEqual(
+            mismatchedConsumer.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationConsumerMismatch)]
+        )
+
+        let wrongTab = SelectedGitArtifactDelegationConsumer(
+            workspaceID: consumer.workspaceID,
+            tabID: UUID(),
+            agentSessionID: consumer.agentSessionID,
+            agentRunID: consumer.agentRunID,
+            boundCheckouts: consumer.boundCheckouts
+        )
+        let wrongTabResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: wrongTab
+        )
+        XCTAssertEqual(
+            wrongTabResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationConsumerMismatch)]
+        )
+
+        let wrongSession = SelectedGitArtifactDelegationConsumer(
+            workspaceID: consumer.workspaceID,
+            tabID: consumer.tabID,
+            agentSessionID: UUID(),
+            agentRunID: consumer.agentRunID,
+            boundCheckouts: consumer.boundCheckouts
+        )
+        let wrongSessionResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: wrongSession
+        )
+        XCTAssertEqual(
+            wrongSessionResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationConsumerMismatch)]
+        )
+
+        let wrongWorkspace = SelectedGitArtifactDelegationConsumer(
+            workspaceID: UUID(),
+            tabID: consumer.tabID,
+            agentSessionID: consumer.agentSessionID,
+            agentRunID: consumer.agentRunID,
+            boundCheckouts: consumer.boundCheckouts
+        )
+        let wrongWorkspaceResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: wrongWorkspace
+        )
+        XCTAssertEqual(
+            wrongWorkspaceResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationWorkspaceMismatch)]
+        )
+
+        let wrongSource = makeDelegatedCapability(
+            fixture,
+            consumer: consumer,
+            selectedPaths: [fixture.allPatchURL.path],
+            sourceTabID: UUID()
+        )
+        let wrongSourceResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: wrongSource,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(
+            wrongSourceResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationConsumerMismatch)]
+        )
+
+        let directWithDelegatedConsumer = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: fixture.capability,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(
+            directWithDelegatedConsumer.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationConsumerMismatch)]
+        )
+    }
+
+    func testDelegatedCanonicalLegacyManifestFailsClosedWithoutChangingDirectCompatibility() async throws {
+        let fixture = try await makeUnboundFixture(omitManifestTab: true)
+        let direct = await authorize(fixture, selectedPaths: [fixture.allPatchURL.path])
+        XCTAssertEqual(
+            direct.dispositions,
+            [.authorized(path: fixture.allPatchURL.path, kind: .patch, readability: .readable)]
+        )
+
+        let consumer = makeDelegationConsumer(workspaceID: fixture.capability.workspaceID)
+        let delegated = makeDelegatedCapability(
+            fixture,
+            consumer: consumer,
+            selectedPaths: [fixture.allPatchURL.path]
+        )
+        let delegatedResult = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(
+            delegatedResult.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .legacyArtifactNotDelegable)]
+        )
+    }
+
+    func testDelegatedLinkedWorktreeRejectsTargetBindingMismatch() async throws {
+        let fixture = try await makeBoundFixture()
+        let consumer = makeDelegationConsumer(
+            workspaceID: fixture.capability.workspaceID,
+            boundCheckouts: fixture.capability.boundCheckouts
+        )
+        let delegated = makeDelegatedCapability(
+            fixture,
+            consumer: consumer,
+            selectedPaths: [fixture.allPatchURL.path]
+        )
+        let authorized = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: consumer
+        )
+        XCTAssertEqual(
+            authorized.dispositions,
+            [.authorized(path: fixture.allPatchURL.path, kind: .patch, readability: .readable)]
+        )
+
+        let siblingBinding = FrozenBoundCheckoutIdentity(
+            logicalRootPath: fixture.capability.boundCheckouts[0].logicalRootPath,
+            logicalRootName: fixture.capability.boundCheckouts[0].logicalRootName,
+            physicalWorktreeRootPath: fixture.capability.boundCheckouts[0].physicalWorktreeRootPath,
+            repositoryID: fixture.capability.boundCheckouts[0].repositoryID,
+            worktreeID: "sibling-worktree"
+        )
+        let siblingConsumer = SelectedGitArtifactDelegationConsumer(
+            workspaceID: consumer.workspaceID,
+            tabID: consumer.tabID,
+            agentSessionID: consumer.agentSessionID,
+            agentRunID: consumer.agentRunID,
+            boundCheckouts: [siblingBinding]
+        )
+        let rejected = await authorize(
+            fixture,
+            selectedPaths: [fixture.allPatchURL.path],
+            capability: delegated,
+            delegationConsumer: siblingConsumer
+        )
+        XCTAssertEqual(
+            rejected.dispositions,
+            [.rejected(path: fixture.allPatchURL.path, reason: .delegationBindingMismatch)]
         )
     }
 
@@ -259,7 +607,9 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
 
     private func authorize(
         _ fixture: Fixture,
-        selectedPaths: [String]
+        selectedPaths: [String],
+        capability: SelectedGitArtifactCapability? = nil,
+        delegationConsumer: SelectedGitArtifactDelegationConsumer? = nil
     ) async -> SelectedGitArtifactAuthorizationResult {
         await SelectedGitDiffArtifactAuthorizationService().authorize(
             SelectedGitArtifactAuthorizationRequest(
@@ -267,8 +617,55 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
                     selectedPaths: selectedPaths,
                     codemapAutoEnabled: false
                 ),
-                capability: fixture.capability,
-                store: fixture.store
+                capability: capability ?? fixture.capability,
+                store: fixture.store,
+                delegationConsumer: delegationConsumer
+            )
+        )
+    }
+
+    private func makeDelegationConsumer(
+        workspaceID: UUID,
+        boundCheckouts: [FrozenBoundCheckoutIdentity] = []
+    ) -> SelectedGitArtifactDelegationConsumer {
+        SelectedGitArtifactDelegationConsumer(
+            workspaceID: workspaceID,
+            tabID: UUID(),
+            agentSessionID: UUID(),
+            agentRunID: UUID(),
+            boundCheckouts: boundCheckouts
+        )
+    }
+
+    private func makeDelegatedCapability(
+        _ fixture: Fixture,
+        consumer: SelectedGitArtifactDelegationConsumer,
+        selectedPaths: Set<String>,
+        sourceTabID: UUID? = nil
+    ) -> SelectedGitArtifactCapability {
+        SelectedGitArtifactCapability(
+            workspaceID: fixture.capability.workspaceID,
+            workspaceDirectoryPath: fixture.capability.workspaceDirectoryPath,
+            gitDataRoot: fixture.capability.gitDataRoot,
+            creatorTabID: fixture.capability.creatorTabID,
+            sessionID: fixture.capability.sessionID,
+            boundCheckouts: fixture.capability.boundCheckouts,
+            visibleRootCheckouts: fixture.capability.visibleRootCheckouts,
+            canonicalWorkspaceRootPaths: fixture.capability.canonicalWorkspaceRootPaths,
+            access: .delegated(
+                SelectedGitArtifactDelegation(
+                    delegationID: UUID(),
+                    sourceWorkspaceID: fixture.capability.workspaceID,
+                    sourceTabID: sourceTabID ?? fixture.capability.creatorTabID,
+                    sourceAgentSessionID: fixture.capability.sessionID,
+                    sourceAgentRunID: UUID(),
+                    targetWorkspaceID: consumer.workspaceID,
+                    targetTabID: consumer.tabID,
+                    targetAgentSessionID: consumer.agentSessionID,
+                    targetAgentRunID: consumer.agentRunID,
+                    exactSelectedArtifactPaths: selectedPaths,
+                    targetBoundCheckouts: consumer.boundCheckouts
+                )
             )
         )
     }
@@ -373,6 +770,49 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
         )
     }
 
+    private func makeVisibleLinkedFixture(
+        omitManifestTab: Bool = false
+    ) async throws -> Fixture {
+        let workspace = try temporaryRoots.makeRoot(suiteName: "SelectedGitArtifactVisibleLinked")
+        let mainRoot = workspace.appendingPathComponent("Main", isDirectory: true)
+        let commonGitDir = mainRoot.appendingPathComponent(".git", isDirectory: true)
+        let gitDir = commonGitDir.appendingPathComponent("worktrees/visible", isDirectory: true)
+        let worktreeRoot = workspace.appendingPathComponent("VisibleWorktree", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        try FileSystemTestSupport.write(
+            "gitdir: \(gitDir.path)\n",
+            to: worktreeRoot.appendingPathComponent(".git")
+        )
+        try FileSystemTestSupport.write("../..\n", to: gitDir.appendingPathComponent("commondir"))
+
+        let creatorTabID = UUID()
+        let snapshotID = "2026-06-20/0900"
+        let repoKey = "visible-linked"
+        let manifest = makeManifest(
+            snapshotID: snapshotID,
+            repoKey: repoKey,
+            repoRoot: worktreeRoot.path,
+            isWorktree: true,
+            worktreeRoot: worktreeRoot.path,
+            mainWorktreeRoot: mainRoot.path,
+            commonGitDir: commonGitDir.path,
+            tabID: omitManifestTab ? nil : creatorTabID
+        )
+        return try await makeFixture(
+            workspace: workspace,
+            repoRoot: worktreeRoot,
+            repoKey: repoKey,
+            snapshotID: snapshotID,
+            manifest: manifest,
+            creatorTabID: creatorTabID,
+            boundCheckouts: [],
+            visibleWorkspaceRootPaths: [worktreeRoot.path],
+            canonicalWorkspaceRootPaths: [worktreeRoot.path],
+            allPatchContent: "visible linked patch"
+        )
+    }
+
     private func makeFixture(
         workspace: URL,
         repoRoot: URL,
@@ -382,6 +822,7 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
         creatorTabID: UUID,
         sessionID: UUID? = nil,
         boundCheckouts: [FrozenBoundCheckoutIdentity],
+        visibleWorkspaceRootPaths: [String] = [],
         canonicalWorkspaceRootPaths: [String],
         allPatchContent: String
     ) async throws -> Fixture {
@@ -416,6 +857,16 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             kind: .workspaceGitData
         )
         let gitDataRootRef = try XCTUnwrap(gitDataRootRefValue)
+        for visibleRootPath in visibleWorkspaceRootPaths {
+            _ = try await store.loadRoot(path: visibleRootPath, kind: .primaryWorkspace)
+        }
+        let visibleRootCheckouts = await FrozenVisibleGitCheckoutResolver(
+            vcsService: VCSService()
+        ).resolve(
+            workspaceRootPaths: visibleWorkspaceRootPaths,
+            bindings: [],
+            store: store
+        )
         let capability = SelectedGitArtifactCapability(
             workspaceID: UUID(),
             workspaceDirectoryPath: workspace.path,
@@ -423,6 +874,7 @@ final class SelectedGitDiffArtifactAuthorizationServiceTests: XCTestCase {
             creatorTabID: creatorTabID,
             sessionID: sessionID,
             boundCheckouts: boundCheckouts,
+            visibleRootCheckouts: visibleRootCheckouts,
             canonicalWorkspaceRootPaths: canonicalWorkspaceRootPaths
         )
         return Fixture(

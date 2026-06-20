@@ -97,6 +97,50 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertEqual(ingressAfterReply.launchCount, ingressBeforeReply.launchCount)
     }
 
+    func testStabilizedVirtualContextRefreshesCanonicalSelectionAndRevisionTogether() async throws {
+        let root = try makeTemporaryRoot(name: "StabilizedRevision")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let staleFile = root.appendingPathComponent("Stale.swift")
+        let freshFile = root.appendingPathComponent("Fresh.swift")
+        try write("struct Stale {}\n", to: staleFile)
+        try write("struct Fresh {}\n", to: freshFile)
+
+        let tabID = UUID()
+        let staleSelection = StoredSelection(selectedPaths: [staleFile.path])
+        let freshSelection = StoredSelection(selectedPaths: [freshFile.path])
+        let (window, workspaceID) = await makeWindow(
+            root: root,
+            tabID: tabID,
+            selection: staleSelection
+        )
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        var staleContext = makeContext(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: staleSelection
+        )
+        staleContext.selectionRevision = 0
+        var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+        liveTab.selection = freshSelection
+        XCTAssertTrue(
+            window.workspaceManager.updateComposeTabStoredOnly(
+                liveTab,
+                inWorkspaceID: workspaceID
+            )
+        )
+
+        let stabilized = await window.mcpServer.stabilizedVirtualContext(for: staleContext)
+        let canonicalRevision = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertEqual(stabilized.selection, freshSelection)
+        XCTAssertEqual(stabilized.selectionRevision, canonicalRevision)
+        XCTAssertGreaterThan(stabilized.selectionRevision, 0)
+    }
+
     func testAlreadyAwaitedRepliesKeepProviderResolvedLookupContext() async throws {
         let workspaceRoot = try makeTemporaryRoot(name: "Workspace")
         let worktreeRoot = try makeTemporaryRoot(name: "Worktree")

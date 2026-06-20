@@ -8,14 +8,36 @@ extension MCPServerViewModel {
 
     @MainActor
     func stabilizedVirtualSelection(for context: TabScopedContext) async -> StoredSelection {
+        await stabilizedVirtualContext(for: context).selection
+    }
+
+    @MainActor
+    func stabilizedVirtualContext(for context: TabScopedContext) async -> TabScopedContext {
         // For any tab-bound virtual context (including runs), prefer latest stored tab selection.
         // This prevents resurrecting stale slices from the run snapshot after the user clears them.
-        guard let manager = workspaceManager else { return context.selection }
+        guard let manager = workspaceManager else { return context }
+        var stabilized = context
         if let workspaceID = context.workspaceID {
             let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
-            return manager.composeTab(for: identity)?.selection ?? context.selection
+            guard let selection = manager.composeTab(for: identity)?.selection else { return context }
+            stabilized.selection = selection
+            stabilized.selectionRevision = manager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: context.tabID
+            )
+            return stabilized
         }
-        return manager.composeTab(with: context.tabID)?.selection ?? context.selection
+        guard let workspace = manager.workspaces.first(where: { workspace in
+            workspace.composeTabs.contains(where: { $0.id == context.tabID })
+        }),
+            let selection = manager.composeTab(with: context.tabID)?.selection
+        else { return context }
+        stabilized.selection = selection
+        stabilized.selectionRevision = manager.selectionRevisionForMCP(
+            workspaceID: workspace.id,
+            tabID: context.tabID
+        )
+        return stabilized
     }
 
     struct TabSelectionData {
@@ -258,33 +280,23 @@ extension MCPServerViewModel {
         extraInvalid: [String],
         viewMode: String?,
         codeMapUsageOverride: CodeMapUsage?,
-        lookupContext: WorkspaceLookupContext = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace,
+        virtualContext: TabScopedContext? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> ToolResultDTOs.SelectionReply {
-        let source = StoredSelectionSource(
-            stored: lookupContext.physicalizeSelection(selection),
-            codeMapUsage: effectiveMCPCodeMapUsage(codeMapUsageOverride ?? promptVM.codeMapUsage)
-        )
-        let collections = await SelectionReplyAssembler.collect(
-            from: source,
-            owner: self,
-            rootScope: lookupContext.rootScope,
-            contentPolicy: includeBlocks ? .loadContent : .cachedOnly
-        )
-        let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
-        let tokens = TokenServices(owner: self)
-        var reply = await SelectionReplyAssembler.buildSelectionReply(
-            collections: collections,
+        await buildTabSelectionReply(
+            from: selection,
             includeBlocks: includeBlocks,
             display: display,
-            formatter: formatter,
-            tokens: tokens,
-            status: "preview",
-            extraInvalid: extraInvalid
+            extraInvalid: extraInvalid,
+            viewMode: viewMode,
+            codeMapUsageOverride: codeMapUsageOverride,
+            virtualContext: virtualContext,
+            lookupContextOverride: lookupContext,
+            ingressPolicy: .alreadyAwaited,
+            reviewGitContextOverride: reviewGitContext,
+            statusOverride: "preview"
         )
-        if let viewMode, viewMode == "codemaps" {
-            reply = SelectionReplyAssembler.applyViewFilter(reply, view: viewMode)
-        }
-        return reply
     }
 
     @MainActor
@@ -298,7 +310,9 @@ extension MCPServerViewModel {
         virtualContext: TabScopedContext? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
         codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle? = nil,
-        ingressPolicy: SelectionReplyIngressPolicy = .awaitPending
+        ingressPolicy: SelectionReplyIngressPolicy = .awaitPending,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
+        statusOverride: String = "ok"
     ) async -> ToolResultDTOs.SelectionReply {
         // Always use .auto mode for manage_selection (normalized view)
         let effectiveOverride = effectiveMCPCodeMapUsage(codeMapUsageOverride ?? .auto)
@@ -313,13 +327,36 @@ extension MCPServerViewModel {
             _ = await promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         }
         let effectiveSelection = lookupContext.physicalizeSelection(selection)
-        let source = StoredSelectionSource(stored: effectiveSelection, codeMapUsage: effectiveOverride)
-        let collections = await SelectionReplyAssembler.collect(
+        let reviewGitContext = if let reviewGitContextOverride {
+            reviewGitContextOverride
+        } else {
+            await promptVM.freezePromptGitReviewContext(
+                workspaceID: virtualContext?.workspaceID,
+                tabID: virtualContext?.tabID,
+                sessionID: virtualContext?.activeAgentSessionID,
+                bindings: virtualContext?.worktreeBindings ?? [],
+                base: "HEAD"
+            )
+        }
+        let artifactAuthorization = await authorizeSelectedGitArtifacts(
+            selection: effectiveSelection,
+            reviewGitContext: reviewGitContext
+        )
+        let ordinarySelection = selectionExcludingArtifacts(
+            effectiveSelection,
+            excluding: artifactAuthorization.consumedSelectionPaths
+        )
+        let source = StoredSelectionSource(stored: ordinarySelection, codeMapUsage: effectiveOverride)
+        let ordinaryCollections = await SelectionReplyAssembler.collect(
             from: source,
             owner: self,
-            rootScope: lookupContext.rootScope,
+            rootScope: lookupContext.rootScope.excludingWorkspaceGitData,
             codemapSnapshotBundle: codemapSnapshotBundle,
             contentPolicy: includeBlocks ? .loadContent : .cachedOnly
+        )
+        let collections = overlaySelectedGitArtifacts(
+            artifactAuthorization,
+            onto: ordinaryCollections
         )
         let resolvedPromptContext = promptVM.resolvePromptContext()
         let accountingContext = virtualContext ?? TabContextSnapshot(
@@ -341,7 +378,30 @@ extension MCPServerViewModel {
             lookupContext: lookupContext,
             activeTabCompatibility: virtualContext == nil && codemapSnapshotBundle == nil
         )
-        let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
+        let artifactRootMetadata: [String: PathFormatter.RootMetadata] = Dictionary(
+            uniqueKeysWithValues: artifactAuthorization.displayAliasesByAbsolutePath.compactMap { path, alias in
+                guard artifactAuthorization.entries.contains(where: {
+                    $0.file.standardizedFullPath == path
+                }) else { return nil }
+                let pathWithinRoot = alias.hasPrefix("_git_data/")
+                    ? String(alias.dropFirst("_git_data/".count))
+                    : alias
+                return (
+                    path,
+                    PathFormatter.RootMetadata(
+                        rootPath: "_git_data",
+                        pathWithinRoot: pathWithinRoot
+                    )
+                )
+            }
+        )
+        let formatter = PathFormatter(
+            format: display,
+            owner: self,
+            projection: lookupContext.bindingProjection,
+            displayPathOverrides: artifactAuthorization.displayAliasesByAbsolutePath,
+            rootMetadataOverrides: artifactRootMetadata
+        )
         let tokens = TokenServices(owner: self)
 
         // Get user's effective copy preset mode
@@ -375,12 +435,14 @@ extension MCPServerViewModel {
             collections: collections,
             includeBlocks: includeBlocks,
             display: display,
-            status: "ok",
-            extraInvalid: extraInvalid,
+            status: statusOverride,
+            extraInvalid: extraInvalid + artifactAuthorization.rejectedDisplayDiagnostics,
             userPresetState: userPresetState,
             tokens: tokens,
             tokenStatsOverride: tokenStatsOverride,
-            tokenAccountingOverride: preparedAccounting.tokenAccounting
+            tokenAccountingOverride: preparedAccounting.tokenAccounting,
+            pathProjection: lookupContext.bindingProjection,
+            displayPathOverrides: artifactAuthorization.displayAliasesByAbsolutePath
         )
 
         // Inject minimal codeStructure.unmappedPaths to report pending codemaps
@@ -415,6 +477,65 @@ extension MCPServerViewModel {
         return reply
     }
 
+    private func authorizeSelectedGitArtifacts(
+        selection: StoredSelection,
+        reviewGitContext: FrozenPromptGitReviewContext
+    ) async -> SelectedGitArtifactAuthorizationResult {
+        guard let capability = reviewGitContext.artifactCapability else {
+            return SelectedGitArtifactAuthorizationResult(
+                entries: [],
+                consumedSelectionPaths: [],
+                dispositions: []
+            )
+        }
+        return await SelectedGitDiffArtifactAuthorizationService().authorize(
+            SelectedGitArtifactAuthorizationRequest(
+                physicalSelection: selection,
+                capability: capability,
+                store: promptVM.workspaceFileContextStore
+            )
+        )
+    }
+
+    private func selectionExcludingArtifacts(
+        _ selection: StoredSelection,
+        excluding consumedPaths: Set<String>
+    ) -> StoredSelection {
+        guard !consumedPaths.isEmpty else { return selection }
+        let normalizedConsumed = Set(
+            consumedPaths.compactMap(StoredSelectionPathNormalization.standardizedPath)
+        )
+        func isConsumed(_ path: String) -> Bool {
+            consumedPaths.contains(path)
+                || StoredSelectionPathNormalization.standardizedPath(path)
+                .map(normalizedConsumed.contains) == true
+        }
+        return StoredSelection(
+            selectedPaths: selection.selectedPaths.filter { !isConsumed($0) },
+            autoCodemapPaths: selection.autoCodemapPaths.filter { !isConsumed($0) },
+            slices: selection.slices.filter { !isConsumed($0.key) },
+            codemapAutoEnabled: selection.codemapAutoEnabled
+        )
+    }
+
+    private func overlaySelectedGitArtifacts(
+        _ authorization: SelectedGitArtifactAuthorizationResult,
+        onto collections: SelectionReplyAssembler.SelectionCollections
+    ) -> SelectionReplyAssembler.SelectionCollections {
+        let artifactEntries = authorization.entries.map {
+            SelectionReplyAssembler.SelectedEntry(entry: $0)
+        }
+        guard !artifactEntries.isEmpty else { return collections }
+        return SelectionReplyAssembler.SelectionCollections(
+            selected: artifactEntries + collections.selected,
+            codemap: collections.codemap,
+            codemapAutoEnabled: collections.codemapAutoEnabled,
+            codeMapUsage: collections.codeMapUsage,
+            invalid: collections.invalid,
+            codemapSnapshotBundle: collections.codemapSnapshotBundle
+        )
+    }
+
     // MARK: - Unified Selection Reply Builder
 
     /// Unified entry point to build a selection reply from a resolved tab-context snapshot.
@@ -429,7 +550,7 @@ extension MCPServerViewModel {
     ) async -> ToolResultDTOs.SelectionReply {
         var context = resolvedContext.snapshot
         if !resolvedContext.usesActiveTabCompatibility {
-            context.selection = await stabilizedVirtualSelection(for: context)
+            context = await stabilizedVirtualContext(for: context)
         }
         return await buildTabSelectionReply(
             from: context.selection,
@@ -453,13 +574,14 @@ extension MCPServerViewModel {
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
         virtualContext: TabScopedContext?,
-        lookupContext: WorkspaceLookupContext
+        lookupContext: WorkspaceLookupContext,
+        reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> ToolResultDTOs.SelectionReply {
         var effectiveSelection = selection
         var effectiveVirtualContext = virtualContext
         if var context = virtualContext {
-            effectiveSelection = await stabilizedVirtualSelection(for: context)
-            context.selection = effectiveSelection
+            context = await stabilizedVirtualContext(for: context)
+            effectiveSelection = context.selection
             effectiveVirtualContext = context
         }
         return await buildTabSelectionReply(
@@ -471,7 +593,8 @@ extension MCPServerViewModel {
             codeMapUsageOverride: codeMapUsageOverride,
             virtualContext: effectiveVirtualContext,
             lookupContextOverride: lookupContext,
-            ingressPolicy: .alreadyAwaited
+            ingressPolicy: .alreadyAwaited,
+            reviewGitContextOverride: reviewGitContext
         )
     }
 

@@ -705,6 +705,7 @@ actor WorkspaceFileContextStore {
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
         private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
+        private var publishedGitArtifactIngressDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
         private var storeEditDeferredPublicationDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
@@ -762,6 +763,12 @@ actor WorkspaceFileContextStore {
 
         func setEnsureIndexedFilesEligibilityDidResolveHandler(_ handler: (@Sendable (UUID, String) async -> Void)?) {
             ensureIndexedFilesEligibilityDidResolveHandler = handler
+        }
+
+        func setPublishedGitArtifactIngressDidRegisterHandler(
+            _ handler: (@Sendable (UUID, String) async -> Void)?
+        ) {
+            publishedGitArtifactIngressDidRegisterHandler = handler
         }
 
         func setWatcherSinkWillApplyHandler(_ handler: (@Sendable (UUID) async -> Void)?) {
@@ -6769,6 +6776,136 @@ actor WorkspaceFileContextStore {
         case .eligible:
             return try .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: false))
         }
+    }
+
+    func ingressPublishedGitArtifacts(
+        _ request: WorkspacePublishedGitArtifactIngressRequest
+    ) async -> WorkspacePublishedGitArtifactIngressResult {
+        func staleRootResult() -> WorkspacePublishedGitArtifactIngressResult {
+            WorkspacePublishedGitArtifactIngressResult(outcomes: request.artifacts.map {
+                WorkspacePublishedGitArtifactIngressOutcome(artifact: $0, status: .staleRoot)
+            })
+        }
+
+        guard let initialState = exactRootState(
+            expectedRoot: request.root,
+            expectedKind: .workspaceGitData
+        ) else {
+            return staleRootResult()
+        }
+        let expectedBatchLifetimeID = initialState.lifetimeID
+
+        var outcomes: [WorkspacePublishedGitArtifactIngressOutcome] = []
+        var seenAbsolutePaths = Set<String>()
+
+        func append(
+            _ artifact: GitDiffPublishedArtifact,
+            _ status: WorkspacePublishedGitArtifactIngressOutcomeStatus
+        ) {
+            outcomes.append(WorkspacePublishedGitArtifactIngressOutcome(
+                artifact: artifact,
+                status: status
+            ))
+        }
+
+        for artifact in request.artifacts {
+            let relativePath = artifact.gitDataRelativePath
+            guard GitDiffArtifactPathPolicy.isSafeRelativeArtifactPath(relativePath) else {
+                append(artifact, .invalidRelativePath)
+                continue
+            }
+
+            let absolutePath = artifact.absolutePath
+            guard absolutePath.hasPrefix("/"),
+                  !StandardizedPath.containsNUL(absolutePath),
+                  StandardizedPath.isDescendant(absolutePath, of: request.root.standardizedFullPath),
+                  absolutePath != request.root.standardizedFullPath
+            else {
+                append(artifact, .outsideExpectedRoot)
+                continue
+            }
+
+            let reconstructedPath = StandardizedPath.join(
+                standardizedRoot: request.root.standardizedFullPath,
+                standardizedRelativePath: relativePath
+            )
+            guard reconstructedPath == absolutePath else {
+                append(artifact, .outsideExpectedRoot)
+                continue
+            }
+
+            guard seenAbsolutePaths.insert(absolutePath).inserted else {
+                append(artifact, .duplicateOf(path: absolutePath))
+                continue
+            }
+
+            guard let state = exactRootState(
+                expectedRoot: request.root,
+                expectedKind: .workspaceGitData
+            ), state.lifetimeID == expectedBatchLifetimeID else {
+                return staleRootResult()
+            }
+            let eligibility = await state.service.registerExplicitlyManagedRegularFile(
+                relativePath: relativePath
+            )
+            #if DEBUG
+                if let publishedGitArtifactIngressDidRegisterHandler {
+                    await publishedGitArtifactIngressDidRegisterHandler(request.root.id, relativePath)
+                }
+            #endif
+
+            guard let revalidatedState = exactRootState(
+                expectedRoot: request.root,
+                expectedKind: .workspaceGitData
+            ), revalidatedState.lifetimeID == expectedBatchLifetimeID else {
+                return staleRootResult()
+            }
+
+            let managedOnly: Bool
+            switch eligibility {
+            case .eligible:
+                managedOnly = false
+            case .ineligible(.ignored):
+                managedOnly = true
+            case .ineligible(.missingOrDirectory):
+                pruneCatalogFileMissingOnDisk(
+                    rootID: request.root.id,
+                    relativePath: relativePath,
+                    publishDelta: true
+                )
+                append(artifact, .missingOnDisk)
+                continue
+            case let .ineligible(reason):
+                append(artifact, .ineligible(reason: reason))
+                continue
+            }
+
+            do {
+                let record = try materializeCatalogRegularFile(
+                    rootID: request.root.id,
+                    relativePath: relativePath,
+                    managedOnly: managedOnly
+                )
+                append(artifact, .cataloged(record: record))
+            } catch {
+                if !regularFileAppearsPresentOnDisk(
+                    root: revalidatedState.root,
+                    relativePath: relativePath
+                ) {
+                    append(artifact, .missingOnDisk)
+                } else {
+                    append(artifact, .materializationFailed(reason: error.localizedDescription))
+                }
+            }
+        }
+
+        guard let finalState = exactRootState(
+            expectedRoot: request.root,
+            expectedKind: .workspaceGitData
+        ), finalState.lifetimeID == expectedBatchLifetimeID else {
+            return staleRootResult()
+        }
+        return WorkspacePublishedGitArtifactIngressResult(outcomes: outcomes)
     }
 
     private func explicitDiskLookupCandidates(

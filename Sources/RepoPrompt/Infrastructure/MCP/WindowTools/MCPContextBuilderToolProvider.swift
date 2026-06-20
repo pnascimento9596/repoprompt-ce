@@ -373,7 +373,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     false,
                     .relative,
                     .auto,
-                    lookupContext
+                    lookupContext,
+                    tabResolution.reviewGitContext
                 )
                 let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
 

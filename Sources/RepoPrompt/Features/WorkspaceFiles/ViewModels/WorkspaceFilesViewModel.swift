@@ -571,6 +571,20 @@ class WorkspaceFilesViewModel: ObservableObject {
         case supplementalSystem
     }
 
+    enum GitDataRootLoadError: LocalizedError, Equatable {
+        case systemWorkspace(workspaceID: UUID)
+        case exactRootUnavailable(path: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .systemWorkspace(workspaceID):
+                "Git-data roots are unavailable for system workspace \(workspaceID.uuidString)."
+            case let .exactRootUnavailable(path):
+                "The loaded Git-data root does not have the expected workspace Git-data identity: \(path)"
+            }
+        }
+    }
+
     private func workspaceRootKind(for rootKind: RootKind, url: URL) -> WorkspaceRootKind {
         switch rootKind {
         case .user:
@@ -3181,23 +3195,27 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspace: WorkspaceModel,
         workspaceManager: WorkspaceManagerViewModel,
         refreshRootFolderStateAfterLoad: Bool = true
-    ) async {
+    ) async throws -> WorkspaceRootRef {
         guard workspace.isSystemWorkspace == false else {
-            return
+            throw GitDataRootLoadError.systemWorkspace(workspaceID: workspace.id)
         }
+
         let gitDataURL = workspaceManager.gitDataDirectory(for: workspace)
-        if isFolderAlreadyLoaded(gitDataURL) {
-            return
-        }
-        do {
+        if !isFolderAlreadyLoaded(gitDataURL) {
             try await loadSupplementalRoot(
                 at: gitDataURL,
                 for: workspace,
                 refreshRootFolderStateAfterLoad: refreshRootFolderStateAfterLoad
             )
-        } catch {
-            print("Failed to load _git_data root: \(error)")
         }
+
+        guard let exactRoot = await workspaceFileContextStore.exactRootRef(
+            path: gitDataURL.path,
+            kind: .workspaceGitData
+        ) else {
+            throw GitDataRootLoadError.exactRootUnavailable(path: gitDataURL.path)
+        }
+        return exactRoot
     }
 
     private func removeFolderBeingAdded() {

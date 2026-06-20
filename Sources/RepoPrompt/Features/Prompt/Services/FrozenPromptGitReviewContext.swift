@@ -6,8 +6,21 @@ import Foundation
 /// consume it, but must not reacquire repository, comparison, workspace, or tab identity.
 struct FrozenPromptGitReviewContext: Equatable {
     let artifactCapability: SelectedGitArtifactCapability?
+    let artifactDelegationConsumer: SelectedGitArtifactDelegationConsumer?
     let compareIntent: ReviewGitCompareIntent
     let displayContext: ReviewGitDisplayContext
+
+    init(
+        artifactCapability: SelectedGitArtifactCapability?,
+        artifactDelegationConsumer: SelectedGitArtifactDelegationConsumer? = nil,
+        compareIntent: ReviewGitCompareIntent,
+        displayContext: ReviewGitDisplayContext
+    ) {
+        self.artifactCapability = artifactCapability
+        self.artifactDelegationConsumer = artifactDelegationConsumer
+        self.compareIntent = compareIntent
+        self.displayContext = displayContext
+    }
 }
 
 enum ReviewGitCompareIntent: Equatable {
@@ -35,7 +48,9 @@ struct SelectedGitArtifactCapability: Equatable {
     let creatorTabID: UUID
     let sessionID: UUID?
     let boundCheckouts: [FrozenBoundCheckoutIdentity]
+    let visibleRootCheckouts: [FrozenVisibleGitCheckoutIdentity]
     let canonicalWorkspaceRootPaths: [String]
+    let access: SelectedGitArtifactAccess
 
     init(
         workspaceID: UUID,
@@ -44,7 +59,9 @@ struct SelectedGitArtifactCapability: Equatable {
         creatorTabID: UUID,
         sessionID: UUID?,
         boundCheckouts: [FrozenBoundCheckoutIdentity],
-        canonicalWorkspaceRootPaths: [String]
+        visibleRootCheckouts: [FrozenVisibleGitCheckoutIdentity] = [],
+        canonicalWorkspaceRootPaths: [String],
+        access: SelectedGitArtifactAccess = .direct
     ) {
         self.workspaceID = workspaceID
         self.workspaceDirectoryPath = StandardizedPath.absolute(
@@ -54,13 +71,93 @@ struct SelectedGitArtifactCapability: Equatable {
         self.creatorTabID = creatorTabID
         self.sessionID = sessionID
         self.boundCheckouts = boundCheckouts
+        self.visibleRootCheckouts = visibleRootCheckouts
         self.canonicalWorkspaceRootPaths = canonicalWorkspaceRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
         }
+        self.access = access
+    }
+
+    func delegated(_ delegation: SelectedGitArtifactDelegation) -> SelectedGitArtifactCapability {
+        SelectedGitArtifactCapability(
+            workspaceID: workspaceID,
+            workspaceDirectoryPath: workspaceDirectoryPath,
+            gitDataRoot: gitDataRoot,
+            creatorTabID: creatorTabID,
+            sessionID: sessionID,
+            boundCheckouts: boundCheckouts,
+            visibleRootCheckouts: visibleRootCheckouts,
+            canonicalWorkspaceRootPaths: canonicalWorkspaceRootPaths,
+            access: .delegated(delegation)
+        )
     }
 }
 
-struct FrozenBoundCheckoutIdentity: Equatable {
+enum SelectedGitArtifactAccess: Equatable {
+    case direct
+    case delegated(SelectedGitArtifactDelegation)
+}
+
+/// Immutable, source-owned authority for one exact child Agent Mode run.
+///
+/// The allowlist contains only identities selected when the child was launched. The capability is
+/// deliberately ephemeral and grants no root discovery or raw filesystem access.
+struct SelectedGitArtifactDelegation: Equatable {
+    let delegationID: UUID
+    let sourceWorkspaceID: UUID
+    let sourceTabID: UUID
+    let sourceAgentSessionID: UUID?
+    let sourceAgentRunID: UUID?
+    let targetWorkspaceID: UUID
+    let targetTabID: UUID
+    let targetAgentSessionID: UUID
+    let targetAgentRunID: UUID
+    let exactSelectedArtifactPaths: Set<String>
+    let targetBoundCheckouts: [FrozenBoundCheckoutIdentity]
+
+    init(
+        delegationID: UUID,
+        sourceWorkspaceID: UUID,
+        sourceTabID: UUID,
+        sourceAgentSessionID: UUID?,
+        sourceAgentRunID: UUID?,
+        targetWorkspaceID: UUID,
+        targetTabID: UUID,
+        targetAgentSessionID: UUID,
+        targetAgentRunID: UUID,
+        exactSelectedArtifactPaths: Set<String>,
+        targetBoundCheckouts: [FrozenBoundCheckoutIdentity]
+    ) {
+        self.delegationID = delegationID
+        self.sourceWorkspaceID = sourceWorkspaceID
+        self.sourceTabID = sourceTabID
+        self.sourceAgentSessionID = sourceAgentSessionID
+        self.sourceAgentRunID = sourceAgentRunID
+        self.targetWorkspaceID = targetWorkspaceID
+        self.targetTabID = targetTabID
+        self.targetAgentSessionID = targetAgentSessionID
+        self.targetAgentRunID = targetAgentRunID
+        self.exactSelectedArtifactPaths = Set(exactSelectedArtifactPaths.compactMap(Self.normalizeIdentity))
+        self.targetBoundCheckouts = targetBoundCheckouts
+    }
+
+    private static func normalizeIdentity(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/"), !StandardizedPath.containsNUL(trimmed) else { return nil }
+        return StandardizedPath.absolute((trimmed as NSString).expandingTildeInPath)
+    }
+}
+
+/// Current consumer identity supplied by the exact child Agent Mode run at packaging time.
+struct SelectedGitArtifactDelegationConsumer: Equatable {
+    let workspaceID: UUID
+    let tabID: UUID
+    let agentSessionID: UUID
+    let agentRunID: UUID
+    let boundCheckouts: [FrozenBoundCheckoutIdentity]
+}
+
+struct FrozenBoundCheckoutIdentity: Equatable, Hashable {
     let logicalRootPath: String
     let logicalRootName: String
     let physicalWorktreeRootPath: String
@@ -154,6 +251,11 @@ extension FrozenPromptGitReviewContext {
                 worktreeID: $0.worktreeID
             )
         }
+        let visibleRootCheckouts = await FrozenVisibleGitCheckoutResolver().resolve(
+            workspaceRootPaths: workspaceRootPaths,
+            bindings: bindings,
+            store: store
+        )
         let capability = gitDataRoot.map {
             SelectedGitArtifactCapability(
                 workspaceID: workspaceID,
@@ -162,6 +264,7 @@ extension FrozenPromptGitReviewContext {
                 creatorTabID: tabID,
                 sessionID: sessionID,
                 boundCheckouts: boundCheckouts,
+                visibleRootCheckouts: visibleRootCheckouts,
                 canonicalWorkspaceRootPaths: workspaceRootPaths
             )
         }

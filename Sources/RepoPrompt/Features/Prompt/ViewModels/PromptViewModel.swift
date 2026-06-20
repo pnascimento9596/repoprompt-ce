@@ -48,6 +48,16 @@ class PromptViewModel: ObservableObject {
     /// Set to true to enable debug logging for settings sync
     static var debugLoggingEnabled = false
 
+    #if DEBUG
+        private var automaticReviewGitDiffProviderOverrideForTesting: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+
+        func setAutomaticReviewGitDiffProviderOverrideForTesting(
+            _ override: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+        ) {
+            automaticReviewGitDiffProviderOverrideForTesting = override
+        }
+    #endif
+
     // MARK: - Type Definitions and Enums
 
     enum PlanActMode: String, CaseIterable, Codable {
@@ -1040,7 +1050,10 @@ class PromptViewModel: ObservableObject {
         )
 
         // Ensure _git_data is visible and refreshed
-        await fileManager.ensureGitDataRootLoaded(workspace: workspace, workspaceManager: workspaceManager)
+        _ = try await fileManager.ensureGitDataRootLoaded(
+            workspace: workspace,
+            workspaceManager: workspaceManager
+        )
         await fileManager.flushPendingDeltas(aggressive: true)
 
         return result
@@ -4955,7 +4968,7 @@ class PromptViewModel: ObservableObject {
             return metaInstructionsForChat
         }()
 
-        return PromptPackagingService.buildAIMessage(
+        let message = PromptPackagingService.buildAIMessage(
             systemPrompt: systemPrompt,
             metaInstructions: metaForThisChat,
             fileTree: fileTreeString,
@@ -4967,6 +4980,20 @@ class PromptViewModel: ObservableObject {
             disabledPromptSections: disabledPromptSections,
             duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
         )
+        #if DEBUG
+            OracleReviewPackagingDiagnostics.recordPreassembly(
+                mode: effectiveMode,
+                model: overrideModel,
+                chatPreset: preset,
+                config: activeConfig,
+                selectedArtifactPolicy: .includeBeforeGitInclusion,
+                logicalSelection: logicalSelection,
+                preassembly: preAssembly,
+                message: message,
+                disabledPromptSections: disabledPromptSections
+            )
+        #endif
+        return message
     }
 
     func getSystemPrompt() -> String {
@@ -5483,6 +5510,9 @@ extension PromptViewModel {
         }
         let gitVM = gitViewModel
         let coordinator = AutomaticReviewGitDiffCoordinator()
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
         return await PromptContextPreAssemblyService.resolve(
             PromptContextPreAssemblyRequest(
                 cfg: cfg,
@@ -5497,7 +5527,12 @@ extension PromptViewModel {
                 includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
                 reviewGitContext: frozenReviewContext,
                 selectedGitDiffProvider: { request in
-                    await coordinator.resolve(request)
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
                 },
                 completeGitDiffProvider: { [gitVM] in
                     await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)

@@ -121,6 +121,59 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(Set(nestedRoots.map(\.standardizedFullPath)), Set([logicalRoot.standardizedFileURL.path]))
     }
 
+    func testResolveWithoutBindingsFreezesVisibleLinkedCheckoutAuthority() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "ContextBuilderVisibleLinked")
+        defer { fixture.cleanup() }
+
+        let canonical = try fixture.makeRepository(named: "canonical")
+        let linked = try fixture.makeLinkedWorktree(
+            from: canonical,
+            named: "linked",
+            branch: "feature/context-builder-visible"
+        )
+        let workspaceDirectory = fixture.sandbox.appendingPathComponent(
+            "workspace",
+            isDirectory: true
+        )
+        let gitDataRoot = workspaceDirectory.appendingPathComponent("_git_data", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDataRoot, withIntermediateDirectories: true)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: linked.path, kind: .primaryWorkspace)
+        _ = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 45,
+            workspaceID: UUID(),
+            promptText: "Review visible linked checkout",
+            selection: StoredSelection(codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Visible linked",
+            runID: UUID(),
+            activeAgentSessionID: UUID(),
+            worktreeBindings: [],
+            explicitlyBound: false
+        )
+
+        let context = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot,
+            workspaceRepoPaths: [linked.path],
+            workspaceDirectoryPath: workspaceDirectory.path,
+            store: store
+        )
+
+        let capability = try XCTUnwrap(context.reviewGitContext.artifactCapability)
+        XCTAssertTrue(capability.boundCheckouts.isEmpty)
+        XCTAssertEqual(capability.visibleRootCheckouts.count, 1)
+        XCTAssertEqual(capability.visibleRootCheckouts.first?.kind, .linkedWorktree)
+        XCTAssertEqual(
+            capability.visibleRootCheckouts.first?.visibleRootPath,
+            GitRepoRootAuthorization.canonicalPath(linked.path)
+        )
+        XCTAssertEqual(context.providerWorkspacePath, linked.standardizedFileURL.path)
+        XCTAssertNil(context.lookupContext.bindingProjection)
+    }
+
     func testResolveFailsClosedWhenWorktreeBindingStateIsUnhydrated() async throws {
         let logicalRoot = try makeTemporaryDirectory(name: "ContextBuilderUnhydrated")
         defer { try? FileManager.default.removeItem(at: logicalRoot) }

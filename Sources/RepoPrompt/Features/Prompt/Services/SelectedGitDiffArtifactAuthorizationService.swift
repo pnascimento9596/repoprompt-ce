@@ -4,12 +4,74 @@ struct SelectedGitArtifactAuthorizationRequest {
     let physicalSelection: StoredSelection
     let capability: SelectedGitArtifactCapability
     let store: WorkspaceFileContextStore
+    let delegationConsumer: SelectedGitArtifactDelegationConsumer?
+
+    init(
+        physicalSelection: StoredSelection,
+        capability: SelectedGitArtifactCapability,
+        store: WorkspaceFileContextStore,
+        delegationConsumer: SelectedGitArtifactDelegationConsumer? = nil
+    ) {
+        self.physicalSelection = physicalSelection
+        self.capability = capability
+        self.store = store
+        self.delegationConsumer = delegationConsumer
+    }
+}
+
+struct ExactSelectedGitArtifactAuthorizationRequest {
+    let exactAbsolutePaths: [String]
+    let capability: SelectedGitArtifactCapability
+    let store: WorkspaceFileContextStore
+    let delegationConsumer: SelectedGitArtifactDelegationConsumer?
+
+    init(
+        exactAbsolutePaths: [String],
+        capability: SelectedGitArtifactCapability,
+        store: WorkspaceFileContextStore,
+        delegationConsumer: SelectedGitArtifactDelegationConsumer? = nil
+    ) {
+        self.exactAbsolutePaths = exactAbsolutePaths
+        self.capability = capability
+        self.store = store
+        self.delegationConsumer = delegationConsumer
+    }
 }
 
 struct SelectedGitArtifactAuthorizationResult {
     let entries: [ResolvedPromptFileEntry]
     let consumedSelectionPaths: Set<String>
     let dispositions: [SelectedGitArtifactDisposition]
+    let displayAliasesByAbsolutePath: [String: String]
+
+    init(
+        entries: [ResolvedPromptFileEntry],
+        consumedSelectionPaths: Set<String>,
+        dispositions: [SelectedGitArtifactDisposition],
+        displayAliasesByAbsolutePath: [String: String] = [:]
+    ) {
+        self.entries = entries
+        self.consumedSelectionPaths = consumedSelectionPaths
+        self.dispositions = dispositions
+        self.displayAliasesByAbsolutePath = displayAliasesByAbsolutePath
+    }
+
+    var rejectedDisplayDiagnostics: [String] {
+        dispositions.compactMap { disposition in
+            guard case let .rejected(path, reason) = disposition else { return nil }
+            let displayPath = displayAliasesByAbsolutePath[path] ?? path
+            return "\(displayPath): \(reason.diagnosticLabel)"
+        }
+    }
+
+    var dispositionsByAbsolutePath: [String: SelectedGitArtifactDisposition] {
+        Dictionary(uniqueKeysWithValues: dispositions.map { disposition in
+            switch disposition {
+            case let .authorized(path, _, _), let .rejected(path, _):
+                (path, disposition)
+            }
+        })
+    }
 }
 
 enum SelectedGitArtifactKind: String, Equatable {
@@ -38,6 +100,36 @@ enum SelectedGitArtifactRejectionReason: Equatable {
     case checkoutProvenanceMismatch
     case unlistedPatch
     case contentUnreadable
+    case notInDelegatedSelection
+    case delegationConsumerMismatch
+    case delegationWorkspaceMismatch
+    case legacyArtifactNotDelegable
+    case delegationBindingMismatch
+
+    var diagnosticLabel: String {
+        switch self {
+        case .invalidAbsolutePath: "invalid selected artifact path"
+        case .outsideWorkspaceGitData: "outside the frozen workspace Git-data root"
+        case .capabilityRootUnavailable: "frozen Git-data root is no longer available"
+        case .notCataloged: "selected artifact is not cataloged"
+        case .unsupportedArtifactPath: "unsupported selected artifact path"
+        case .manifestNotCataloged: "artifact manifest is not cataloged"
+        case .manifestUnreadable: "artifact manifest is unreadable"
+        case .manifestInvalid: "artifact manifest is invalid"
+        case .manifestIdentityMismatch: "artifact manifest identity does not match"
+        case .tabMismatch: "artifact belongs to a different tab"
+        case .legacyTabNotAllowed: "legacy artifact is not allowed in a bound worktree"
+        case .repositoryProvenanceMissing: "repository provenance is missing"
+        case .checkoutProvenanceMismatch: "checkout provenance does not match"
+        case .unlistedPatch: "patch is not listed by the artifact manifest"
+        case .contentUnreadable: "selected artifact content is unreadable"
+        case .notInDelegatedSelection: "artifact was not selected in the delegated launch snapshot"
+        case .delegationConsumerMismatch: "delegated artifact consumer does not match"
+        case .delegationWorkspaceMismatch: "delegated artifact workspace does not match"
+        case .legacyArtifactNotDelegable: "legacy artifact without tab provenance cannot be delegated"
+        case .delegationBindingMismatch: "delegated artifact checkout binding does not match"
+        }
+    }
 }
 
 enum SelectedGitArtifactDisposition: Equatable {
@@ -77,6 +169,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
 
     private enum CheckoutAuthorization: Equatable {
         case bound
+        case visibleLinked
         case unbound
     }
 
@@ -93,6 +186,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
         var entries: [ResolvedPromptFileEntry] = []
         var consumedPaths = Set<String>()
         var dispositions: [SelectedGitArtifactDisposition] = []
+        var displayAliasesByAbsolutePath: [String: String] = [:]
         var seenPaths = Set<String>()
 
         let capability = request.capability
@@ -112,6 +206,12 @@ struct SelectedGitDiffArtifactAuthorizationService {
             guard let path = exactAbsolutePath(rawPath) else {
                 if rawPath.hasPrefix(capability.gitDataRoot.standardizedFullPath + "/") {
                     consumedPaths.insert(rawPath)
+                    if let alias = displayAlias(
+                        for: rawPath,
+                        gitDataRootPath: capability.gitDataRoot.standardizedFullPath
+                    ) {
+                        displayAliasesByAbsolutePath[rawPath] = alias
+                    }
                     dispositions.append(.rejected(path: rawPath, reason: .invalidAbsolutePath))
                 }
                 continue
@@ -122,6 +222,21 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 continue
             }
             consumedPaths.insert(rawPath)
+            if let alias = displayAlias(
+                for: path,
+                gitDataRootPath: capability.gitDataRoot.standardizedFullPath
+            ) {
+                displayAliasesByAbsolutePath[path] = alias
+            }
+
+            if let delegationRejection = authorizeDelegation(
+                path: path,
+                capability: capability,
+                consumer: request.delegationConsumer
+            ) {
+                dispositions.append(.rejected(path: path, reason: delegationRejection))
+                continue
+            }
 
             guard capabilityRootIsCurrent else {
                 dispositions.append(.rejected(path: path, reason: .capabilityRootUnavailable))
@@ -172,7 +287,8 @@ struct SelectedGitDiffArtifactAuthorizationService {
             }
             guard let checkoutAuthorization = await authorizeCheckout(
                 manifest: manifest,
-                capability: capability
+                capability: capability,
+                store: request.store
             ) else {
                 let reason: SelectedGitArtifactRejectionReason =
                     manifest.repoRoot == nil ? .repositoryProvenanceMissing : .checkoutProvenanceMismatch
@@ -180,14 +296,26 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 continue
             }
 
-            if let manifestTabID = manifest.tabID {
+            switch capability.access {
+            case .direct:
+                if let manifestTabID = manifest.tabID {
+                    guard manifestTabID == capability.creatorTabID else {
+                        dispositions.append(.rejected(path: path, reason: .tabMismatch))
+                        continue
+                    }
+                } else if checkoutAuthorization == .bound || checkoutAuthorization == .visibleLinked {
+                    dispositions.append(.rejected(path: path, reason: .legacyTabNotAllowed))
+                    continue
+                }
+            case .delegated:
+                guard let manifestTabID = manifest.tabID else {
+                    dispositions.append(.rejected(path: path, reason: .legacyArtifactNotDelegable))
+                    continue
+                }
                 guard manifestTabID == capability.creatorTabID else {
                     dispositions.append(.rejected(path: path, reason: .tabMismatch))
                     continue
                 }
-            } else if checkoutAuthorization == .bound {
-                dispositions.append(.rejected(path: path, reason: .legacyTabNotAllowed))
-                continue
             }
 
             guard isWhitelisted(candidate, manifest: manifest) else {
@@ -226,8 +354,65 @@ struct SelectedGitDiffArtifactAuthorizationService {
         return SelectedGitArtifactAuthorizationResult(
             entries: entries,
             consumedSelectionPaths: consumedPaths,
-            dispositions: dispositions
+            dispositions: dispositions,
+            displayAliasesByAbsolutePath: displayAliasesByAbsolutePath
         )
+    }
+
+    func authorizeExactPaths(
+        _ request: ExactSelectedGitArtifactAuthorizationRequest
+    ) async -> SelectedGitArtifactAuthorizationResult {
+        await authorize(
+            SelectedGitArtifactAuthorizationRequest(
+                physicalSelection: StoredSelection(selectedPaths: request.exactAbsolutePaths),
+                capability: request.capability,
+                store: request.store,
+                delegationConsumer: request.delegationConsumer
+            )
+        )
+    }
+
+    private func authorizeDelegation(
+        path: String,
+        capability: SelectedGitArtifactCapability,
+        consumer: SelectedGitArtifactDelegationConsumer?
+    ) -> SelectedGitArtifactRejectionReason? {
+        guard case let .delegated(delegation) = capability.access else {
+            return consumer == nil ? nil : .delegationConsumerMismatch
+        }
+        guard let consumer else { return .delegationConsumerMismatch }
+
+        guard capability.workspaceID == delegation.sourceWorkspaceID,
+              delegation.sourceWorkspaceID == delegation.targetWorkspaceID,
+              consumer.workspaceID == delegation.targetWorkspaceID
+        else { return .delegationWorkspaceMismatch }
+
+        guard delegation.exactSelectedArtifactPaths.contains(path) else {
+            return .notInDelegatedSelection
+        }
+
+        guard capability.creatorTabID == delegation.sourceTabID,
+              capability.sessionID == delegation.sourceAgentSessionID,
+              consumer.tabID == delegation.targetTabID,
+              consumer.agentSessionID == delegation.targetAgentSessionID,
+              consumer.agentRunID == delegation.targetAgentRunID
+        else { return .delegationConsumerMismatch }
+
+        let sourceBindings = Set(capability.boundCheckouts)
+        guard sourceBindings == Set(delegation.targetBoundCheckouts),
+              sourceBindings == Set(consumer.boundCheckouts)
+        else { return .delegationBindingMismatch }
+
+        return nil
+    }
+
+    private func displayAlias(for path: String, gitDataRootPath: String) -> String? {
+        guard path.hasPrefix(gitDataRootPath + "/") else { return nil }
+        let relativePath = String(path.dropFirst(gitDataRootPath.count + 1))
+        guard !relativePath.isEmpty,
+              !StandardizedPath.containsNUL(relativePath)
+        else { return nil }
+        return "_git_data/\(relativePath)"
     }
 
     private func selectedArtifactCandidates(from selection: StoredSelection) -> [String] {
@@ -255,7 +440,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
         }
         let relativePath = String(path.dropFirst(gitDataRootPath.count))
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard isSafeRelativeArtifactPath(relativePath) else { return nil }
+        guard GitDiffArtifactPathPolicy.isSafeRelativeArtifactPath(relativePath) else { return nil }
 
         if relativePath.hasSuffix("/MAP.txt") {
             let snapshotPath = String(relativePath.dropLast("/MAP.txt".count))
@@ -297,11 +482,15 @@ struct SelectedGitDiffArtifactAuthorizationService {
 
     private func authorizeCheckout(
         manifest: GitDiffSnapshotManifest,
-        capability: SelectedGitArtifactCapability
+        capability: SelectedGitArtifactCapability,
+        store: WorkspaceFileContextStore
     ) async -> CheckoutAuthorization? {
         guard let manifestRepoRoot = normalizedRootPath(manifest.repoRoot) else { return nil }
         let boundCheckout = capability.boundCheckouts.first {
             GitRepoRootAuthorization.canonicalPath($0.physicalWorktreeRootPath) == manifestRepoRoot
+        }
+        let visibleCheckout = capability.visibleRootCheckouts.first {
+            $0.visibleRootPath == manifestRepoRoot
         }
         let hasWorktreeMetadata =
             manifest.isWorktree == true ||
@@ -310,18 +499,32 @@ struct SelectedGitDiffArtifactAuthorizationService {
             manifest.mainWorktreeRoot != nil ||
             manifest.commonGitDir != nil
 
-        if boundCheckout != nil || hasWorktreeMetadata {
-            guard let boundCheckout,
-                  manifest.isWorktree == true,
+        let resolved = await vcsService.resolveRepo(
+            from: URL(fileURLWithPath: manifestRepoRoot, isDirectory: true)
+        )
+        let exactResolvedRoot = resolved.flatMap { candidate -> VCSResolvedRepo? in
+            guard candidate.backendKind == .git,
+                  GitRepoRootAuthorization.canonicalPath(candidate.rootURL.path) == manifestRepoRoot
+            else { return nil }
+            return candidate
+        }
+        let liveLayout = exactResolvedRoot.flatMap {
+            GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: $0.rootURL)
+        }
+        let isLinkedCandidate = boundCheckout != nil
+            || hasWorktreeMetadata
+            || liveLayout?.isLinkedWorktree == true
+
+        if isLinkedCandidate {
+            let liveMainWorktreeRoot = liveLayout?.knownMainWorktreeRoot.map {
+                GitRepoRootAuthorization.canonicalPath($0.path)
+            }
+            let manifestMainWorktreeRoot = normalizedRootPath(manifest.mainWorktreeRoot)
+            guard manifest.isWorktree == true,
                   let manifestWorktreeRoot = normalizedRootPath(manifest.worktreeRoot),
                   let manifestCommonGitDir = normalizedRootPath(manifest.commonGitDir),
                   manifestWorktreeRoot == manifestRepoRoot,
-                  manifestWorktreeRoot == GitRepoRootAuthorization.canonicalPath(
-                      boundCheckout.physicalWorktreeRootPath
-                  ),
-                  let layout = GitRepositoryLayoutResolver.resolve(
-                      atWorkTreeRoot: URL(fileURLWithPath: boundCheckout.physicalWorktreeRootPath)
-                  ),
+                  let layout = liveLayout,
                   layout.isLinkedWorktree,
                   GitRepoRootAuthorization.canonicalPath(layout.workTreeRoot.path) == manifestWorktreeRoot,
                   GitRepoRootAuthorization.canonicalPath(layout.commonDir.path) == manifestCommonGitDir
@@ -337,23 +540,113 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 isMain: false,
                 path: layout.workTreeRoot
             )
-            guard repositoryIdentity.repositoryID == boundCheckout.repositoryID,
-                  worktreeID == boundCheckout.worktreeID
+
+            if let boundCheckout,
+               manifestWorktreeRoot == GitRepoRootAuthorization.canonicalPath(
+                   boundCheckout.physicalWorktreeRootPath
+               ),
+               repositoryIdentity.repositoryID == boundCheckout.repositoryID,
+               worktreeID == boundCheckout.worktreeID
+            {
+                return .bound
+            }
+
+            guard let visibleCheckout,
+                  visibleCheckout.kind == .linkedWorktree,
+                  visibleCheckout.repositoryRootPath == manifestRepoRoot,
+                  visibleCheckout.worktreeRootPath == manifestWorktreeRoot,
+                  visibleCheckout.commonGitDirectoryPath == manifestCommonGitDir,
+                  manifestMainWorktreeRoot == liveMainWorktreeRoot,
+                  visibleCheckout.mainWorktreeRootPath == liveMainWorktreeRoot,
+                  visibleCheckout.repositoryID == repositoryIdentity.repositoryID,
+                  visibleCheckout.worktreeID == worktreeID,
+                  await visibleCheckoutIsCurrent(visibleCheckout, store: store)
             else { return nil }
-            return .bound
+            return .visibleLinked
         }
 
         guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
             manifestRepoRoot,
             roots: capability.canonicalWorkspaceRootPaths
         ),
-            let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: manifestRepoRoot)),
-            resolved.backendKind == .git,
-            GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == manifestRepoRoot,
-            let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: resolved.rootURL),
+            let resolved = exactResolvedRoot,
+            let layout = liveLayout,
             !layout.isLinkedWorktree
         else { return nil }
+
+        if let visibleCheckout,
+           visibleCheckout.kind == .canonical,
+           await !visibleCheckoutIsCurrent(visibleCheckout, store: store)
+        {
+            return nil
+        }
+        _ = resolved
         return .unbound
+    }
+
+    func visibleRootCheckoutsAreCurrent(
+        capability: SelectedGitArtifactCapability,
+        store: WorkspaceFileContextStore
+    ) async -> Bool {
+        for checkout in capability.visibleRootCheckouts {
+            guard await visibleCheckoutIsCurrent(checkout, store: store) else { return false }
+        }
+        for checkout in capability.visibleRootCheckouts {
+            guard await store.exactRootRef(
+                path: checkout.workspaceRoot.standardizedFullPath,
+                kind: .primaryWorkspace
+            ) == checkout.workspaceRoot else { return false }
+        }
+        return true
+    }
+
+    private func visibleCheckoutIsCurrent(
+        _ checkout: FrozenVisibleGitCheckoutIdentity,
+        store: WorkspaceFileContextStore
+    ) async -> Bool {
+        guard let currentRoot = await store.exactRootRef(
+            path: checkout.workspaceRoot.standardizedFullPath,
+            kind: .primaryWorkspace
+        ),
+            currentRoot == checkout.workspaceRoot,
+            GitRepoRootAuthorization.canonicalPath(currentRoot.standardizedFullPath)
+            == checkout.visibleRootPath,
+            let resolved = await vcsService.resolveRepo(
+                from: URL(fileURLWithPath: currentRoot.standardizedFullPath, isDirectory: true)
+            ),
+            resolved.backendKind == .git,
+            GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path)
+            == checkout.repositoryRootPath,
+            let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: resolved.rootURL),
+            GitRepoRootAuthorization.canonicalPath(layout.workTreeRoot.path)
+            == checkout.worktreeRootPath,
+            GitRepoRootAuthorization.canonicalPath(layout.commonDir.path)
+            == checkout.commonGitDirectoryPath,
+            layout.isLinkedWorktree == (checkout.kind == .linkedWorktree)
+        else { return false }
+
+        let liveMainWorktreeRoot = layout.knownMainWorktreeRoot.map {
+            GitRepoRootAuthorization.canonicalPath($0.path)
+        }
+        guard liveMainWorktreeRoot == checkout.mainWorktreeRootPath else { return false }
+
+        let repositoryIdentity = GitWorktreeIdentity.repositoryIdentity(
+            commonGitDir: layout.commonDir,
+            mainWorktreeRoot: layout.knownMainWorktreeRoot
+        )
+        let worktreeID = GitWorktreeIdentity.worktreeID(
+            repositoryID: repositoryIdentity.repositoryID,
+            gitDir: layout.gitDir,
+            isMain: !layout.isLinkedWorktree,
+            path: layout.workTreeRoot
+        )
+        guard repositoryIdentity.repositoryID == checkout.repositoryID,
+              worktreeID == checkout.worktreeID
+        else { return false }
+        return await store.exactRootRef(
+            path: checkout.workspaceRoot.standardizedFullPath,
+            kind: .primaryWorkspace
+        ) == checkout.workspaceRoot
     }
 
     private func isWhitelisted(
@@ -369,39 +662,11 @@ struct SelectedGitDiffArtifactAuthorizationService {
             }
             let listedPaths = Set(manifest.files.compactMap { file -> String? in
                 guard let patchPath = file.patchPath,
-                      let normalized = safeManifestPatchPath(patchPath)
+                      let normalized = GitDiffArtifactPathPolicy.safeManifestPatchPath(patchPath)
                 else { return nil }
                 return normalized
             })
             return listedPaths.contains(relativePath)
-        }
-    }
-
-    private func safeManifestPatchPath(_ rawPath: String) -> String? {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("diff/"),
-              isSafeRelativeArtifactPath(trimmed),
-              !trimmed.hasPrefix("/"),
-              !trimmed.hasPrefix("~")
-        else { return nil }
-        let lowercased = trimmed.lowercased()
-        guard lowercased.hasSuffix(".patch") || lowercased.hasSuffix(".diff") else { return nil }
-        return trimmed
-    }
-
-    private func isSafeRelativeArtifactPath(_ path: String) -> Bool {
-        guard !path.isEmpty,
-              !path.hasPrefix("/"),
-              !path.hasPrefix("~"),
-              !StandardizedPath.containsNUL(path)
-        else { return false }
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        guard !components.isEmpty else { return false }
-        return components.allSatisfy { component in
-            !component.isEmpty &&
-                component != "." &&
-                component != ".." &&
-                !component.contains(":")
         }
     }
 

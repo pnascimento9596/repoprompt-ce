@@ -175,7 +175,8 @@ enum PromptContextPreAssemblyService {
             SelectedGitArtifactAuthorizationRequest(
                 physicalSelection: physicalSelection,
                 capability: capability,
-                store: request.store
+                store: request.store,
+                delegationConsumer: request.reviewGitContext.artifactDelegationConsumer
             )
         )
     }
@@ -280,7 +281,7 @@ enum PromptContextPreAssemblyService {
     }
 }
 
-private extension WorkspaceLookupRootScope {
+extension WorkspaceLookupRootScope {
     var excludingWorkspaceGitData: WorkspaceLookupRootScope {
         switch self {
         case .visibleWorkspace, .sessionBoundWorkspace, .validatedSessionBoundWorkspace:

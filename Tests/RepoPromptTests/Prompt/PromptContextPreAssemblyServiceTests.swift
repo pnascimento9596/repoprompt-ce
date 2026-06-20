@@ -348,6 +348,87 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertEqual(occurrences(of: diffText, in: clipboard), 1, clipboard)
     }
 
+    func testDelegatedArtifactRequiresExactFrozenConsumerAtPreassemblyBoundary() async throws {
+        let diffText = "diff --git a/Sources/App.swift b/Sources/App.swift\n+delegated launch patch\n"
+        let fixture = try await makeArtifactFixture(patchContent: diffText)
+        let capability = try XCTUnwrap(fixture.reviewContext.artifactCapability)
+        let targetWorkspaceID = capability.workspaceID
+        let targetTabID = UUID()
+        let targetSessionID = UUID()
+        let targetRunID = UUID()
+        let delegation = SelectedGitArtifactDelegation(
+            delegationID: UUID(),
+            sourceWorkspaceID: capability.workspaceID,
+            sourceTabID: capability.creatorTabID,
+            sourceAgentSessionID: capability.sessionID,
+            sourceAgentRunID: UUID(),
+            targetWorkspaceID: targetWorkspaceID,
+            targetTabID: targetTabID,
+            targetAgentSessionID: targetSessionID,
+            targetAgentRunID: targetRunID,
+            exactSelectedArtifactPaths: [fixture.patchURL.path],
+            targetBoundCheckouts: capability.boundCheckouts
+        )
+        let consumer = SelectedGitArtifactDelegationConsumer(
+            workspaceID: targetWorkspaceID,
+            tabID: targetTabID,
+            agentSessionID: targetSessionID,
+            agentRunID: targetRunID,
+            boundCheckouts: capability.boundCheckouts
+        )
+        let delegatedReviewContext = FrozenPromptGitReviewContext(
+            artifactCapability: capability.delegated(delegation),
+            artifactDelegationConsumer: consumer,
+            compareIntent: fixture.reviewContext.compareIntent,
+            displayContext: fixture.reviewContext.displayContext
+        )
+        let selection = StoredSelection(
+            selectedPaths: [fixture.patchURL.path, fixture.sourceURL.path],
+            codemapAutoEnabled: false
+        )
+        let capture = ProviderCapture()
+
+        func request(_ reviewContext: FrozenPromptGitReviewContext) -> PromptContextPreAssemblyRequest {
+            PromptContextPreAssemblyRequest(
+                cfg: makeConfig(gitInclusion: .selected),
+                selection: selection,
+                store: fixture.store,
+                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: true,
+                showCodeMapMarkers: true,
+                selectedGitDiffFolderPolicy: .filesOnly,
+                reviewGitContext: reviewContext,
+                selectedGitDiffProvider: { automaticRequest in
+                    await capture.record(automaticRequest)
+                    return Self.automaticResult("automatic fallback")
+                },
+                completeGitDiffProvider: { nil }
+            )
+        }
+
+        let authorized = await PromptContextPreAssemblyService.resolve(
+            request(delegatedReviewContext)
+        )
+        XCTAssertEqual(authorized.gitDiff, diffText)
+        let authorizedProviderCount = await capture.count()
+        XCTAssertEqual(authorizedProviderCount, 0)
+
+        let missingConsumer = FrozenPromptGitReviewContext(
+            artifactCapability: capability.delegated(delegation),
+            compareIntent: fixture.reviewContext.compareIntent,
+            displayContext: fixture.reviewContext.displayContext
+        )
+        let rejected = await PromptContextPreAssemblyService.resolve(request(missingConsumer))
+        XCTAssertEqual(rejected.gitDiff, "automatic fallback")
+        let rejectedProviderCount = await capture.count()
+        XCTAssertEqual(rejectedProviderCount, 1)
+        XCTAssertEqual(
+            rejected.selectedGitArtifactDispositions,
+            [.rejected(path: fixture.patchURL.path, reason: .delegationConsumerMismatch)]
+        )
+    }
+
     func testSelectedArtifactPolicyCanRespectGitInclusionNone() async throws {
         let diffText = "diff --git a/Sources/App.swift b/Sources/App.swift\n"
         let fixture = try await makeArtifactFixture(patchContent: diffText)
@@ -544,6 +625,8 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         try FileSystemTestSupport.write("ordinary map context", to: mapURL)
         try FileSystemTestSupport.write(patchContent, to: patchURL)
 
+        let workspaceID = UUID()
+        let creatorTabID = UUID()
         let manifest = GitDiffSnapshotManifest(
             snapshotID: snapshotID,
             generatedAt: Date(timeIntervalSince1970: 1),
@@ -569,7 +652,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             worktreeRoot: nil,
             mainWorktreeRoot: nil,
             commonGitDir: nil,
-            tabID: nil
+            tabID: creatorTabID
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -585,10 +668,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             kind: .workspaceGitData
         )
         let reviewContext = await FrozenPromptGitReviewContext.make(
-            workspaceID: UUID(),
+            workspaceID: workspaceID,
             workspaceDirectoryPath: workspace.path,
             workspaceRootPaths: [repoRoot.path],
-            tabID: UUID(),
+            tabID: creatorTabID,
             sessionID: nil,
             bindings: [],
             base: "HEAD",

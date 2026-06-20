@@ -16,6 +16,7 @@ final class ReviewGitRepositoryFixture {
     }
 
     func cleanup() {
+        guard FileManager.default.fileExists(atPath: sandbox.path) else { return }
         try? FileManager.default.removeItem(at: sandbox)
     }
 

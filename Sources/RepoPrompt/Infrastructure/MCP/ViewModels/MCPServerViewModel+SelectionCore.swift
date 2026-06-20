@@ -107,17 +107,35 @@ extension MCPServerViewModel {
     }
 
     struct PathFormatter {
+        struct RootMetadata {
+            let rootPath: String
+            let pathWithinRoot: String
+        }
+
         let format: FilePathDisplay
         unowned let owner: MCPServerViewModel
         let projection: WorkspaceRootBindingProjection?
+        let displayPathOverrides: [String: String]
+        let rootMetadataOverrides: [String: RootMetadata]
 
-        init(format: FilePathDisplay, owner: MCPServerViewModel, projection: WorkspaceRootBindingProjection? = nil) {
+        init(
+            format: FilePathDisplay,
+            owner: MCPServerViewModel,
+            projection: WorkspaceRootBindingProjection? = nil,
+            displayPathOverrides: [String: String] = [:],
+            rootMetadataOverrides: [String: RootMetadata] = [:]
+        ) {
             self.format = format
             self.owner = owner
             self.projection = projection
+            self.displayPathOverrides = displayPathOverrides
+            self.rootMetadataOverrides = rootMetadataOverrides
         }
 
         func displayPath(for file: WorkspaceFileRecord) async -> String {
+            if let override = displayPathOverrides[file.standardizedFullPath] {
+                return override
+            }
             if let projection,
                let projected = projection.projectedLogicalDisplayPath(forPhysicalPath: file.standardizedFullPath, display: format)
             {
@@ -261,9 +279,12 @@ extension MCPServerViewModel {
         private static func pathMetadata(
             for file: WorkspaceFileRecord,
             entry: ResolvedPromptFileEntry? = nil,
-            projection: WorkspaceRootBindingProjection? = nil
+            formatter: PathFormatter
         ) -> (rootPath: String, pathWithinRoot: String) {
-            if let projected = projection?.projectedLogicalRootMetadata(forPhysicalPath: file.standardizedFullPath) {
+            if let override = formatter.rootMetadataOverrides[file.standardizedFullPath] {
+                return (override.rootPath, override.pathWithinRoot)
+            }
+            if let projected = formatter.projection?.projectedLogicalRootMetadata(forPhysicalPath: file.standardizedFullPath) {
                 return projected
             }
             let rootPath = entry?.rootFolderPath.map { StandardizedPath.absolute($0) }
@@ -369,7 +390,7 @@ extension MCPServerViewModel {
             for entry in collections.selected {
                 let file = entry.file
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry, projection: formatter.projection)
+                let metadata = pathMetadata(for: file, entry: entry.entry, formatter: formatter)
                 let ranges = entry.ranges ?? []
                 let hasSlices = !ranges.isEmpty
                 let entryResult = entryResultsByFileID?[file.id]
@@ -457,7 +478,7 @@ extension MCPServerViewModel {
             for entry in collections.codemap {
                 let file = entry.file
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry, projection: formatter.projection)
+                let metadata = pathMetadata(for: file, entry: entry.entry, formatter: formatter)
                 let rawCodemapTokens = tokens.codemapTokens(
                     for: file,
                     displayPath: displayPath,
@@ -624,7 +645,8 @@ extension MCPServerViewModel {
             tokens: TokenServices? = nil,
             tokenStatsOverride: ToolResultDTOs.TokenStats? = nil,
             tokenAccountingOverride: ToolResultDTOs.TokenAccountingDTO? = nil,
-            pathProjection: WorkspaceRootBindingProjection? = nil
+            pathProjection: WorkspaceRootBindingProjection? = nil,
+            displayPathOverrides: [String: String] = [:]
         ) async -> ToolResultDTOs.SelectionReply {
             var blocks: [String]? = nil
             if includeBlocks {
@@ -633,7 +655,8 @@ extension MCPServerViewModel {
                     codemap: collections.codemap,
                     codemapSnapshotBundle: collections.codemapSnapshotBundle,
                     display: display,
-                    projection: pathProjection
+                    projection: pathProjection,
+                    displayPathOverrides: displayPathOverrides
                 )
                 blocks = generated
             }
@@ -703,7 +726,8 @@ extension MCPServerViewModel {
             codemap: [CodemapEntry],
             codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
             display: FilePathDisplay,
-            projection: WorkspaceRootBindingProjection? = nil
+            projection: WorkspaceRootBindingProjection? = nil,
+            displayPathOverrides: [String: String] = [:]
         ) -> [String] {
             let renderableCodemaps = codemap.compactMap { item -> ResolvedPromptFileEntry? in
                 if item.origin == .selectedMode || codemapSnapshotBundle.hasRenderableCodemap(for: item.file) {
@@ -718,7 +742,11 @@ extension MCPServerViewModel {
                 filePathDisplay: display,
                 codemapSnapshotBundle: codemapSnapshotBundle,
                 displayPathResolver: { entry in
-                    projection?.projectedLogicalDisplayPath(forPhysicalPath: entry.file.standardizedFullPath, display: display)
+                    displayPathOverrides[entry.file.standardizedFullPath]
+                        ?? projection?.projectedLogicalDisplayPath(
+                            forPhysicalPath: entry.file.standardizedFullPath,
+                            display: display
+                        )
                 }
             )
             return contentBlocks + codemapBlocks
@@ -739,7 +767,7 @@ extension MCPServerViewModel {
                 guard !ranges.isEmpty else { continue }
 
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry, projection: formatter.projection)
+                let metadata = pathMetadata(for: file, entry: entry.entry, formatter: formatter)
                 let dtoRanges = ranges.map { ToolResultDTOs.LineRangeDTO(range: $0) }
                 slices.append(.init(
                     path: displayPath,

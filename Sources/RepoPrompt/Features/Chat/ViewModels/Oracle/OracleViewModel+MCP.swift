@@ -20,31 +20,121 @@ extension OracleViewModel {
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
     }
 
-    struct OracleSendTabContext {
-        let tabID: UUID
+    enum OracleSendPackagingProvenance: Equatable {
+        case direct
+        case delegated(delegationID: UUID)
+    }
+
+    /// Immutable prompt-packaging inputs. These may be source-owned by a launching tab while
+    /// `OracleSendTabContext` remains owned by the exact child conversation/session/run.
+    struct OracleSendPackagingContext {
+        let sourceTabID: UUID
+        let sourceWorkspaceID: UUID?
+        let sourceSelectionRevision: UInt64
+        let sourceAgentSessionID: UUID?
+        let sourceAgentRunID: UUID?
         let promptText: String
         let selection: StoredSelection
         let lookupContext: WorkspaceLookupContext?
         let reviewGitContext: FrozenPromptGitReviewContext
-        let agentModeSessionID: UUID?
-        let agentModeRunID: UUID?
+        let provenance: OracleSendPackagingProvenance
 
         init(
-            tabID: UUID,
+            sourceTabID: UUID,
+            sourceWorkspaceID: UUID?,
+            sourceSelectionRevision: UInt64,
+            sourceAgentSessionID: UUID?,
+            sourceAgentRunID: UUID?,
             promptText: String,
             selection: StoredSelection,
-            lookupContext: WorkspaceLookupContext? = nil,
+            lookupContext: WorkspaceLookupContext?,
             reviewGitContext: FrozenPromptGitReviewContext,
-            agentModeSessionID: UUID? = nil,
-            agentModeRunID: UUID? = nil
+            provenance: OracleSendPackagingProvenance
         ) {
-            self.tabID = tabID
+            self.sourceTabID = sourceTabID
+            self.sourceWorkspaceID = sourceWorkspaceID
+            self.sourceSelectionRevision = sourceSelectionRevision
+            self.sourceAgentSessionID = sourceAgentSessionID
+            self.sourceAgentRunID = sourceAgentRunID
             self.promptText = promptText
             self.selection = selection
             self.lookupContext = lookupContext
             self.reviewGitContext = reviewGitContext
+            self.provenance = provenance
+        }
+
+        init(delegated context: DelegatedAgentRunOracleReviewContext) throws {
+            if let reason = context.unavailableReason {
+                throw reason
+            }
+            guard let source = context.capturedSource else {
+                throw AgentRunOracleReviewUnavailableReason.sourceCaptureFailed(
+                    "The immutable launch snapshot is unavailable."
+                )
+            }
+            let artifactDelegation = SelectedGitArtifactDelegation(
+                delegationID: source.delegationID,
+                sourceWorkspaceID: source.workspaceID,
+                sourceTabID: source.sourceTabID,
+                sourceAgentSessionID: source.sourceAgentSessionID,
+                sourceAgentRunID: source.sourceAgentRunID,
+                targetWorkspaceID: context.targetWorkspaceID,
+                targetTabID: context.targetTabID,
+                targetAgentSessionID: context.targetAgentSessionID,
+                targetAgentRunID: context.targetRunID,
+                exactSelectedArtifactPaths: Set(source.exactSelectedIdentities),
+                targetBoundCheckouts: context.targetBoundCheckouts
+            )
+            let delegatedReviewContext = FrozenPromptGitReviewContext(
+                artifactCapability: source.reviewGitContext.artifactCapability?.delegated(artifactDelegation),
+                artifactDelegationConsumer: SelectedGitArtifactDelegationConsumer(
+                    workspaceID: context.targetWorkspaceID,
+                    tabID: context.targetTabID,
+                    agentSessionID: context.targetAgentSessionID,
+                    agentRunID: context.targetRunID,
+                    boundCheckouts: context.targetBoundCheckouts
+                ),
+                compareIntent: source.reviewGitContext.compareIntent,
+                displayContext: source.reviewGitContext.displayContext
+            )
+            self.init(
+                sourceTabID: source.sourceTabID,
+                sourceWorkspaceID: source.workspaceID,
+                sourceSelectionRevision: source.sourceSelectionRevision,
+                sourceAgentSessionID: source.sourceAgentSessionID,
+                sourceAgentRunID: source.sourceAgentRunID,
+                promptText: source.promptText,
+                selection: source.selection,
+                lookupContext: source.lookupContext,
+                reviewGitContext: delegatedReviewContext,
+                provenance: .delegated(delegationID: source.delegationID)
+            )
+        }
+    }
+
+    struct OracleSendTabContext {
+        /// Conversation ownership. Never substitute packaging source identity here.
+        let tabID: UUID
+        let workspaceID: UUID?
+        let origin: OracleSendOrigin
+        let agentModeSessionID: UUID?
+        let agentModeRunID: UUID?
+        let packaging: OracleSendPackagingContext
+
+        init(
+            tabID: UUID,
+            workspaceID: UUID? = nil,
+            origin: OracleSendOrigin = .compatibility,
+            agentModeSessionID: UUID? = nil,
+            agentModeRunID: UUID? = nil,
+            packaging: OracleSendPackagingContext
+        ) {
+            self.tabID = tabID
+            self.workspaceID = workspaceID
+            self.origin = origin
             self.agentModeSessionID = agentModeSessionID
             self.agentModeRunID = agentModeRunID
+            self.packaging = packaging
         }
     }
 
@@ -632,7 +722,13 @@ extension OracleViewModel {
         agentModeRunID: UUID?,
         allowUnownedLegacy: Bool
     ) -> Bool {
-        guard agentModeSessionID != nil || agentModeRunID != nil else { return true }
+        if !allowUnownedLegacy {
+            return session.agentModeSessionID == agentModeSessionID
+                && session.agentModeRunID == agentModeRunID
+        }
+        guard agentModeSessionID != nil || agentModeRunID != nil else {
+            return session.agentModeSessionID == nil && session.agentModeRunID == nil
+        }
 
         let sessionIsUnowned = session.agentModeSessionID == nil && session.agentModeRunID == nil
         if sessionIsUnowned {
@@ -658,6 +754,19 @@ extension OracleViewModel {
         }
 
         return true
+    }
+
+    static func sessionMatchesOracleOwnerForExplicitContinuation(
+        _ session: ChatSession,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) -> Bool {
+        sessionMatchesOracleOwner(
+            session,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            allowUnownedLegacy: false
+        )
     }
 
     private static func oracleOwnerRank(
@@ -796,11 +905,10 @@ extension OracleViewModel {
             guard Self.sessionBelongsToResolvedTab(existing, tabID: resolvedTabID) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different tab")
             }
-            guard Self.sessionMatchesOracleOwner(
+            guard Self.sessionMatchesOracleOwnerForExplicitContinuation(
                 existing,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID,
-                allowUnownedLegacy: true
+                agentModeRunID: agentModeRunID
             ) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different Agent Mode owner")
             }
@@ -870,7 +978,7 @@ extension OracleViewModel {
         }
 
         let candidate = hasOwner
-            ? (findCandidate(allowUnownedLegacy: false) ?? findCandidate(allowUnownedLegacy: true))
+            ? findCandidate(allowUnownedLegacy: false)
             : findCandidate(allowUnownedLegacy: true)
 
         if let candidate {
@@ -924,7 +1032,7 @@ extension OracleViewModel {
         // Resolve message: either from tab prompt or explicit message parameter
         let message: String
         if useTabPrompt {
-            let base = tabContext?.promptText ?? promptVM.promptText
+            let base = tabContext?.packaging.promptText ?? promptVM.promptText
             message = base.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !message.isEmpty else {
                 throw ChatToolError.invalidParams("Active tab prompt is empty (use_tab_prompt=true)")
@@ -946,9 +1054,9 @@ extension OracleViewModel {
         let modelParam = args["model"]?.stringValue
         // Deprecated compatibility parameter: Oracle replies are text-only and no longer emit diffs.
         _ = args["include_diffs"]?.boolValue
-        let selectionOverride = tabContext?.selection
-        let lookupContextOverride = tabContext?.lookupContext
-        let reviewGitContextOverride = tabContext?.reviewGitContext
+        let selectionOverride = tabContext?.packaging.selection
+        let lookupContextOverride = tabContext?.packaging.lookupContext
+        let reviewGitContextOverride = tabContext?.packaging.reviewGitContext
 
         // ────────── 2. Handle model selection ──────────
         let presetsManager = ModelPresetsManager.shared
@@ -1021,19 +1129,30 @@ extension OracleViewModel {
         let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
 
         // ────────── 5. Send user message & wait for completion ──────────
-        // Pass the selected model, chat preset, and mode to sendMessage without affecting global state
-        await sendMessage(
-            message,
-            sessionID: chatID,
-            overrideModel: selectedModel,
-            overrideChatPresetID: modelSelection.chatPresetID,
-            overrideMode: effectiveMode,
-            gitInclusionOverride: nil,
-            gitBaseOverride: nil,
-            selectionOverride: selectionOverride,
-            lookupContextOverride: lookupContextOverride,
-            reviewGitContextOverride: reviewGitContextOverride
-        )
+        // Pass the selected model, chat preset, and mode to sendMessage without affecting global state.
+        let send = {
+            await self.sendMessage(
+                message,
+                sessionID: chatID,
+                overrideModel: selectedModel,
+                overrideChatPresetID: modelSelection.chatPresetID,
+                overrideMode: effectiveMode,
+                gitInclusionOverride: nil,
+                gitBaseOverride: nil,
+                selectionOverride: selectionOverride,
+                lookupContextOverride: lookupContextOverride,
+                reviewGitContextOverride: reviewGitContextOverride
+            )
+        }
+        #if DEBUG
+            let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
+                tabContext: tabContext,
+                observer: oracleReviewPackagingTraceObserverForTesting
+            )
+            await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
+        #else
+            await send()
+        #endif
         let queryId = activeQueryId(for: chatID) ?? currentQueryId
 
         if let q = queryId {
@@ -1127,24 +1246,15 @@ extension OracleViewModel {
     ) -> ChatSession? {
         let tabSessions = sessions.filter { $0.composeTabID == tabID }
         let hasOwner = agentModeSessionID != nil || agentModeRunID != nil
-        let sortedCandidates: [ChatSession]
-        if hasOwner {
-            let strictBucket = Self.strongestOracleOwnerBucket(
+        let sortedCandidates: [ChatSession] = if hasOwner {
+            Self.strongestOracleOwnerBucket(
                 tabSessions,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 allowUnownedLegacy: false
             )
-            sortedCandidates = strictBucket.isEmpty
-                ? Self.strongestOracleOwnerBucket(
-                    tabSessions,
-                    agentModeSessionID: agentModeSessionID,
-                    agentModeRunID: agentModeRunID,
-                    allowUnownedLegacy: true
-                )
-                : strictBucket
         } else {
-            sortedCandidates = tabSessions.sorted(by: { $0.savedAt > $1.savedAt })
+            tabSessions.sorted(by: { $0.savedAt > $1.savedAt })
         }
 
         if let activeSessionID,
@@ -1206,11 +1316,10 @@ extension OracleViewModel {
                     "Chat with ID '\(normalizedChatID)' belongs to a different tab. oracle_utils op='log' can only read chats from the current tab during agent mode."
                 )
             }
-            guard Self.sessionMatchesOracleOwner(
+            guard Self.sessionMatchesOracleOwnerForExplicitContinuation(
                 found,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID,
-                allowUnownedLegacy: true
+                agentModeRunID: agentModeRunID
             ) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(normalizedChatID)' belongs to a different Agent Mode owner")
             }
