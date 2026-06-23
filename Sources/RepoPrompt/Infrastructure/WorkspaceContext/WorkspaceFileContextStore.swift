@@ -203,6 +203,17 @@ actor WorkspaceFileContextStore {
         case unavailable(WorkspaceCodemapArtifactDemandUnavailableReason)
     }
 
+    private enum ModernCodemapInvalidationCommand {
+        case modified(Set<String>)
+        case deleted(Set<String>)
+        case renamed(from: String, to: String)
+        case watcherGap
+        case checkout
+        case repositoryAuthority
+        case catalogAdvanced
+        case unload
+    }
+
     private struct ModernCodemapDemandRecord {
         let ticket: WorkspaceCodemapArtifactDemandTicket
         let identity: WorkspaceCodemapArtifactBindingIdentity
@@ -253,12 +264,14 @@ actor WorkspaceFileContextStore {
         var engine: WorkspaceCodemapBindingEngine?
         var setupTask: Task<ModernCodemapSetupDisposition, Never>?
         var setupDisposition: ModernCodemapSetupDisposition?
+        var pathGenerationsByRelativePath: [String: UInt64] = [:]
         var demandsByFileID: [UUID: ModernCodemapDemandRecord] = [:]
         var bundlesByRequestID: [UUID: WorkspaceCodemapLiveOverlayBundle] = [:]
         var presentationRecordsByID: [
             WorkspaceCodemapFrozenPresentationBundleID: ModernCodemapPresentationRecord
         ] = [:]
         var selectionGraph: ModernCodemapSelectionGraphState?
+        var graphSnapshotDirtyDuringPathInvalidation = false
     }
 
     private struct DetachedModernCodemapSession: @unchecked Sendable {
@@ -271,7 +284,21 @@ actor WorkspaceFileContextStore {
         let demandTasks: [Task<Void, Never>]
         let selectionGraph: WorkspaceCodemapSelectionGraph?
         let graphWorkerTask: Task<Void, Never>?
+        let predecessorTasks: [Task<Void, Never>]
+        let invalidationCommands: [ModernCodemapInvalidationCommand]
         let graphInvalidationReason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason
+    }
+
+    private struct ModernCodemapPathFenceToken: Hashable {
+        let id: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let standardizedRelativePaths: Set<String>
+    }
+
+    private struct ModernCodemapPathInvalidationFlight {
+        let id: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let task: Task<Void, Never>
     }
 
     private struct ModernCodemapCleanupFlight {
@@ -1633,6 +1660,12 @@ actor WorkspaceFileContextStore {
     private let modernCodemapReadyPublicationHook: @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void
     private var modernCodemapSessionsByRootEpoch: [WorkspaceCodemapRootEpoch: ModernCodemapRootSession] = [:]
     private var modernCodemapCleanupFlightsByRootID: [UUID: ModernCodemapCleanupFlight] = [:]
+    private var modernCodemapPathInvalidationFlightsByRootEpoch: [
+        WorkspaceCodemapRootEpoch: ModernCodemapPathInvalidationFlight
+    ] = [:]
+    private var modernCodemapPathFenceTokensByID: [UUID: ModernCodemapPathFenceToken] = [:]
+    private var modernCodemapPathLocalCatalogMutationDepthByRootID: [UUID: Int] = [:]
+    private var modernCodemapAuthorityGenerationsByRootEpoch: [WorkspaceCodemapRootEpoch: UInt64] = [:]
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
     private var pendingCodemapRepairFileIDs = Set<UUID>()
@@ -1771,6 +1804,9 @@ actor WorkspaceFileContextStore {
             }
         }
         for flight in modernCodemapCleanupFlightsByRootID.values {
+            flight.task.cancel()
+        }
+        for flight in modernCodemapPathInvalidationFlightsByRootEpoch.values {
             flight.task.cancel()
         }
         for attachment in watcherPublisherAttachmentsByKey.values {
@@ -5457,6 +5493,10 @@ actor WorkspaceFileContextStore {
             ))
         }
 
+        await fenceModernCodemapRootAuthority(
+            rootIDs: Array(Set(eligibleFiles.map(\.rootID))),
+            command: .catalogAdvanced
+        )
         var indexed: [String] = []
         var upsertedFilesByRoot: [UUID: [WorkspaceFileRecord]] = [:]
         for eligible in eligibleFiles {
@@ -6408,11 +6448,16 @@ actor WorkspaceFileContextStore {
             )
             if let cleanup = detachModernCodemapSession(
                 rootEpoch: rootEpoch,
+                invalidationCommands: [.unload],
                 graphInvalidationReason: .rootUnloaded
             ),
                 modernCodemapCleanupIDs.insert(cleanup.id).inserted
             {
                 modernCodemapCleanupFlights.append(cleanup)
+            }
+            modernCodemapAuthorityGenerationsByRootEpoch.removeValue(forKey: rootEpoch)
+            modernCodemapPathFenceTokensByID = modernCodemapPathFenceTokensByID.filter {
+                $0.value.rootEpoch != rootEpoch
             }
             statesToUnload.append((rootID, state))
         }
@@ -6788,7 +6833,7 @@ actor WorkspaceFileContextStore {
             } catch is CancellationError {
                 throw CancellationError()
             } catch FileSystemError.fileNotFound {
-                pruneCatalogFileIfStillCurrent(current)
+                await pruneCatalogFileIfStillCurrent(current)
                 return staleSearchContentSnapshot(for: current)
             } catch {
                 return staleSearchContentSnapshot(for: current)
@@ -6841,7 +6886,7 @@ actor WorkspaceFileContextStore {
                 if attempt == 0 { continue }
                 return staleSearchContentSnapshot(for: current)
             } catch FileSystemError.fileNotFound {
-                pruneCatalogFileIfStillCurrent(current)
+                await pruneCatalogFileIfStillCurrent(current)
                 return staleSearchContentSnapshot(for: current)
             } catch {
                 return staleSearchContentSnapshot(for: current)
@@ -6889,7 +6934,7 @@ actor WorkspaceFileContextStore {
             } catch is CancellationError {
                 throw CancellationError()
             } catch FileSystemError.fileNotFound {
-                pruneCatalogFileIfStillCurrent(current)
+                await pruneCatalogFileIfStillCurrent(current)
                 return nil
             } catch {
                 return nil
@@ -6942,7 +6987,7 @@ actor WorkspaceFileContextStore {
                 if attempt == 0 { continue }
                 return nil
             } catch FileSystemError.fileNotFound {
-                pruneCatalogFileIfStillCurrent(current)
+                await pruneCatalogFileIfStillCurrent(current)
                 return nil
             } catch {
                 return nil
@@ -7159,11 +7204,7 @@ actor WorkspaceFileContextStore {
         else {
             return .unavailable(.unsupportedFileType)
         }
-        guard let catalogGeneration = translatedModernCodemapGeneration(
-            catalogGenerationsByRootID[file.rootID] ?? 0
-        ), let ingressGeneration = translatedModernCodemapGeneration(
-            appliedIndexGenerationsByRootID[file.rootID] ?? 0
-        ), let identity = WorkspaceCodemapArtifactBindingIdentity(
+        guard let identity = WorkspaceCodemapArtifactBindingIdentity(
             rootID: file.rootID,
             rootLifetimeID: state.lifetimeID,
             fileID: file.id,
@@ -7178,20 +7219,34 @@ actor WorkspaceFileContextStore {
             rootID: file.rootID,
             rootLifetimeID: state.lifetimeID
         )
-        let authority = ModernCodemapRootAuthority(
-            rootEpoch: rootEpoch,
-            standardizedRootPath: state.root.standardizedFullPath,
-            catalogGeneration: catalogGeneration,
-            ingressGeneration: ingressGeneration
-        )
-        if modernCodemapCleanupFlightsByRootID[file.rootID] != nil {
+        if modernCodemapCleanupFlightsByRootID[file.rootID] != nil ||
+            modernCodemapPathIsFenced(rootEpoch: rootEpoch, relativePath: file.standardizedRelativePath)
+        {
             return .unavailable(.busy(retryAfterMilliseconds: nil))
         }
-        if let existing = modernCodemapSessionsByRootEpoch[rootEpoch],
-           existing.authority != authority
-        {
-            _ = detachModernCodemapSession(rootEpoch: rootEpoch)
-            return .unavailable(.busy(retryAfterMilliseconds: nil))
+
+        let authority: ModernCodemapRootAuthority
+        if let existing = modernCodemapSessionsByRootEpoch[rootEpoch] {
+            guard modernCodemapAuthorityMatchesLoadedRoot(existing.authority) else {
+                _ = detachModernCodemapSession(
+                    rootEpoch: rootEpoch,
+                    invalidationCommands: [.repositoryAuthority]
+                )
+                return .unavailable(.busy(retryAfterMilliseconds: nil))
+            }
+            authority = existing.authority
+        } else {
+            let authorityGeneration = modernCodemapAuthorityGenerationsByRootEpoch[rootEpoch] ?? 1
+            guard authorityGeneration > 0 else {
+                return .unavailable(.staleCurrentness)
+            }
+            modernCodemapAuthorityGenerationsByRootEpoch[rootEpoch] = authorityGeneration
+            authority = ModernCodemapRootAuthority(
+                rootEpoch: rootEpoch,
+                standardizedRootPath: state.root.standardizedFullPath,
+                catalogGeneration: authorityGeneration,
+                ingressGeneration: authorityGeneration
+            )
         }
 
         if let existing = modernCodemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] {
@@ -7216,14 +7271,16 @@ actor WorkspaceFileContextStore {
             modernCodemapSessionsByRootEpoch[rootEpoch] = ModernCodemapRootSession(authority: authority)
         }
 
+        let pathGeneration = modernCodemapSessionsByRootEpoch[rootEpoch]?
+            .pathGenerationsByRelativePath[file.standardizedRelativePath] ?? authority.ingressGeneration
         let ticket = WorkspaceCodemapArtifactDemandTicket(
             requestID: UUID(),
             rootEpoch: rootEpoch,
             fileID: file.id,
-            requestGeneration: ingressGeneration,
-            catalogGeneration: catalogGeneration,
-            pathGeneration: ingressGeneration,
-            ingressGeneration: ingressGeneration
+            requestGeneration: pathGeneration,
+            catalogGeneration: authority.catalogGeneration,
+            pathGeneration: pathGeneration,
+            ingressGeneration: authority.ingressGeneration
         )
         let owner = WorkspaceCodemapLiveDemandOwner()
         var record = ModernCodemapDemandRecord(
@@ -7327,21 +7384,27 @@ actor WorkspaceFileContextStore {
                 return .stale(.currentness(rootEpoch))
             }
             let sources = partitions[rootEpoch] ?? []
-            guard let currentCatalogGeneration = translatedModernCodemapGeneration(
-                catalogGenerationsByRootID[rootEpoch.rootID] ?? 0
-            ), let currentIngressGeneration = translatedModernCodemapGeneration(
-                appliedIndexGenerationsByRootID[rootEpoch.rootID] ?? 0
-            ), sources.allSatisfy({
-                $0.ticket.catalogGeneration == currentCatalogGeneration &&
-                    $0.ticket.ingressGeneration == currentIngressGeneration &&
-                    $0.ticket.pathGeneration == currentIngressGeneration
-            }) else {
-                return .stale(.currentness(rootEpoch))
-            }
             guard let session = modernCodemapSessionsByRootEpoch[rootEpoch] else {
+                if let authorityGeneration = modernCodemapAuthorityGenerationsByRootEpoch[rootEpoch],
+                   sources.contains(where: {
+                       $0.ticket.catalogGeneration != authorityGeneration ||
+                           $0.ticket.ingressGeneration != authorityGeneration
+                   })
+                {
+                    return .stale(.currentness(rootEpoch))
+                }
                 return .unavailable(.notActivated(rootEpoch))
             }
-            guard modernCodemapAuthorityIsCurrent(session.authority) else {
+            guard sources.allSatisfy({ source in
+                let ticket = source.ticket
+                guard let record = session.demandsByFileID[ticket.fileID] else { return false }
+                return ticket.catalogGeneration == session.authority.catalogGeneration &&
+                    ticket.ingressGeneration == session.authority.ingressGeneration &&
+                    ticket.pathGeneration == (
+                        session.pathGenerationsByRelativePath[record.identity.standardizedRelativePath]
+                            ?? session.authority.ingressGeneration
+                    )
+            }), modernCodemapAuthorityIsCurrent(session.authority) else {
                 return .stale(.currentness(rootEpoch))
             }
             for source in sources {
@@ -7993,7 +8056,7 @@ actor WorkspaceFileContextStore {
         }
         guard modernCodemapAuthorityIsCurrent(authority), !Task.isCancelled else {
             _ = await registry.unregister(routeToken)
-            await engine.unloadRoot(rootEpoch: authority.rootEpoch)
+            await fenceLateModernCodemapSetup(engine: engine, authority: authority)
             return .unavailable(.staleCurrentness)
         }
         modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.engine = engine
@@ -8008,7 +8071,7 @@ actor WorkspaceFileContextStore {
         let registrationResult = await engine.registerRoot(registration)
         guard modernCodemapAuthorityIsCurrent(authority), !Task.isCancelled else {
             _ = await registry.unregister(routeToken)
-            await engine.unloadRoot(rootEpoch: authority.rootEpoch)
+            await fenceLateModernCodemapSetup(engine: engine, authority: authority)
             return .unavailable(.staleCurrentness)
         }
 
@@ -8175,6 +8238,11 @@ actor WorkspaceFileContextStore {
             bundle.close()
             return
         }
+        if modernCodemapPathInvalidationFlightsByRootEpoch[ticket.rootEpoch] != nil {
+            modernCodemapSessionsByRootEpoch[ticket.rootEpoch]?
+                .graphSnapshotDirtyDuringPathInvalidation = true
+            return
+        }
         guard let graphSnapshot = try? bundle.graphSnapshot(),
               modernCodemapGraphSnapshotIsAccepted(
                   graphSnapshot,
@@ -8182,6 +8250,17 @@ actor WorkspaceFileContextStore {
               )
         else { return }
         enqueueModernCodemapGraphSnapshot(graphSnapshot)
+    }
+
+    private func fenceLateModernCodemapSetup(
+        engine: WorkspaceCodemapBindingEngine,
+        authority: ModernCodemapRootAuthority
+    ) async {
+        if modernCodemapAuthorityMatchesLoadedRoot(authority) {
+            _ = await engine.invalidateRepositoryAuthority(rootEpoch: authority.rootEpoch)
+        } else {
+            await engine.unloadRoot(rootEpoch: authority.rootEpoch)
+        }
     }
 
     private func publishModernCodemapSetupDisposition(
@@ -8497,21 +8576,21 @@ actor WorkspaceFileContextStore {
         return snapshot
     }
 
+    private func modernCodemapAuthorityMatchesLoadedRoot(
+        _ authority: ModernCodemapRootAuthority
+    ) -> Bool {
+        guard let state = rootStatesByID[authority.rootEpoch.rootID],
+              state.lifetimeID == authority.rootEpoch.rootLifetimeID,
+              state.root.standardizedFullPath == authority.standardizedRootPath
+        else { return false }
+        return true
+    }
+
     private func modernCodemapAuthorityIsCurrent(
         _ authority: ModernCodemapRootAuthority
     ) -> Bool {
-        guard modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.authority == authority,
-              let state = rootStatesByID[authority.rootEpoch.rootID],
-              state.lifetimeID == authority.rootEpoch.rootLifetimeID,
-              state.root.standardizedFullPath == authority.standardizedRootPath,
-              translatedModernCodemapGeneration(
-                  catalogGenerationsByRootID[authority.rootEpoch.rootID] ?? 0
-              ) == authority.catalogGeneration,
-              translatedModernCodemapGeneration(
-                  appliedIndexGenerationsByRootID[authority.rootEpoch.rootID] ?? 0
-              ) == authority.ingressGeneration
-        else { return false }
-        return true
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.authority == authority &&
+            modernCodemapAuthorityMatchesLoadedRoot(authority)
     }
 
     private func modernCodemapDemandIsCurrent(
@@ -8522,13 +8601,18 @@ actor WorkspaceFileContextStore {
               ticket.pathGeneration > 0,
               ticket.ingressGeneration > 0,
               ticket.requestGeneration == ticket.pathGeneration,
-              ticket.requestGeneration == ticket.ingressGeneration,
               let session = modernCodemapSessionsByRootEpoch[ticket.rootEpoch],
               session.authority.catalogGeneration == ticket.catalogGeneration,
               session.authority.ingressGeneration == ticket.ingressGeneration,
               modernCodemapAuthorityIsCurrent(session.authority),
+              let record = session.demandsByFileID[ticket.fileID],
+              record.ticket == ticket,
+              (
+                  session.pathGenerationsByRelativePath[record.identity.standardizedRelativePath]
+                      ?? session.authority.ingressGeneration
+              ) == ticket.pathGeneration,
               let state = rootStatesByID[ticket.rootEpoch.rootID],
-              state.fileIDsByRelativePath.values.contains(ticket.fileID),
+              state.fileIDsByRelativePath[record.identity.standardizedRelativePath] == ticket.fileID,
               filesByID[ticket.fileID]?.rootID == ticket.rootEpoch.rootID
         else { return false }
         return true
@@ -8572,21 +8656,296 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private func translatedModernCodemapGeneration(_ generation: UInt64) -> UInt64? {
-        let (translated, overflow) = generation.addingReportingOverflow(1)
-        return overflow ? nil : translated
+    private func modernCodemapPathIsFenced(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        relativePath: String
+    ) -> Bool {
+        let path = StandardizedPath.relative(relativePath)
+        return modernCodemapPathFenceTokensByID.values.contains {
+            $0.rootEpoch == rootEpoch && $0.standardizedRelativePaths.contains(path)
+        }
+    }
+
+    private func standardizedModernCodemapInvalidationCommand(
+        _ command: ModernCodemapInvalidationCommand
+    ) -> ModernCodemapInvalidationCommand? {
+        switch command {
+        case let .modified(paths):
+            let safe = Set(paths.map(StandardizedPath.relative).filter { !$0.isEmpty })
+            return safe.isEmpty ? nil : .modified(safe)
+        case let .deleted(paths):
+            let safe = Set(paths.map(StandardizedPath.relative).filter { !$0.isEmpty })
+            return safe.isEmpty ? nil : .deleted(safe)
+        case let .renamed(from, to):
+            let oldPath = StandardizedPath.relative(from)
+            let newPath = StandardizedPath.relative(to)
+            guard !oldPath.isEmpty, !newPath.isEmpty else { return nil }
+            return .renamed(from: oldPath, to: newPath)
+        case .watcherGap, .checkout, .repositoryAuthority, .catalogAdvanced, .unload:
+            return command
+        }
+    }
+
+    private func modernCodemapPaths(
+        in commands: [ModernCodemapInvalidationCommand]
+    ) -> Set<String> {
+        var paths = Set<String>()
+        for command in commands {
+            switch command {
+            case let .modified(commandPaths), let .deleted(commandPaths):
+                paths.formUnion(commandPaths)
+            case let .renamed(from, to):
+                paths.insert(from)
+                paths.insert(to)
+            case .watcherGap, .checkout, .repositoryAuthority, .catalogAdvanced, .unload:
+                break
+            }
+        }
+        return paths
+    }
+
+    private func fenceModernCodemapPaths(
+        rootID: UUID,
+        commands rawCommands: [ModernCodemapInvalidationCommand]
+    ) async -> ModernCodemapPathFenceToken? {
+        let commands = rawCommands.compactMap(standardizedModernCodemapInvalidationCommand)
+        let paths = modernCodemapPaths(in: commands)
+        guard !paths.isEmpty,
+              let state = rootStatesByID[rootID]
+        else { return nil }
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: rootID,
+            rootLifetimeID: state.lifetimeID
+        )
+
+        if let cleanup = modernCodemapCleanupFlightsByRootID[rootID] {
+            await cleanup.task.value
+            return nil
+        }
+        if let existing = modernCodemapPathInvalidationFlightsByRootEpoch[rootEpoch] {
+            await existing.task.value
+            guard rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID,
+                  modernCodemapSessionsByRootEpoch[rootEpoch] != nil
+            else { return nil }
+            return await fenceModernCodemapPaths(rootID: rootID, commands: commands)
+        }
+        guard var session = modernCodemapSessionsByRootEpoch[rootEpoch] else { return nil }
+
+        let token = ModernCodemapPathFenceToken(
+            id: UUID(),
+            rootEpoch: rootEpoch,
+            standardizedRelativePaths: paths
+        )
+        modernCodemapPathFenceTokensByID[token.id] = token
+
+        var affectedRecords: [ModernCodemapDemandRecord] = []
+        for (fileID, record) in session.demandsByFileID
+            where paths.contains(record.identity.standardizedRelativePath)
+        {
+            affectedRecords.append(record)
+            session.demandsByFileID.removeValue(forKey: fileID)
+            session.bundlesByRequestID.removeValue(forKey: record.ticket.requestID)?.close()
+        }
+        let affectedRequestIDs = Set(affectedRecords.map(\.ticket.requestID))
+        session.presentationRecordsByID = session.presentationRecordsByID.filter {
+            $0.value.requestIDs.isDisjoint(with: affectedRequestIDs)
+        }
+        for record in affectedRecords {
+            record.task?.cancel()
+        }
+        for path in paths {
+            let current = session.pathGenerationsByRelativePath[path] ?? session.authority.ingressGeneration
+            session.pathGenerationsByRelativePath[path] = current == .max ? .max : current + 1
+        }
+
+        let graph = session.selectionGraph?.graph
+        let graphWorkerTask = session.selectionGraph?.workerTask
+        graphWorkerTask?.cancel()
+        if let graph {
+            session.selectionGraph = ModernCodemapSelectionGraphState(
+                id: UUID(),
+                graph: graph,
+                desiredKey: nil,
+                pendingSnapshot: nil,
+                publishedSummary: nil,
+                lastRebuildDisposition: nil,
+                workerID: nil,
+                workerTask: nil
+            )
+        }
+        modernCodemapSessionsByRootEpoch[rootEpoch] = session
+
+        let flightID = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await performModernCodemapPathInvalidation(
+                flightID: flightID,
+                authority: session.authority,
+                engine: session.engine,
+                setupTask: session.setupTask,
+                graph: graph,
+                graphWorkerTask: graphWorkerTask,
+                commands: commands
+            )
+        }
+        let flight = ModernCodemapPathInvalidationFlight(
+            id: flightID,
+            rootEpoch: rootEpoch,
+            task: task
+        )
+        modernCodemapPathInvalidationFlightsByRootEpoch[rootEpoch] = flight
+        await task.value
+        return token
+    }
+
+    private func performModernCodemapPathInvalidation(
+        flightID: UUID,
+        authority: ModernCodemapRootAuthority,
+        engine: WorkspaceCodemapBindingEngine?,
+        setupTask: Task<ModernCodemapSetupDisposition, Never>?,
+        graph: WorkspaceCodemapSelectionGraph?,
+        graphWorkerTask: Task<Void, Never>?,
+        commands: [ModernCodemapInvalidationCommand]
+    ) async {
+        if let graph {
+            _ = await graph.fenceContributionsForPathInvalidation(
+                rootEpoch: authority.rootEpoch
+            )
+        }
+        if let graphWorkerTask {
+            await graphWorkerTask.value
+        }
+        if let setupTask {
+            _ = await setupTask.value
+        }
+        let resolvedEngine = engine ?? modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.engine
+        if let resolvedEngine {
+            await applyModernCodemapInvalidationCommands(
+                commands,
+                rootEpoch: authority.rootEpoch,
+                engine: resolvedEngine
+            )
+        }
+        let bundle = await resolvedEngine?.freeze(rootEpoch: authority.rootEpoch)
+        let snapshot = try? bundle?.graphSnapshot()
+        await finishModernCodemapPathInvalidation(
+            flightID: flightID,
+            authority: authority,
+            snapshot: snapshot
+        )
+        bundle?.close()
+    }
+
+    private func finishModernCodemapPathInvalidation(
+        flightID: UUID,
+        authority: ModernCodemapRootAuthority,
+        snapshot: WorkspaceCodemapLiveGraphSnapshot?
+    ) async {
+        guard modernCodemapPathInvalidationFlightsByRootEpoch[authority.rootEpoch]?.id == flightID else {
+            return
+        }
+        defer {
+            if modernCodemapPathInvalidationFlightsByRootEpoch[authority.rootEpoch]?.id == flightID {
+                modernCodemapPathInvalidationFlightsByRootEpoch.removeValue(forKey: authority.rootEpoch)
+            }
+        }
+        guard modernCodemapAuthorityIsCurrent(authority) else { return }
+        if let snapshot,
+           let acceptedSnapshot = modernCodemapPathInvalidationGraphSnapshot(
+               snapshot,
+               authority: authority
+           )
+        {
+            enqueueModernCodemapGraphSnapshot(acceptedSnapshot)
+        }
+
+        while modernCodemapAuthorityIsCurrent(authority) {
+            if let workerTask = modernCodemapSessionsByRootEpoch[authority.rootEpoch]?
+                .selectionGraph?.workerTask
+            {
+                await workerTask.value
+            }
+            guard modernCodemapAuthorityIsCurrent(authority),
+                  modernCodemapSessionsByRootEpoch[authority.rootEpoch]?
+                  .graphSnapshotDirtyDuringPathInvalidation == true
+            else { return }
+            modernCodemapSessionsByRootEpoch[authority.rootEpoch]?
+                .graphSnapshotDirtyDuringPathInvalidation = false
+            guard let engine = modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.engine,
+                  let bundle = await engine.freeze(rootEpoch: authority.rootEpoch)
+            else { continue }
+            let latestSnapshot = try? bundle.graphSnapshot()
+            bundle.close()
+            guard let latestSnapshot,
+                  let acceptedSnapshot = modernCodemapPathInvalidationGraphSnapshot(
+                      latestSnapshot,
+                      authority: authority
+                  )
+            else { continue }
+            enqueueModernCodemapGraphSnapshot(acceptedSnapshot)
+        }
+    }
+
+    private func modernCodemapPathInvalidationGraphSnapshot(
+        _ snapshot: WorkspaceCodemapLiveGraphSnapshot,
+        authority: ModernCodemapRootAuthority
+    ) -> WorkspaceCodemapLiveGraphSnapshot? {
+        guard snapshot.rootEpoch == authority.rootEpoch,
+              snapshot.catalogGeneration == authority.catalogGeneration,
+              let session = modernCodemapSessionsByRootEpoch[authority.rootEpoch]
+        else { return nil }
+        let retainedBindings = snapshot.bindings.filter { binding in
+            guard let record = session.demandsByFileID[binding.identity.fileID],
+                  case let .ready(ready) = record.result,
+                  case let .resolved(completion) = binding.availability
+            else { return false }
+            return ready.identity == binding.identity &&
+                ready.ticket == record.ticket &&
+                ready.snapshot.artifactKey == completion.artifactKey
+        }
+        guard let firstBinding = retainedBindings.first,
+              let firstRecord = session.demandsByFileID[firstBinding.identity.fileID],
+              case let .ready(triggeringReady) = firstRecord.result
+        else { return nil }
+        let filtered = WorkspaceCodemapLiveGraphSnapshot(
+            rootEpoch: snapshot.rootEpoch,
+            catalogGeneration: snapshot.catalogGeneration,
+            repositoryAuthority: snapshot.repositoryAuthority,
+            contributionGeneration: snapshot.contributionGeneration,
+            bindings: retainedBindings
+        )
+        return modernCodemapGraphSnapshotIsAccepted(
+            filtered,
+            triggeringReady: triggeringReady
+        ) ? filtered : nil
+    }
+
+    private func releaseModernCodemapPathFence(_ token: ModernCodemapPathFenceToken?) {
+        guard let token else { return }
+        modernCodemapPathFenceTokensByID.removeValue(forKey: token.id)
     }
 
     @discardableResult
     private func detachModernCodemapSession(
         rootEpoch: WorkspaceCodemapRootEpoch,
+        invalidationCommands: [ModernCodemapInvalidationCommand] = [.catalogAdvanced],
         graphInvalidationReason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason =
             .authorityRevoked
     ) -> ModernCodemapCleanupFlight? {
         guard let session = modernCodemapSessionsByRootEpoch.removeValue(forKey: rootEpoch) else {
             return modernCodemapCleanupFlightsByRootID[rootEpoch.rootID]
         }
-        session.setupTask?.cancel()
+        let authorityGeneration = modernCodemapAuthorityGenerationsByRootEpoch[rootEpoch]
+            ?? session.authority.ingressGeneration
+        modernCodemapAuthorityGenerationsByRootEpoch[rootEpoch] = authorityGeneration == .max
+            ? 0
+            : authorityGeneration + 1
+        let isUnload = invalidationCommands.contains(where: {
+            if case .unload = $0 { true } else { false }
+        })
+        if isUnload {
+            session.setupTask?.cancel()
+        }
         session.selectionGraph?.workerTask?.cancel()
         let demandRecords = Array(session.demandsByFileID.values)
         for record in demandRecords {
@@ -8595,6 +8954,8 @@ actor WorkspaceFileContextStore {
         for bundle in session.bundlesByRequestID.values {
             bundle.close()
         }
+        let predecessorTasks = modernCodemapPathInvalidationFlightsByRootEpoch[rootEpoch]
+            .map { [$0.task] } ?? []
         let detached = DetachedModernCodemapSession(
             authority: session.authority,
             registry: session.runtime?.bindingIntegrationRegistry,
@@ -8605,19 +8966,13 @@ actor WorkspaceFileContextStore {
             demandTasks: demandRecords.compactMap(\.task),
             selectionGraph: session.selectionGraph?.graph,
             graphWorkerTask: session.selectionGraph?.workerTask,
+            predecessorTasks: predecessorTasks,
+            invalidationCommands: invalidationCommands.compactMap(
+                standardizedModernCodemapInvalidationCommand
+            ),
             graphInvalidationReason: graphInvalidationReason
         )
         return startModernCodemapCleanup(detached)
-    }
-
-    private func detachModernCodemapSessions(rootIDs: Set<UUID>) {
-        guard !rootIDs.isEmpty else { return }
-        let rootEpochs = modernCodemapSessionsByRootEpoch.keys.filter {
-            rootIDs.contains($0.rootID)
-        }
-        for rootEpoch in rootEpochs {
-            _ = detachModernCodemapSession(rootEpoch: rootEpoch)
-        }
     }
 
     private func startModernCodemapCleanup(
@@ -8628,6 +8983,9 @@ actor WorkspaceFileContextStore {
         }
         let cleanupID = UUID()
         let task = Task { [weak self] in
+            for predecessorTask in detached.predecessorTasks {
+                await predecessorTask.value
+            }
             if let selectionGraph = detached.selectionGraph {
                 _ = await selectionGraph.invalidateCurrentness(
                     rootEpoch: detached.authority.rootEpoch,
@@ -8638,10 +8996,19 @@ actor WorkspaceFileContextStore {
                 _ = await registry.unregister(routeToken)
             }
             if let engine = detached.engine {
+                await self?.applyModernCodemapInvalidationCommands(
+                    detached.invalidationCommands,
+                    rootEpoch: detached.authority.rootEpoch,
+                    engine: engine
+                )
                 for owner in detached.owners {
                     _ = await engine.cancel(owner: owner)
                 }
-                await engine.unloadRoot(rootEpoch: detached.authority.rootEpoch)
+                if detached.invalidationCommands.contains(where: {
+                    if case .unload = $0 { true } else { false }
+                }) {
+                    await engine.unloadRoot(rootEpoch: detached.authority.rootEpoch)
+                }
             }
             if let setupTask = detached.setupTask {
                 _ = await setupTask.value
@@ -8666,9 +9033,74 @@ actor WorkspaceFileContextStore {
         return flight
     }
 
+    private func applyModernCodemapInvalidationCommands(
+        _ commands: [ModernCodemapInvalidationCommand],
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        engine: WorkspaceCodemapBindingEngine
+    ) async {
+        for command in commands {
+            switch command {
+            case let .modified(paths):
+                _ = await engine.invalidateModified(
+                    rootEpoch: rootEpoch,
+                    standardizedRelativePaths: paths
+                )
+            case let .deleted(paths):
+                _ = await engine.invalidateDeleted(
+                    rootEpoch: rootEpoch,
+                    standardizedRelativePaths: paths
+                )
+            case let .renamed(from, to):
+                _ = await engine.invalidateRenamed(rootEpoch: rootEpoch, from: from, to: to)
+            case .watcherGap:
+                _ = await engine.invalidateWatcherGap(rootEpoch: rootEpoch)
+            case .checkout:
+                _ = await engine.invalidateCheckout(rootEpoch: rootEpoch)
+            case .repositoryAuthority:
+                _ = await engine.invalidateRepositoryAuthority(rootEpoch: rootEpoch)
+            case .catalogAdvanced:
+                _ = await engine.invalidateCatalog(rootEpoch: rootEpoch)
+            case .unload:
+                break
+            }
+        }
+    }
+
     private func finishModernCodemapCleanup(rootID: UUID, cleanupID: UUID) {
         guard modernCodemapCleanupFlightsByRootID[rootID]?.id == cleanupID else { return }
         modernCodemapCleanupFlightsByRootID.removeValue(forKey: rootID)
+    }
+
+    private func awaitModernCodemapCleanupFlights(rootIDs: Set<UUID>) async {
+        let flights = rootIDs.compactMap { modernCodemapCleanupFlightsByRootID[$0] }
+        for flight in flights {
+            await flight.task.value
+        }
+    }
+
+    private func fenceModernCodemapRootAuthority(
+        rootIDs: [UUID],
+        command: ModernCodemapInvalidationCommand
+    ) async {
+        let loadedRootIDs = Set(rootIDs.filter { rootStatesByID[$0] != nil })
+        guard !loadedRootIDs.isEmpty else { return }
+        for rootEpoch in modernCodemapSessionsByRootEpoch.keys
+            .filter({ loadedRootIDs.contains($0.rootID) })
+        {
+            _ = detachModernCodemapSession(
+                rootEpoch: rootEpoch,
+                invalidationCommands: [command]
+            )
+        }
+        await awaitModernCodemapCleanupFlights(rootIDs: loadedRootIDs)
+    }
+
+    func fenceCodemapAuthorityForCheckoutMutation(rootIDs: [UUID]) async {
+        await fenceModernCodemapRootAuthority(rootIDs: rootIDs, command: .checkout)
+    }
+
+    func fenceCodemapAuthorityForRepositoryAuthorityMutation(rootIDs: [UUID]) async {
+        await fenceModernCodemapRootAuthority(rootIDs: rootIDs, command: .repositoryAuthority)
     }
 
     func requestCodemapScans(inRoot rootID: UUID) async throws {
@@ -9204,8 +9636,14 @@ actor WorkspaceFileContextStore {
         }
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        await fenceModernCodemapRootAuthority(rootIDs: [rootID], command: .catalogAdvanced)
         try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
-        return try await materializeCatalogFileAfterDiskWrite(rootID: rootID, relativePath: standardizedRelativePath)
+        let result = try await materializeCatalogFileAfterDiskWrite(
+            rootID: rootID,
+            relativePath: standardizedRelativePath
+        )
+        await awaitModernCodemapCleanupFlights(rootIDs: [rootID])
+        return result
     }
 
     @discardableResult
@@ -9213,6 +9651,11 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let expectedLifetimeID = state.lifetimeID
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let modernCodemapFence = await fenceModernCodemapPaths(
+            rootID: rootID,
+            commands: [.modified([standardizedRelativePath])]
+        )
+        defer { releaseModernCodemapPathFence(modernCodemapFence) }
         let deferredPublicationToken: FileSystemDeferredEditPublicationToken
         do {
             guard let token = try await state.service.editFile(
@@ -9226,7 +9669,13 @@ actor WorkspaceFileContextStore {
             }
             deferredPublicationToken = token
         } catch FileSystemError.fileNotFound {
-            pruneCatalogFileMissingOnDisk(rootID: rootID, relativePath: standardizedRelativePath, publishDelta: true)
+            _ = withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+                pruneCatalogFileMissingOnDisk(
+                    rootID: rootID,
+                    relativePath: standardizedRelativePath,
+                    publishDelta: true
+                )
+            }
             throw FileSystemError.fileNotFound
         }
 
@@ -9261,7 +9710,8 @@ actor WorkspaceFileContextStore {
             } else {
                 let materialization = try await materializeCatalogFileAfterDiskWrite(
                     rootID: rootID,
-                    relativePath: standardizedRelativePath
+                    relativePath: standardizedRelativePath,
+                    modernCodemapPathLocalMutation: true
                 )
                 result = materialization
                 switch materialization {
@@ -9292,6 +9742,11 @@ actor WorkspaceFileContextStore {
         let state = try state(for: rootID)
         let oldPath = StandardizedPath.relative(oldRelativePath)
         let newPath = StandardizedPath.relative(newRelativePath)
+        let modernCodemapFence = await fenceModernCodemapPaths(
+            rootID: rootID,
+            commands: [.renamed(from: oldPath, to: newPath)]
+        )
+        defer { releaseModernCodemapPathFence(modernCodemapFence) }
         let oldFile = file(rootID: rootID, relativePath: oldPath)
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         try await state.service.moveFile(
@@ -9308,32 +9763,47 @@ actor WorkspaceFileContextStore {
         case let .ineligible(reason):
             throw WorkspaceFileContextStoreError.catalogMaterializationFailed("moved file is not catalog-eligible at destination: \(reason.description)")
         }
-        removeFile(relativePath: oldPath, rootID: rootID)
-        indexFile(relativePath: newPath, root: state.root, managedOnly: destinationManagedOnly)
-        publishAppliedIndexEvent(
-            root: state.root,
-            upsertedFiles: destinationManagedOnly ? [] : (file(rootID: rootID, relativePath: newPath).map { [$0] } ?? []),
-            removedFileIDs: oldFileWasDiscoverable ? (oldFile.map { [$0.id] } ?? []) : [],
-            removedFilePaths: oldFileWasDiscoverable ? (oldFile.map { [$0.standardizedRelativePath] } ?? []) : []
-        )
+        withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+            removeFile(relativePath: oldPath, rootID: rootID)
+            indexFile(relativePath: newPath, root: state.root, managedOnly: destinationManagedOnly)
+            publishAppliedIndexEvent(
+                root: state.root,
+                upsertedFiles: destinationManagedOnly ? [] : (file(rootID: rootID, relativePath: newPath).map { [$0] } ?? []),
+                removedFileIDs: oldFileWasDiscoverable ? (oldFile.map { [$0.id] } ?? []) : [],
+                removedFilePaths: oldFileWasDiscoverable ? (oldFile.map { [$0.standardizedRelativePath] } ?? []) : []
+            )
+        }
     }
 
     func deleteFile(rootID: UUID, relativePath: String) async throws {
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let modernCodemapFence = await fenceModernCodemapPaths(
+            rootID: rootID,
+            commands: [.deleted([standardizedRelativePath])]
+        )
+        defer { releaseModernCodemapPathFence(modernCodemapFence) }
         let oldFile = file(rootID: rootID, relativePath: standardizedRelativePath)
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         do {
             try await state.service.deleteFile(atRelativePath: standardizedRelativePath)
         } catch FileSystemError.fileNotFound {
             if oldFile != nil {
-                pruneCatalogFileMissingOnDisk(rootID: rootID, relativePath: standardizedRelativePath, publishDelta: true)
+                _ = withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+                    pruneCatalogFileMissingOnDisk(
+                        rootID: rootID,
+                        relativePath: standardizedRelativePath,
+                        publishDelta: true
+                    )
+                }
             }
             throw FileSystemError.fileNotFound
         }
-        removeFile(relativePath: standardizedRelativePath, rootID: rootID)
-        if let oldFile, oldFileWasDiscoverable {
-            publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
+        withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+            removeFile(relativePath: standardizedRelativePath, rootID: rootID)
+            if let oldFile, oldFileWasDiscoverable {
+                publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
+            }
         }
     }
 
@@ -9344,28 +9814,48 @@ actor WorkspaceFileContextStore {
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         let oldFolder = folder(rootID: rootID, relativePath: standardizedRelativePath)
         let oldFolderWasDiscoverable = oldFolder.map { isDiscoverableFolderID($0.id) } ?? false
+        let affectedPaths: Set<String> = if oldFolder != nil {
+            Set(state.fileIDsByRelativePath.keys.filter {
+                $0 == standardizedRelativePath || $0.hasPrefix(standardizedRelativePath + "/")
+            })
+        } else {
+            [standardizedRelativePath]
+        }
+        let modernCodemapFence = await fenceModernCodemapPaths(
+            rootID: rootID,
+            commands: [.deleted(affectedPaths)]
+        )
+        defer { releaseModernCodemapPathFence(modernCodemapFence) }
         do {
             try await state.service.moveItemToTrash(atRelativePath: standardizedRelativePath)
         } catch FileSystemError.fileNotFound {
             if oldFile != nil || oldFolder != nil {
-                pruneCatalogItemMissingOnDisk(rootID: rootID, relativePath: standardizedRelativePath, publishDelta: true)
+                _ = withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+                    pruneCatalogItemMissingOnDisk(
+                        rootID: rootID,
+                        relativePath: standardizedRelativePath,
+                        publishDelta: true
+                    )
+                }
             }
             throw FileSystemError.fileNotFound
         }
-        if let oldFile {
-            removeFile(relativePath: standardizedRelativePath, rootID: rootID)
-            if oldFileWasDiscoverable {
-                publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
+        withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+            if let oldFile {
+                removeFile(relativePath: standardizedRelativePath, rootID: rootID)
+                if oldFileWasDiscoverable {
+                    publishAppliedIndexEvent(root: state.root, removedFileIDs: [oldFile.id], removedFilePaths: [oldFile.standardizedRelativePath])
+                }
+            } else if let oldFolder {
+                let removal = removeFolderTree(relativePath: standardizedRelativePath, rootID: rootID)
+                publishAppliedIndexEvent(
+                    root: state.root,
+                    removedFileIDs: removal.fileIDs,
+                    removedFolderIDs: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs,
+                    removedFilePaths: removal.filePaths,
+                    removedFolderPaths: removal.folderPaths.isEmpty && oldFolderWasDiscoverable ? [oldFolder.standardizedRelativePath] : removal.folderPaths
+                )
             }
-        } else if let oldFolder {
-            let removal = removeFolderTree(relativePath: standardizedRelativePath, rootID: rootID)
-            publishAppliedIndexEvent(
-                root: state.root,
-                removedFileIDs: removal.fileIDs,
-                removedFolderIDs: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs,
-                removedFilePaths: removal.filePaths,
-                removedFolderPaths: removal.folderPaths.isEmpty && oldFolderWasDiscoverable ? [oldFolder.standardizedRelativePath] : removal.folderPaths
-            )
         }
     }
 
@@ -9396,7 +9886,11 @@ actor WorkspaceFileContextStore {
             outcome = "current"
             return current
         }
-        pruneCatalogFileMissingOnDisk(rootID: file.rootID, relativePath: current.standardizedRelativePath, publishDelta: true)
+        _ = await fenceAndPruneCatalogFileMissingOnDisk(
+            rootID: file.rootID,
+            relativePath: current.standardizedRelativePath,
+            publishDelta: true
+        )
         return nil
     }
 
@@ -9613,7 +10107,11 @@ actor WorkspaceFileContextStore {
             case .ineligible(.ignored):
                 materializable.append((candidate.rootID, candidate.relativePath, true))
             case .ineligible(.missingOrDirectory):
-                pruneCatalogFileMissingOnDisk(rootID: candidate.rootID, relativePath: candidate.relativePath, publishDelta: true)
+                _ = await fenceAndPruneCatalogFileMissingOnDisk(
+                    rootID: candidate.rootID,
+                    relativePath: candidate.relativePath,
+                    publishDelta: true
+                )
                 continue
             case .ineligible:
                 foundBlockedCandidate = true
@@ -9631,11 +10129,19 @@ actor WorkspaceFileContextStore {
         case .ineligible(.ignored):
             managedOnly = true
         case .ineligible(.missingOrDirectory):
-            pruneCatalogFileMissingOnDisk(rootID: candidate.rootID, relativePath: candidate.relativePath, publishDelta: true)
+            _ = await fenceAndPruneCatalogFileMissingOnDisk(
+                rootID: candidate.rootID,
+                relativePath: candidate.relativePath,
+                publishDelta: true
+            )
             return .noCandidate
         case .ineligible:
             return .blocked
         }
+        await fenceModernCodemapRootAuthority(
+            rootIDs: [candidate.rootID],
+            command: .catalogAdvanced
+        )
         return try .materialized(materializeCatalogRegularFile(
             rootID: candidate.rootID,
             relativePath: candidate.relativePath,
@@ -9646,17 +10152,35 @@ actor WorkspaceFileContextStore {
     @discardableResult
     func materializeCatalogFileAfterDiskWrite(
         rootID: UUID,
-        relativePath: String
+        relativePath: String,
+        modernCodemapPathLocalMutation: Bool = false
     ) async throws -> WorkspaceFileCatalogMaterializationResult {
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         let eligibility = await state.service.registerExplicitlyManagedRegularFile(relativePath: standardizedRelativePath)
+
+        func materialize(managedOnly: Bool) throws -> WorkspaceFileCatalogMaterializationResult {
+            let perform = {
+                try self.materializeCatalogRegularFile(
+                    rootID: rootID,
+                    relativePath: standardizedRelativePath,
+                    managedOnly: managedOnly
+                )
+            }
+            let file = if modernCodemapPathLocalMutation {
+                try withModernCodemapPathLocalCatalogMutation(rootID: rootID, perform)
+            } else {
+                try perform()
+            }
+            return .materialized(file)
+        }
+
         switch eligibility {
         case .ineligible(.ignored):
             // A direct app/MCP write is an explicit request to manage this exact file.
             // Keep it available for follow-up read_file/apply_edits calls without making
             // ignored siblings discoverable through scans or replay.
-            return try .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: true))
+            return try materialize(managedOnly: true)
         case let .ineligible(reason):
             guard isExpectedDiskWriteCatalogIneligibility(reason) else {
                 throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
@@ -9665,7 +10189,7 @@ actor WorkspaceFileContextStore {
             }
             return .ineligible(reason)
         case .eligible:
-            return try .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: false))
+            return try materialize(managedOnly: false)
         }
     }
 
@@ -9939,6 +10463,27 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
+    private func fenceAndPruneCatalogFileMissingOnDisk(
+        rootID: UUID,
+        relativePath: String,
+        publishDelta: Bool
+    ) async -> Bool {
+        let path = StandardizedPath.relative(relativePath)
+        let token = await fenceModernCodemapPaths(
+            rootID: rootID,
+            commands: [.deleted([path])]
+        )
+        defer { releaseModernCodemapPathFence(token) }
+        return withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+            pruneCatalogFileMissingOnDisk(
+                rootID: rootID,
+                relativePath: path,
+                publishDelta: publishDelta
+            )
+        }
+    }
+
+    @discardableResult
     private func pruneCatalogFileMissingOnDisk(
         rootID: UUID,
         relativePath: String,
@@ -10048,6 +10593,40 @@ actor WorkspaceFileContextStore {
         }
     #endif
 
+    private func modernCodemapWatcherInvalidationCommands(
+        rootID: UUID,
+        deltas: [PreparedFileSystemDelta],
+        requiresFullResync: Bool
+    ) -> (rootCommand: ModernCodemapInvalidationCommand?, pathCommands: [ModernCodemapInvalidationCommand]) {
+        if requiresFullResync {
+            return (.watcherGap, [])
+        }
+        var commands: [ModernCodemapInvalidationCommand] = []
+        for prepared in deltas {
+            switch prepared.delta {
+            case .fileAdded:
+                commands.append(.modified([prepared.relativePath]))
+            case .fileModified:
+                commands.append(.modified([prepared.relativePath]))
+            case .fileRemoved:
+                commands.append(.deleted([prepared.relativePath]))
+            case .folderRemoved:
+                let folderPath = StandardizedPath.relative(prepared.relativePath)
+                let descendantPaths = Set(
+                    rootStatesByID[rootID]?.fileIDsByRelativePath.keys.filter {
+                        $0 == folderPath || $0.hasPrefix(folderPath + "/")
+                    } ?? []
+                )
+                if !descendantPaths.isEmpty {
+                    commands.append(.deleted(descendantPaths))
+                }
+            case .folderAdded, .folderModified:
+                break
+            }
+        }
+        return (nil, commands)
+    }
+
     private func applyPreparedIndexDeltasBody(
         rootID: UUID,
         deltas: [PreparedFileSystemDelta],
@@ -10060,11 +10639,36 @@ actor WorkspaceFileContextStore {
             expectedLifetimeID: expectedLifetimeID
         )
         guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
-        applyPreparedIndexDeltaMutations(
+        let invalidation = modernCodemapWatcherInvalidationCommands(
             rootID: rootID,
             deltas: applicableDeltas,
             requiresFullResync: requiresFullResync
         )
+        if let rootCommand = invalidation.rootCommand {
+            await fenceModernCodemapRootAuthority(rootIDs: [rootID], command: rootCommand)
+            guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
+            applyPreparedIndexDeltaMutations(
+                rootID: rootID,
+                deltas: applicableDeltas,
+                requiresFullResync: requiresFullResync
+            )
+            await awaitModernCodemapCleanupFlights(rootIDs: [rootID])
+            return
+        }
+
+        let token = await fenceModernCodemapPaths(
+            rootID: rootID,
+            commands: invalidation.pathCommands
+        )
+        defer { releaseModernCodemapPathFence(token) }
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
+        withModernCodemapPathLocalCatalogMutation(rootID: rootID) {
+            applyPreparedIndexDeltaMutations(
+                rootID: rootID,
+                deltas: applicableDeltas,
+                requiresFullResync: requiresFullResync
+            )
+        }
     }
 
     private func preflightPreparedIndexDeltas(
@@ -11184,6 +11788,22 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private func withModernCodemapPathLocalCatalogMutation<T>(
+        rootID: UUID,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        modernCodemapPathLocalCatalogMutationDepthByRootID[rootID, default: 0] += 1
+        defer {
+            let next = (modernCodemapPathLocalCatalogMutationDepthByRootID[rootID] ?? 1) - 1
+            if next == 0 {
+                modernCodemapPathLocalCatalogMutationDepthByRootID.removeValue(forKey: rootID)
+            } else {
+                modernCodemapPathLocalCatalogMutationDepthByRootID[rootID] = next
+            }
+        }
+        return try body()
+    }
+
     private func bumpCatalogGenerations(
         affectedRootKinds: Set<WorkspaceRootKind>,
         affectedRootIDs: Set<UUID>
@@ -11202,7 +11822,17 @@ actor WorkspaceFileContextStore {
         for rootID in rootIDsToAdvance {
             catalogGenerationsByRootID[rootID] = (catalogGenerationsByRootID[rootID] ?? 0) &+ 1
         }
-        detachModernCodemapSessions(rootIDs: rootIDsToAdvance)
+        let rootIDsRequiringAuthorityFence = rootIDsToAdvance.filter {
+            modernCodemapPathLocalCatalogMutationDepthByRootID[$0] == nil
+        }
+        for rootEpoch in modernCodemapSessionsByRootEpoch.keys
+            .filter({ rootIDsRequiringAuthorityFence.contains($0.rootID) })
+        {
+            _ = detachModernCodemapSession(
+                rootEpoch: rootEpoch,
+                invalidationCommands: [.catalogAdvanced]
+            )
+        }
     }
 
     private static let catalogGenerationScopes: [WorkspaceLookupRootScope] = [
@@ -11334,11 +11964,11 @@ actor WorkspaceFileContextStore {
         return (searchContentInvalidationEpochsByFileID[record.id] ?? 0) == invalidationEpoch
     }
 
-    private func pruneCatalogFileIfStillCurrent(_ record: WorkspaceFileRecord) {
+    private func pruneCatalogFileIfStillCurrent(_ record: WorkspaceFileRecord) async {
         guard let current = file(rootID: record.rootID, relativePath: record.standardizedRelativePath),
               current.id == record.id
         else { return }
-        pruneCatalogFileMissingOnDisk(
+        _ = await fenceAndPruneCatalogFileMissingOnDisk(
             rootID: current.rootID,
             relativePath: current.standardizedRelativePath,
             publishDelta: true

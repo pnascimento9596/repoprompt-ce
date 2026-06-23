@@ -488,10 +488,9 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
             "struct Added {}\n",
             to: catalogRoot.appendingPathComponent("Sources/Added.swift")
         )
-        await store.replayObservedFileSystemDeltas(
-            rootID: catalogLoaded.id,
-            deltas: [.fileAdded("Sources/Added.swift")]
-        )
+        _ = await store.ensureIndexedFiles(paths: [
+            catalogRoot.appendingPathComponent("Sources/Added.swift").path
+        ])
         await assertPresentationRenderUnavailable(
             store.renderCodemapPresentation(catalogBundle),
             equals: .bundleNotRetained
@@ -643,10 +642,9 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
             "struct CatalogAdvance {}\n",
             to: root.appendingPathComponent("Sources/CatalogAdvance.swift")
         )
-        await store.replayObservedFileSystemDeltas(
-            rootID: loaded.id,
-            deltas: [.fileAdded("Sources/CatalogAdvance.swift")]
-        )
+        _ = await store.ensureIndexedFiles(paths: [
+            root.appendingPathComponent("Sources/CatalogAdvance.swift").path
+        ])
         let staleAfterCatalogAdvance = await store.queryCodemapSelectionGraph(sourceQuery)
         XCTAssertEqual(
             staleAfterCatalogAdvance,
@@ -1025,21 +1023,22 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
         XCTAssertEqual(routed?.identity.fileID, file.id)
 
         try Self.write("struct Added {}\n", to: root.appendingPathComponent("Sources/Added.swift"))
-        await store.replayObservedFileSystemDeltas(
-            rootID: loaded.id,
-            deltas: [.fileAdded("Sources/Added.swift")]
-        )
+        let replayTask = Task {
+            await store.ensureIndexedFiles(paths: [
+                root.appendingPathComponent("Sources/Added.swift").path
+            ])
+        }
 
-        await assertStale(store.codemapArtifactDemandStatus(ticket))
         let routeUnavailable = await routeBecomesUnavailable(
             registry: fixture.registry,
             ticket: ticket,
             relativePath: file.standardizedRelativePath
         )
         XCTAssertTrue(routeUnavailable)
+        await assertStale(store.codemapArtifactDemandStatus(ticket))
         await gate.release()
-        let engineRootCountIsZero = try await engineRootCountBecomesZero(fixture: fixture)
-        XCTAssertTrue(engineRootCountIsZero)
+        await replayTask.value
+        try await assertEngineRootCount(0, fixture: fixture)
         await store.unloadRoot(id: loaded.id)
     }
 
@@ -1316,6 +1315,439 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
         await store.unloadRoot(id: reloaded.id)
     }
 
+    func testWatcherRenamePairFencesOnlyOldAndNewPaths() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Old.swift": "struct Old {}\n",
+                "Sources/Unrelated.swift": "func unrelated() {}\n"
+            ]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let graphProbe = ModernCodemapSelectionGraphProbe()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let old = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Old.swift" })
+        let unrelated = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
+        let oldTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: old.id))
+        let oldReady = try await readyResult(settledResult(store: store, ticket: oldTicket))
+        let unrelatedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: unrelated.id))
+        let unrelatedReady = try await readyResult(settledResult(store: store, ticket: unrelatedTicket))
+        let unrelatedPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Workspace",
+            standardizedRelativePath: unrelated.standardizedRelativePath
+        ))
+        let unrelatedPresentation = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: unrelatedTicket, logicalPath: unrelatedPath)
+            ])
+        )
+        let unrelatedQuery = WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+            WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+        ])
+        _ = try await readyGraphQuery(store: store, query: unrelatedQuery)
+
+        try FileManager.default.moveItem(
+            at: root.appendingPathComponent(old.standardizedRelativePath),
+            to: root.appendingPathComponent("Sources/New.swift")
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [
+                .fileRemoved(old.standardizedRelativePath),
+                .fileAdded("Sources/New.swift")
+            ]
+        )
+
+        await assertStale(store.codemapArtifactDemandStatus(oldTicket))
+        XCTAssertThrowsError(try oldReady.handle.artifactKey())
+        XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
+        _ = try await renderedPresentationEntries(
+            store.renderCodemapPresentation(unrelatedPresentation)
+        )
+        _ = try await readyGraphQuery(store: store, query: unrelatedQuery)
+        XCTAssertEqual(graphProbe.factoryCount, 1)
+
+        let renamedValue = await store.file(rootID: loaded.id, relativePath: "Sources/New.swift")
+        let renamed = try XCTUnwrap(renamedValue)
+        let renamedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: renamed.id))
+        XCTAssertGreaterThan(renamedTicket.pathGeneration, oldTicket.pathGeneration)
+        _ = try await readyResult(settledResult(store: store, ticket: renamedTicket))
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testPathRepairPublishesReadyContributionCompletedDuringRebuild() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Affected.swift": "struct Affected {}\n",
+                "Sources/Late.swift": "struct Late { let survivor: Survivor }\n",
+                "Sources/Survivor.swift": "struct Survivor {}\n"
+            ]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let buildGate = ModernCodemapSelectionGraphBuildGate()
+        let graphProbe = ModernCodemapSelectionGraphProbe(buildGate: buildGate)
+        addTeardownBlock {
+            buildGate.releaseAll()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let affected = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Affected.swift" })
+        let late = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Late.swift" })
+        let survivor = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Survivor.swift" })
+        let survivorTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: survivor.id))
+        _ = try await readyResult(settledResult(store: store, ticket: survivorTicket))
+        let initialGeneration = try XCTUnwrap(buildGate.waitUntilFirstBlocked())
+        buildGate.release(generation: initialGeneration)
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: survivorTicket)
+            ])
+        )
+
+        try Self.write(
+            "struct Affected { let changed = true }\n",
+            to: root.appendingPathComponent(affected.standardizedRelativePath)
+        )
+        let repairTask = Task {
+            await store.replayObservedFileSystemDeltas(
+                rootID: loaded.id,
+                deltas: [.fileModified(affected.standardizedRelativePath, nil)]
+            )
+        }
+        let repairGeneration = try XCTUnwrap(
+            buildGate.waitUntilBlocked(after: initialGeneration)
+        )
+
+        let lateTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: late.id))
+        _ = try await readyResult(settledResult(store: store, ticket: lateTicket))
+        buildGate.release(generation: repairGeneration)
+        buildGate.releaseAll()
+        await repairTask.value
+
+        let result = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: lateTicket)
+            ])
+        )
+        let rootResult = try XCTUnwrap(result.roots.first)
+        XCTAssertEqual(rootResult.result.publishedSummary.nodeCount, 2)
+        XCTAssertTrue(rootResult.result.sourceCoverage.contains {
+            $0.source.fileID == late.id && $0.state == .covered
+        })
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testWatcherModifyDeleteAndGapAwaitPresentationGraphAndEngineFences() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Affected.swift": "func affected() {}\n",
+                "Sources/Unrelated.swift": "func unrelated() {}\n"
+            ]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let graphProbe = ModernCodemapSelectionGraphProbe()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let affected = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Affected.swift" })
+        let unrelated = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
+        let affectedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: affected.id))
+        let affectedReady = try await readyResult(settledResult(store: store, ticket: affectedTicket))
+        let unrelatedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: unrelated.id))
+        let unrelatedReady = try await readyResult(settledResult(store: store, ticket: unrelatedTicket))
+        let unrelatedPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Workspace",
+            standardizedRelativePath: unrelated.standardizedRelativePath
+        ))
+        let unrelatedPresentation = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: unrelatedTicket, logicalPath: unrelatedPath)
+            ])
+        )
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: affectedTicket),
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+            ])
+        )
+        let graph = try XCTUnwrap(graphProbe.graph(rootEpoch: affectedTicket.rootEpoch))
+
+        try Self.write(
+            "struct Affected { let changed = true }\n",
+            to: root.appendingPathComponent(affected.standardizedRelativePath)
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileModified(affected.standardizedRelativePath, nil)]
+        )
+
+        await assertStale(store.codemapArtifactDemandStatus(affectedTicket))
+        XCTAssertThrowsError(try affectedReady.handle.artifactKey())
+        XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
+        _ = try await renderedPresentationEntries(
+            store.renderCodemapPresentation(unrelatedPresentation)
+        )
+        let unrelatedGraph = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+            ])
+        )
+        XCTAssertEqual(unrelatedGraph.roots.first?.rootEpoch, unrelatedTicket.rootEpoch)
+        XCTAssertEqual(graphProbe.factoryCount, 1)
+        try await assertEngineRootCount(1, fixture: fixture)
+
+        let successorTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: affected.id))
+        XCTAssertGreaterThan(successorTicket.pathGeneration, affectedTicket.pathGeneration)
+        _ = try await readyResult(settledResult(store: store, ticket: successorTicket))
+        try FileManager.default.removeItem(at: root.appendingPathComponent(unrelated.standardizedRelativePath))
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileRemoved(unrelated.standardizedRelativePath)]
+        )
+        await assertStale(store.codemapArtifactDemandStatus(unrelatedTicket))
+        XCTAssertThrowsError(try unrelatedReady.handle.artifactKey())
+
+        await store.replayPublisherFileSystemPublicationForTesting(
+            rootID: loaded.id,
+            expectedLifetimeID: successorTicket.rootEpoch.rootLifetimeID,
+            deltas: [],
+            requiresFullResync: true
+        )
+        await assertStale(store.codemapArtifactDemandStatus(successorTicket))
+        try await assertEngineRootCount(1, fixture: fixture)
+        let graphAccounting = await graph.accounting()
+        XCTAssertEqual(graphAccounting.currentUnavailableReason, .explicitRootUnavailable(.authorityRevoked))
+        XCTAssertEqual(graphAccounting.activeRebuildCount, 0)
+        let route = await fixture.registry.makeBindingCatalogClient().resolveManifestBinding(
+            successorTicket.rootEpoch,
+            affected.standardizedRelativePath
+        )
+        XCTAssertNil(route)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testStoreEditRenameAndDeleteAwaitModernAuthorityFenceBeforeReturning() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Mutable.swift": "struct Mutable {}\n",
+                "Sources/Unrelated.swift": "struct Unrelated {}\n"
+            ]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let graphProbe = ModernCodemapSelectionGraphProbe()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let initialFiles = await store.files(inRoot: loaded.id)
+        let mutable = try XCTUnwrap(initialFiles.first { $0.standardizedRelativePath == "Sources/Mutable.swift" })
+        let unrelated = try XCTUnwrap(initialFiles.first { $0.standardizedRelativePath == "Sources/Unrelated.swift" })
+        let mutableTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: mutable.id))
+        _ = try await readyResult(settledResult(store: store, ticket: mutableTicket))
+        let unrelatedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: unrelated.id))
+        let unrelatedReady = try await readyResult(settledResult(store: store, ticket: unrelatedTicket))
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+            ])
+        )
+
+        _ = try await store.editFile(
+            rootID: loaded.id,
+            relativePath: mutable.standardizedRelativePath,
+            newContent: "struct Mutable { let edited = true }\n"
+        )
+        await assertStale(store.codemapArtifactDemandStatus(mutableTicket))
+        XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
+
+        let editedFileValue = await store.file(
+            rootID: loaded.id,
+            relativePath: mutable.standardizedRelativePath
+        )
+        let editedFile = try XCTUnwrap(editedFileValue)
+        let editedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: editedFile.id))
+        _ = try await readyResult(settledResult(store: store, ticket: editedTicket))
+        try await store.moveFile(
+            rootID: loaded.id,
+            from: mutable.standardizedRelativePath,
+            to: "Sources/Renamed.swift"
+        )
+        await assertStale(store.codemapArtifactDemandStatus(editedTicket))
+        XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
+
+        let renamedFileValue = await store.file(
+            rootID: loaded.id,
+            relativePath: "Sources/Renamed.swift"
+        )
+        let renamedFile = try XCTUnwrap(renamedFileValue)
+        let renamedTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: renamedFile.id))
+        _ = try await readyResult(settledResult(store: store, ticket: renamedTicket))
+        try await store.deleteFile(rootID: loaded.id, relativePath: "Sources/Renamed.swift")
+        await assertStale(store.codemapArtifactDemandStatus(renamedTicket))
+        XCTAssertEqual(try unrelatedReady.handle.artifactKey(), unrelatedReady.snapshot.artifactKey)
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: unrelatedTicket)
+            ])
+        )
+        try await assertEngineRootCount(1, fixture: fixture)
+        XCTAssertEqual(graphProbe.factoryCount, 1)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testCheckoutAndCatalogAdvanceFenceOldAuthorityBeforeSuccessorDemand() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let graphProbe = ModernCodemapSelectionGraphProbe()
+        let scanStarts = ModernCodemapLockedCounter()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        await store.setCodemapScanWillStartHandlerForTesting { _ in scanStarts.increment() }
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let feature = try XCTUnwrap(loadedFiles.first)
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: feature.id))
+        let ready = try await readyResult(settledResult(store: store, ticket: ticket))
+        let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Workspace",
+            standardizedRelativePath: feature.standardizedRelativePath
+        ))
+        let presentation = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: ticket, logicalPath: logicalPath)
+            ])
+        )
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: ticket)
+            ])
+        )
+        let oldGraph = try XCTUnwrap(graphProbe.graph(rootEpoch: ticket.rootEpoch))
+
+        let service = WorkspaceCheckoutRefreshService(
+            store: store,
+            searchService: WorkspaceSearchService()
+        )
+        _ = await service.refreshAfterCheckoutMutation(rootPath: root.path)
+        await assertStale(store.codemapArtifactDemandStatus(ticket))
+        XCTAssertThrowsError(try ready.handle.artifactKey())
+        if case .ready = await store.renderCodemapPresentation(presentation) {
+            XCTFail("Checkout must revoke the retained presentation before returning.")
+        }
+        try await assertEngineRootCount(1, fixture: fixture)
+        let oldGraphAccounting = await oldGraph.accounting()
+        XCTAssertEqual(oldGraphAccounting.activeRebuildCount, 0)
+        XCTAssertEqual(scanStarts.value, 0)
+
+        let successorFileValue = await store.file(
+            rootID: loaded.id,
+            relativePath: feature.standardizedRelativePath
+        )
+        let successorFile = try XCTUnwrap(successorFileValue)
+        let successorTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: successorFile.id))
+        XCTAssertGreaterThan(successorTicket.catalogGeneration, ticket.catalogGeneration)
+        let successorResult = try await settledResult(store: store, ticket: successorTicket)
+        guard case .ready = successorResult else {
+            return XCTFail("Expected checkout successor ready, got \(successorResult).")
+        }
+        _ = try await store.createFile(
+            rootID: loaded.id,
+            relativePath: "Sources/CatalogReplacement.swift",
+            content: "struct CatalogReplacement {}\n"
+        )
+        await assertStale(store.codemapArtifactDemandStatus(successorTicket))
+        try await assertEngineRootCount(1, fixture: fixture)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testUnloadAwaitsPresentationGraphAndEngineRevocationBeforeReturning() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let graphProbe = ModernCodemapSelectionGraphProbe()
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(selectionGraphFactory: graphProbe.factory)
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let feature = try XCTUnwrap(loadedFiles.first)
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: feature.id))
+        let ready = try await readyResult(settledResult(store: store, ticket: ticket))
+        let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Workspace",
+            standardizedRelativePath: feature.standardizedRelativePath
+        ))
+        let presentation = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: ticket, logicalPath: logicalPath)
+            ])
+        )
+        _ = try await readyGraphQuery(
+            store: store,
+            query: WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
+                WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: ticket)
+            ])
+        )
+        let graph = try XCTUnwrap(graphProbe.graph(rootEpoch: ticket.rootEpoch))
+
+        await store.unloadRoot(id: loaded.id)
+        await assertStale(store.codemapArtifactDemandStatus(ticket))
+        XCTAssertThrowsError(try ready.handle.artifactKey())
+        if case .ready = await store.renderCodemapPresentation(presentation) {
+            XCTFail("Unload must revoke the retained presentation before returning.")
+        }
+        let graphAccounting = await graph.accounting()
+        XCTAssertEqual(graphAccounting.currentUnavailableReason, .explicitRootUnavailable(.rootUnloaded))
+        XCTAssertEqual(graphAccounting.activeRebuildCount, 0)
+        try await assertEngineRootCount(0, fixture: fixture)
+        let route = await fixture.registry.makeBindingCatalogClient().resolveManifestBinding(
+            ticket.rootEpoch,
+            feature.standardizedRelativePath
+        )
+        XCTAssertNil(route)
+    }
+
     private func pendingTicket(
         _ result: WorkspaceCodemapArtifactDemandResult
     ) throws -> WorkspaceCodemapArtifactDemandTicket {
@@ -1450,6 +1882,17 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         return false
+    }
+
+    private func assertEngineRootCount(
+        _ expected: Int,
+        fixture: ModernCodemapStoreFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let engine = try fixture.runtime().bindingEngine()
+        let accounting = await engine.accounting()
+        XCTAssertEqual(accounting.rootCount, expected, file: file, line: line)
     }
 
     private func engineRootCountBecomesZero(
@@ -1754,6 +2197,16 @@ private final class ModernCodemapSelectionGraphBuildGate: @unchecked Sendable {
             guard condition.wait(until: deadline) else { return nil }
         }
         return blockedGenerations[0]
+    }
+
+    func waitUntilBlocked(after generation: UInt64) -> UInt64? {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date(timeIntervalSinceNow: 10)
+        while !blockedGenerations.contains(where: { $0 > generation }) {
+            guard condition.wait(until: deadline) else { return nil }
+        }
+        return blockedGenerations.first(where: { $0 > generation })
     }
 
     func release(generation: UInt64) {

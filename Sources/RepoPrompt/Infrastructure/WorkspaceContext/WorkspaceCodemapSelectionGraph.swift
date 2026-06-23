@@ -236,6 +236,22 @@ actor WorkspaceCodemapSelectionGraph {
         return .unavailable(lastUnavailableReason ?? .notBuilt)
     }
 
+    func fenceContributionsForPathInvalidation(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> Bool {
+        guard rootEpoch == self.rootEpoch, revokedReason == nil else { return false }
+        observedKey = nil
+        publishedShard = nil
+        latestOperationID = nil
+        lastUnavailableReason = .rebuilding
+        hasCurrentnessConflict = false
+        advanceObservationSerial()
+        for operation in activeOperations.values {
+            operation.task.cancel()
+        }
+        return true
+    }
+
     func invalidateCurrentness(
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason

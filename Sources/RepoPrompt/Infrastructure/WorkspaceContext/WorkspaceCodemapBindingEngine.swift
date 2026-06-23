@@ -252,6 +252,7 @@ actor WorkspaceCodemapBindingEngine {
     private var manifestAdoptionOperations: [PipelineScope: ManifestAdoptionOperation] = [:]
     private var drainingManifestAdoptionTasks: [UUID: Task<ManifestAdoptionOutcome, Never>] = [:]
     private var registrationOperations: Set<UUID> = []
+    private var replacementCancelledRegistrationAttemptIDs: Set<UUID> = []
     private var registrationDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var isShuttingDown = false
     private var shutdownComplete = false
@@ -304,8 +305,12 @@ actor WorkspaceCodemapBindingEngine {
             case let .registering(attempt):
                 return attempt.registration == registration ? .busy : .failed
             case let .unavailable(unavailable):
-                if unavailable.registration == registration,
-                   case .unresolved = unavailable.state
+                let replacesRevokedAuthority = unavailable.registration.capabilityRequest ==
+                    registration.capabilityRequest &&
+                    registration.catalogGeneration > unavailable.registration.catalogGeneration &&
+                    registration.ingressGeneration > unavailable.registration.ingressGeneration
+                if case .unresolved = unavailable.state,
+                   unavailable.registration == registration || replacesRevokedAuthority
                 {
                     roots.removeValue(forKey: rootEpoch)
                 } else {
@@ -328,7 +333,7 @@ actor WorkspaceCodemapBindingEngine {
         incrementCounter(\.capabilityResolutions)
         var capabilityState = await capabilityService.resolve(root: registration.capabilityRequest)
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             return .failed
         }
@@ -339,14 +344,14 @@ actor WorkspaceCodemapBindingEngine {
             emit(.capabilityTransientRetry, rootEpoch: rootEpoch)
             capabilityState = await capabilityService.reload(root: registration.capabilityRequest)
             guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
-                await capabilityService.release(rootEpoch: rootEpoch)
+                await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
                 finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
                 return .failed
             }
         }
         guard case let .eligible(capability) = capabilityState else {
             guard registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
-                await capabilityService.release(rootEpoch: rootEpoch)
+                await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
                 finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
                 return .failed
             }
@@ -369,7 +374,7 @@ actor WorkspaceCodemapBindingEngine {
         )
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
             _ = await overlay.unregister(rootEpoch: rootEpoch)
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             return .failed
         }
@@ -377,12 +382,12 @@ actor WorkspaceCodemapBindingEngine {
         case .registered, .exactDuplicate:
             break
         case .busy:
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             recordBusy(rootEpoch)
             return .busy
         case .rejected:
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             recordFailure(rootEpoch)
             return .failed
@@ -393,7 +398,7 @@ actor WorkspaceCodemapBindingEngine {
             manifestWriterSession = try await runtime.manifestStore.registerManifestWriterSession()
         } catch {
             _ = await overlay.unregister(rootEpoch: rootEpoch)
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             recordFailure(rootEpoch)
             return .failed
@@ -401,7 +406,7 @@ actor WorkspaceCodemapBindingEngine {
         guard !Task.isCancelled, registrationAttemptIsCurrent(attempt, rootEpoch: rootEpoch) else {
             await runtime.manifestStore.endManifestWriterSession(manifestWriterSession)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await releaseCapabilityAfterRegistrationFailure(attempt, rootEpoch: rootEpoch)
             finishRegistrationAttempt(attempt, rootEpoch: rootEpoch)
             return .failed
         }
@@ -492,6 +497,12 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch
     ) async -> WorkspaceCodemapBindingInvalidationResult {
         await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .checkoutChanged)
+    }
+
+    func invalidateCatalog(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async -> WorkspaceCodemapBindingInvalidationResult {
+        await invalidateRootAuthority(rootEpoch: rootEpoch, reason: .catalogChanged)
     }
 
     func invalidateRepositoryAuthority(
@@ -2816,10 +2827,11 @@ actor WorkspaceCodemapBindingEngine {
                 manifestWriteFailed: false
             )
         }
-        if case .registering? = roots[rootEpoch] {
+        if case let .registering(attempt)? = roots[rootEpoch] {
+            replacementCancelledRegistrationAttemptIDs.insert(attempt.id)
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             emit(.invalidation, rootEpoch: rootEpoch)
             return WorkspaceCodemapBindingInvalidationResult(
@@ -2844,7 +2856,9 @@ actor WorkspaceCodemapBindingEngine {
 
         session.invalidationGeneration += 1
         for path in safePaths {
-            session.pathGenerations[path] = (session.pathGenerations[path] ?? 0) + 1
+            session.pathGenerations[path] = (
+                session.pathGenerations[path] ?? session.registration.ingressGeneration
+            ) + 1
         }
         for identity in session.pipelines.keys {
             guard var pipeline = session.pipelines[identity] else { continue }
@@ -2904,10 +2918,11 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         reason: WorkspaceCodemapLiveOverlayInvalidationReason
     ) async -> WorkspaceCodemapBindingInvalidationResult {
-        if case .registering? = roots[rootEpoch] {
+        if case let .registering(attempt)? = roots[rootEpoch] {
+            replacementCancelledRegistrationAttemptIDs.insert(attempt.id)
             roots.removeValue(forKey: rootEpoch)
             pruneAdmissionHistory()
-            await capabilityService.release(rootEpoch: rootEpoch)
+            await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
             _ = await overlay.unregister(rootEpoch: rootEpoch)
             emit(.invalidation, rootEpoch: rootEpoch)
             return WorkspaceCodemapBindingInvalidationResult(
@@ -3101,6 +3116,16 @@ actor WorkspaceCodemapBindingEngine {
         await withCheckedContinuation { continuation in
             shutdownWaiters.append(continuation)
         }
+    }
+
+    private func releaseCapabilityAfterRegistrationFailure(
+        _ attempt: RegistrationAttempt,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) async {
+        if replacementCancelledRegistrationAttemptIDs.remove(attempt.id) != nil {
+            return
+        }
+        await capabilityService.release(rootEpoch: rootEpoch)
     }
 
     private func registrationAttemptIsCurrent(

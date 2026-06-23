@@ -1180,6 +1180,47 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         XCTAssertEqual(checkout.revokedOverlayCount, 1)
     }
 
+    func testCatalogInvalidationFencesVisibilityWithoutScheduling() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Fenced.swift": "struct Fenced {}\n"]
+        )
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+            )
+        )
+        _ = await fixture.engine.registerRoot(fixture.registration)
+        guard case .ready = await fixture.engine.demand(fixture.demand(path: "Sources/Fenced.swift")) else {
+            return XCTFail("Expected initial ready result.")
+        }
+        let before = await fixture.engine.accounting()
+
+        let invalidation = await fixture.engine.invalidateCatalog(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(invalidation.revokedOverlayCount, 1)
+        XCTAssertEqual(invalidation.cancelledRequestCount, 0)
+        let bundle = await fixture.engine.freeze(rootEpoch: fixture.rootEpoch)
+        XCTAssertNil(bundle)
+        guard case .rejected(.capabilityUnavailable) = await fixture.engine.demand(
+            fixture.demand(path: "Sources/Fenced.swift")
+        ) else {
+            return XCTFail("Catalog invalidation must not schedule replacement work.")
+        }
+        let after = await fixture.engine.accounting()
+        XCTAssertEqual(after.rootCount, 1)
+        XCTAssertEqual(after.unavailableRootCount, 1)
+        XCTAssertEqual(after.counters.builds, before.counters.builds)
+        XCTAssertEqual(after.activeRequestCount, 0)
+        XCTAssertEqual(after.queuedRequestCount, 0)
+
+        let repeated = await fixture.engine.invalidateCatalog(rootEpoch: fixture.rootEpoch)
+        XCTAssertEqual(repeated.revokedOverlayCount, 0)
+        XCTAssertEqual(repeated.cancelledRequestCount, 0)
+        await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
+    }
+
     func testManifestWriteFailureKeepsVerifiedOverlayReadyAndMarksRetryState() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(

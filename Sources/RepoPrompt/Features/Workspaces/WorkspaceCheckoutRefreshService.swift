@@ -51,6 +51,7 @@ struct WorkspaceCheckoutRefreshService {
 
         let rootScope = await narrowRootScope(for: loadedRoots)
         let loadedRootIDs = loadedRoots.map(\.id)
+        await store.fenceCodemapAuthorityForCheckoutMutation(rootIDs: loadedRootIDs)
         _ = await store.awaitAppliedIngress(rootScope: rootScope)
         for rootID in loadedRootIDs {
             await store.reconcileLoadedRootCatalogWithDisk(rootID: rootID)
@@ -60,7 +61,6 @@ struct WorkspaceCheckoutRefreshService {
 
         async let warmedGeneration = store.warmPathLookupIndexes(rootScope: rootScope)
         async let indexedResult = rebuildSharedVisibleSearchIndexIfNeeded(affectedRoots: loadedRoots)
-        requestCodemapRescansInBackground(rootIDs: loadedRootIDs)
 
         let searchIndexResult = await indexedResult
         let pathLookupGeneration = await warmedGeneration
@@ -84,15 +84,6 @@ struct WorkspaceCheckoutRefreshService {
         let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
         let generation = await searchService.rebuildIndex(from: snapshot)
         return (generation, .rebuiltSharedVisibleWorkspace)
-    }
-
-    private func requestCodemapRescansInBackground(rootIDs: [UUID]) {
-        let store = store
-        Task.detached(priority: .utility) {
-            for rootID in rootIDs {
-                try? await store.requestCodemapScans(inRoot: rootID)
-            }
-        }
     }
 
     private func narrowRootScope(for targetRoots: [WorkspaceRootRecord]) async -> WorkspaceLookupRootScope {

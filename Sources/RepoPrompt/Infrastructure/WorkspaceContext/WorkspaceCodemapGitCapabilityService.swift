@@ -326,6 +326,19 @@ actor WorkspaceCodemapGitCapabilityService {
         return await resolve(root: request)
     }
 
+    func invalidateForAuthorityReplacement(rootEpoch: WorkspaceCodemapRootEpoch) async {
+        cancelFlight(for: rootEpoch, restoring: .unresolved)
+        guard let record = records.removeValue(forKey: rootEpoch) else { return }
+        if let workTreeRoot = record.retainedWorkTreeRoot,
+           let gitDirectory = record.retainedGitDirectory
+        {
+            await gitService.releaseRepositoryLayout(
+                workTreeRoot: workTreeRoot,
+                expectedGitDirectory: gitDirectory
+            )
+        }
+    }
+
     func release(rootEpoch: WorkspaceCodemapRootEpoch) async {
         cancelFlight(for: rootEpoch, restoring: .unresolved)
         guard let record = records.removeValue(forKey: rootEpoch) else { return }
