@@ -1,6 +1,6 @@
 import Foundation
 
-struct CodeMapSelectionGraphRehearsalAdmissionPolicy: Hashable {
+struct CodeMapSelectionGraphAdmissionPolicy: Hashable {
     static let initial = Self(
         maximumActiveReservationCount: 1,
         maximumReservedBindingCount: 100_000
@@ -17,29 +17,29 @@ struct CodeMapSelectionGraphRehearsalAdmissionPolicy: Hashable {
     }
 }
 
-enum CodeMapSelectionGraphRehearsalAdmissionBusyReason: Hashable {
+enum CodeMapSelectionGraphAdmissionBusyReason: Hashable {
     case activeReservationCountLimit
     case reservedBindingCountLimit
 }
 
-enum CodeMapSelectionGraphRehearsalAdmissionError: Error, Hashable {
-    case busy(CodeMapSelectionGraphRehearsalAdmissionBusyReason)
+enum CodeMapSelectionGraphAdmissionError: Error, Hashable {
+    case busy(CodeMapSelectionGraphAdmissionBusyReason)
     case accountingOverflow
 }
 
-struct CodeMapSelectionGraphRehearsalAdmissionAccounting: Equatable {
+struct CodeMapSelectionGraphAdmissionAccounting: Equatable {
     let activeReservationCount: Int
     let reservedBindingCount: Int
     let busyRejectionCount: UInt64
     let hasFailedClosed: Bool
 }
 
-final class CodeMapSelectionGraphRehearsalAdmissionPermit: @unchecked Sendable {
+final class CodeMapSelectionGraphAdmissionPermit: @unchecked Sendable {
     private let lock = NSLock()
     private var reservation: Reservation?
 
     fileprivate init(
-        admission: CodeMapSelectionGraphRehearsalAdmission,
+        admission: CodeMapSelectionGraphAdmission,
         token: UUID,
         bindingCount: Int
     ) {
@@ -61,45 +61,45 @@ final class CodeMapSelectionGraphRehearsalAdmissionPermit: @unchecked Sendable {
     }
 
     private struct Reservation {
-        let admission: CodeMapSelectionGraphRehearsalAdmission
+        let admission: CodeMapSelectionGraphAdmission
         let token: UUID
         let bindingCount: Int
     }
 }
 
-final class CodeMapSelectionGraphRehearsalAdmission: @unchecked Sendable {
-    static let processWide = CodeMapSelectionGraphRehearsalAdmission(policy: .initial)
+final class CodeMapSelectionGraphAdmission: @unchecked Sendable {
+    static let processWide = CodeMapSelectionGraphAdmission(policy: .initial)
 
-    private let policy: CodeMapSelectionGraphRehearsalAdmissionPolicy
+    private let policy: CodeMapSelectionGraphAdmissionPolicy
     private let lock = NSLock()
     private var reservations: [UUID: Int] = [:]
     private var reservedBindingCount = 0
     private var busyRejectionCount: UInt64 = 0
     private var hasFailedClosed = false
 
-    init(policy: CodeMapSelectionGraphRehearsalAdmissionPolicy = .initial) {
+    init(policy: CodeMapSelectionGraphAdmissionPolicy = .initial) {
         self.policy = policy
     }
 
-    func reserve(bindingCount: Int) throws -> CodeMapSelectionGraphRehearsalAdmissionPermit {
+    func reserve(bindingCount: Int) throws -> CodeMapSelectionGraphAdmissionPermit {
         try lock.withLock {
             guard !hasFailedClosed, bindingCount >= 0 else {
                 hasFailedClosed = true
-                throw CodeMapSelectionGraphRehearsalAdmissionError.accountingOverflow
+                throw CodeMapSelectionGraphAdmissionError.accountingOverflow
             }
             let (nextActiveCount, activeOverflow) = reservations.count.addingReportingOverflow(1)
             let (nextBindingCount, bindingOverflow) = reservedBindingCount.addingReportingOverflow(bindingCount)
             guard !activeOverflow, !bindingOverflow else {
                 hasFailedClosed = true
-                throw CodeMapSelectionGraphRehearsalAdmissionError.accountingOverflow
+                throw CodeMapSelectionGraphAdmissionError.accountingOverflow
             }
             guard nextActiveCount <= policy.maximumActiveReservationCount else {
                 incrementBusyRejectionCount()
-                throw CodeMapSelectionGraphRehearsalAdmissionError.busy(.activeReservationCountLimit)
+                throw CodeMapSelectionGraphAdmissionError.busy(.activeReservationCountLimit)
             }
             guard nextBindingCount <= policy.maximumReservedBindingCount else {
                 incrementBusyRejectionCount()
-                throw CodeMapSelectionGraphRehearsalAdmissionError.busy(.reservedBindingCountLimit)
+                throw CodeMapSelectionGraphAdmissionError.busy(.reservedBindingCountLimit)
             }
 
             var token = UUID()
@@ -108,7 +108,7 @@ final class CodeMapSelectionGraphRehearsalAdmission: @unchecked Sendable {
             }
             reservations[token] = bindingCount
             reservedBindingCount = nextBindingCount
-            return CodeMapSelectionGraphRehearsalAdmissionPermit(
+            return CodeMapSelectionGraphAdmissionPermit(
                 admission: self,
                 token: token,
                 bindingCount: bindingCount
@@ -116,9 +116,9 @@ final class CodeMapSelectionGraphRehearsalAdmission: @unchecked Sendable {
         }
     }
 
-    func accounting() -> CodeMapSelectionGraphRehearsalAdmissionAccounting {
+    func accounting() -> CodeMapSelectionGraphAdmissionAccounting {
         lock.withLock {
-            CodeMapSelectionGraphRehearsalAdmissionAccounting(
+            CodeMapSelectionGraphAdmissionAccounting(
                 activeReservationCount: reservations.count,
                 reservedBindingCount: reservedBindingCount,
                 busyRejectionCount: busyRejectionCount,

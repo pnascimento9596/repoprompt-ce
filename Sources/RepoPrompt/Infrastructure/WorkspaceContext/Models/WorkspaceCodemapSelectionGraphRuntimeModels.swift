@@ -1,6 +1,6 @@
 import Foundation
 
-struct WorkspaceCodemapSelectionGraphRehearsalKey: Hashable {
+struct WorkspaceCodemapSelectionGraphRuntimeKey: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogGeneration: UInt64
     let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
@@ -22,7 +22,7 @@ struct WorkspaceCodemapSelectionGraphRehearsalKey: Hashable {
     }
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalSizeAccounting: Hashable {
+struct WorkspaceCodemapSelectionGraphRuntimeSizeAccounting: Hashable {
     static let zero = Self(nodes: 0, postings: 0, edges: 0, bytes: 0)
 
     let nodes: UInt64
@@ -45,15 +45,15 @@ struct WorkspaceCodemapSelectionGraphRehearsalSizeAccounting: Hashable {
     }
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalPublishedSummary: Hashable {
-    let key: WorkspaceCodemapSelectionGraphRehearsalKey
+struct WorkspaceCodemapSelectionGraphRuntimePublishedSummary: Hashable {
+    let key: WorkspaceCodemapSelectionGraphRuntimeKey
     let nodeCount: UInt64
     let uniqueEdgeCount: UInt64
-    let sizeAccounting: WorkspaceCodemapSelectionGraphRehearsalSizeAccounting
+    let sizeAccounting: WorkspaceCodemapSelectionGraphRuntimeSizeAccounting
     let isEmpty: Bool
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalPolicy: Hashable {
+struct WorkspaceCodemapSelectionGraphRuntimePolicy: Hashable {
     static let initial = Self(
         maximumActiveRebuildCount: 1,
         maximumReservedBindingCount: 100_000,
@@ -97,12 +97,12 @@ struct WorkspaceCodemapSelectionGraphRehearsalPolicy: Hashable {
     }
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalExternalUnavailableReason: Hashable {
+enum WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason: Hashable {
     case rootUnloaded
     case authorityRevoked
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalValidationReason: Hashable {
+enum WorkspaceCodemapSelectionGraphRuntimeValidationReason: Hashable {
     case bindingNotResolved
     case terminalBinding
     case bindingRootEpochMismatch
@@ -115,21 +115,21 @@ enum WorkspaceCodemapSelectionGraphRehearsalValidationReason: Hashable {
     case contributionPolicyMismatch
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalBusyReason: Hashable {
+enum WorkspaceCodemapSelectionGraphRuntimeBusyReason: Hashable {
     case actorActiveRebuildLimit
     case actorReservedBindingLimit
-    case processAdmission(CodeMapSelectionGraphRehearsalAdmissionBusyReason)
+    case processAdmission(CodeMapSelectionGraphAdmissionBusyReason)
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalRejectionReason: Hashable {
+enum WorkspaceCodemapSelectionGraphRuntimeRejectionReason: Hashable {
     case rootEpochMismatch
     case staleSnapshot(
         received: WorkspaceCodemapSelectionGraphContributionGeneration,
         current: WorkspaceCodemapSelectionGraphContributionGeneration
     )
     case equalGenerationAuthorityConflict
-    case rootUnavailable(WorkspaceCodemapSelectionGraphRehearsalExternalUnavailableReason)
-    case invalidSnapshot(WorkspaceCodemapSelectionGraphRehearsalValidationReason)
+    case rootUnavailable(WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason)
+    case invalidSnapshot(WorkspaceCodemapSelectionGraphRuntimeValidationReason)
     case inputBindingLimit(attempted: Int, limit: Int)
     case graphSize(WorkspaceCodemapSelectionGraphSizeRejection)
     case modelStore(WorkspaceCodemapSelectionGraphContributionRejection)
@@ -137,105 +137,105 @@ enum WorkspaceCodemapSelectionGraphRehearsalRejectionReason: Hashable {
     case accountingOverflow
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalRebuildDisposition: Hashable {
-    case published(WorkspaceCodemapSelectionGraphRehearsalPublishedSummary)
-    case publishedEmpty(WorkspaceCodemapSelectionGraphRehearsalPublishedSummary)
+enum WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition: Hashable {
+    case published(WorkspaceCodemapSelectionGraphRuntimePublishedSummary)
+    case publishedEmpty(WorkspaceCodemapSelectionGraphRuntimePublishedSummary)
     case busy(
-        WorkspaceCodemapSelectionGraphRehearsalKey,
-        WorkspaceCodemapSelectionGraphRehearsalBusyReason
+        WorkspaceCodemapSelectionGraphRuntimeKey,
+        WorkspaceCodemapSelectionGraphRuntimeBusyReason
     )
-    case cancelled(WorkspaceCodemapSelectionGraphRehearsalKey)
+    case cancelled(WorkspaceCodemapSelectionGraphRuntimeKey)
     case rejected(
-        WorkspaceCodemapSelectionGraphRehearsalKey?,
-        WorkspaceCodemapSelectionGraphRehearsalRejectionReason
+        WorkspaceCodemapSelectionGraphRuntimeKey?,
+        WorkspaceCodemapSelectionGraphRuntimeRejectionReason
     )
-    case superseded(WorkspaceCodemapSelectionGraphRehearsalKey)
+    case superseded(WorkspaceCodemapSelectionGraphRuntimeKey)
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalQuerySource: Hashable {
+struct WorkspaceCodemapSelectionGraphRuntimeQuerySource: Hashable {
     let fileID: UUID
     let requestGeneration: UInt64
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalQuery: Hashable {
-    let key: WorkspaceCodemapSelectionGraphRehearsalKey
-    let selectedSources: [WorkspaceCodemapSelectionGraphRehearsalQuerySource]
+struct WorkspaceCodemapSelectionGraphRuntimeQuery: Hashable {
+    let key: WorkspaceCodemapSelectionGraphRuntimeKey
+    let selectedSources: [WorkspaceCodemapSelectionGraphRuntimeQuerySource]
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalEndpoint: Hashable {
+struct WorkspaceCodemapSelectionGraphRuntimeEndpoint: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let fileID: UUID
     let requestGeneration: UInt64
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalSourceCoverage: Hashable {
-    let source: WorkspaceCodemapSelectionGraphRehearsalQuerySource
+struct WorkspaceCodemapSelectionGraphRuntimeSourceCoverage: Hashable {
+    let source: WorkspaceCodemapSelectionGraphRuntimeQuerySource
     let state: WorkspaceCodemapSelectionGraphSourceCoverageState
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalResolution: Hashable {
-    let source: WorkspaceCodemapSelectionGraphRehearsalEndpoint
-    let target: WorkspaceCodemapSelectionGraphRehearsalEndpoint
+struct WorkspaceCodemapSelectionGraphRuntimeResolution: Hashable {
+    let source: WorkspaceCodemapSelectionGraphRuntimeEndpoint
+    let target: WorkspaceCodemapSelectionGraphRuntimeEndpoint
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalReferenceFailureRecord: Hashable {
-    let source: WorkspaceCodemapSelectionGraphRehearsalEndpoint
+struct WorkspaceCodemapSelectionGraphRuntimeReferenceFailureRecord: Hashable {
+    let source: WorkspaceCodemapSelectionGraphRuntimeEndpoint
     let referencedName: String
     let failure: WorkspaceCodemapSelectionGraphReferenceFailure
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalQueryResult: Hashable {
-    let key: WorkspaceCodemapSelectionGraphRehearsalKey
-    let selectedSources: [WorkspaceCodemapSelectionGraphRehearsalQuerySource]
-    let targets: [WorkspaceCodemapSelectionGraphRehearsalEndpoint]
-    let resolutions: [WorkspaceCodemapSelectionGraphRehearsalResolution]
-    let sourceCoverage: [WorkspaceCodemapSelectionGraphRehearsalSourceCoverage]
+struct WorkspaceCodemapSelectionGraphRuntimeQueryResult: Hashable {
+    let key: WorkspaceCodemapSelectionGraphRuntimeKey
+    let selectedSources: [WorkspaceCodemapSelectionGraphRuntimeQuerySource]
+    let targets: [WorkspaceCodemapSelectionGraphRuntimeEndpoint]
+    let resolutions: [WorkspaceCodemapSelectionGraphRuntimeResolution]
+    let sourceCoverage: [WorkspaceCodemapSelectionGraphRuntimeSourceCoverage]
     let definitionUniverseCoverage: WorkspaceCodemapSelectionGraphDefinitionUniverseCoverage
-    let referenceFailures: [WorkspaceCodemapSelectionGraphRehearsalReferenceFailureRecord]
-    let publishedSummary: WorkspaceCodemapSelectionGraphRehearsalPublishedSummary
+    let referenceFailures: [WorkspaceCodemapSelectionGraphRuntimeReferenceFailureRecord]
+    let publishedSummary: WorkspaceCodemapSelectionGraphRuntimePublishedSummary
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalQueryUnavailableReason: Hashable {
+enum WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason: Hashable {
     case notBuilt
     case rebuilding
-    case staleCurrentness(currentKey: WorkspaceCodemapSelectionGraphRehearsalKey?)
-    case actorAdmissionRejected(WorkspaceCodemapSelectionGraphRehearsalBusyReason)
-    case processAdmissionRejected(CodeMapSelectionGraphRehearsalAdmissionBusyReason)
+    case staleCurrentness(currentKey: WorkspaceCodemapSelectionGraphRuntimeKey?)
+    case actorAdmissionRejected(WorkspaceCodemapSelectionGraphRuntimeBusyReason)
+    case processAdmissionRejected(CodeMapSelectionGraphAdmissionBusyReason)
     case cancelled
     case budgetExceeded
     case invalidSnapshot
-    case explicitRootUnavailable(WorkspaceCodemapSelectionGraphRehearsalExternalUnavailableReason)
+    case explicitRootUnavailable(WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason)
     case invalidQuery
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalQueryDisposition: Hashable {
-    case readyPartial(WorkspaceCodemapSelectionGraphRehearsalQueryResult)
-    case unavailable(WorkspaceCodemapSelectionGraphRehearsalQueryUnavailableReason)
+enum WorkspaceCodemapSelectionGraphRuntimeQueryDisposition: Hashable {
+    case readyPartial(WorkspaceCodemapSelectionGraphRuntimeQueryResult)
+    case unavailable(WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason)
 }
 
-enum WorkspaceCodemapSelectionGraphRehearsalDiagnosticEventKind: Hashable {
+enum WorkspaceCodemapSelectionGraphRuntimeDiagnosticEventKind: Hashable {
     case buildStarted
     case beforePublication
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalDiagnosticEvent: Hashable {
+struct WorkspaceCodemapSelectionGraphRuntimeDiagnosticEvent: Hashable {
     let operationID: UInt64
-    let key: WorkspaceCodemapSelectionGraphRehearsalKey
-    let kind: WorkspaceCodemapSelectionGraphRehearsalDiagnosticEventKind
+    let key: WorkspaceCodemapSelectionGraphRuntimeKey
+    let kind: WorkspaceCodemapSelectionGraphRuntimeDiagnosticEventKind
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalDiagnostics {
+struct WorkspaceCodemapSelectionGraphRuntimeDiagnostics {
     static let none = Self { _ in }
 
-    let handle: @Sendable (WorkspaceCodemapSelectionGraphRehearsalDiagnosticEvent) -> Void
+    let handle: @Sendable (WorkspaceCodemapSelectionGraphRuntimeDiagnosticEvent) -> Void
 }
 
-struct WorkspaceCodemapSelectionGraphRehearsalAccounting: Equatable {
+struct WorkspaceCodemapSelectionGraphRuntimeAccounting: Equatable {
     let activeRebuildCount: Int
     let reservedInputBindingCount: Int
-    let publishedSummary: WorkspaceCodemapSelectionGraphRehearsalPublishedSummary?
-    let currentObservedKey: WorkspaceCodemapSelectionGraphRehearsalKey?
-    let currentUnavailableReason: WorkspaceCodemapSelectionGraphRehearsalQueryUnavailableReason?
+    let publishedSummary: WorkspaceCodemapSelectionGraphRuntimePublishedSummary?
+    let currentObservedKey: WorkspaceCodemapSelectionGraphRuntimeKey?
+    let currentUnavailableReason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason?
     let publishedCount: UInt64
     let emptyPublishedCount: UInt64
     let actorBusyCount: UInt64

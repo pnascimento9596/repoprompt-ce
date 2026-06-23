@@ -2,7 +2,7 @@ import Foundation
 @testable import RepoPrompt
 import XCTest
 
-final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
+final class WorkspaceCodemapSelectionGraphTests: XCTestCase {
     func testReadyPartialResolutionIsDeterministicAcrossPermutationsAndCandidateBounds() async throws {
         let authority = try await makeAuthority(
             name: #function,
@@ -36,15 +36,15 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             artifact: makeArtifact(definitions: ["Target"], references: [])
         )
         let bindings = [sourceBinding, aBinding, bBinding]
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 2,
             maximumReservedBindingCount: 20
         ))
-        let first = WorkspaceCodemapSelectionGraphRehearsal(
+        let first = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission
         )
-        let second = WorkspaceCodemapSelectionGraphRehearsal(
+        let second = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission
         )
@@ -53,7 +53,7 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         try await requirePublished(first.rebuild(from: firstSnapshot))
         try await requirePublished(second.rebuild(from: secondSnapshot))
 
-        let source = WorkspaceCodemapSelectionGraphRehearsalQuerySource(
+        let source = WorkspaceCodemapSelectionGraphRuntimeQuerySource(
             fileID: sourceID,
             requestGeneration: 7
         )
@@ -96,9 +96,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         ))
         XCTAssertEqual(conflictingGenerationQuery, .unavailable(.invalidQuery))
 
-        let overflowActor = WorkspaceCodemapSelectionGraphRehearsal(
+        let overflowActor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(graphSizePolicy: graphPolicy(maxDefinitionCandidates: 1)),
+            policy: runtimePolicy(graphSizePolicy: graphPolicy(maxDefinitionCandidates: 1)),
             admission: admission
         )
         try await requirePublished(overflowActor.rebuild(from: firstSnapshot))
@@ -189,15 +189,15 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             bindings: [secondSource, secondTarget],
             generation: 1
         )
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 2,
             maximumReservedBindingCount: 10
         ))
-        let first = WorkspaceCodemapSelectionGraphRehearsal(
+        let first = WorkspaceCodemapSelectionGraph(
             rootEpoch: firstAuthority.capability.rootEpoch,
             admission: admission
         )
-        let second = WorkspaceCodemapSelectionGraphRehearsal(
+        let second = WorkspaceCodemapSelectionGraph(
             rootEpoch: secondAuthority.capability.rootEpoch,
             admission: admission
         )
@@ -256,11 +256,11 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         let bindings = try await graphBindings(authority: authority)
         let snapshot1 = snapshot(authority: authority, bindings: bindings, generation: 1)
         let empty = snapshot(authority: authority, bindings: [], generation: 1)
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 4,
             maximumReservedBindingCount: 20
         ))
-        let emptyActor = WorkspaceCodemapSelectionGraphRehearsal(
+        let emptyActor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission
         )
@@ -278,9 +278,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         )))
         XCTAssertEqual(emptyResult.sourceCoverage.map(\.state), [.missing])
 
-        let gate = RehearsalBuildGate()
+        let gate = SelectionGraphBuildGate()
         defer { gate.releaseAll() }
-        let actor = WorkspaceCodemapSelectionGraphRehearsal(
+        let actor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission,
             diagnostics: gate.diagnostics
@@ -308,9 +308,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             .unavailable(.cancelled)
         )
 
-        let limitedActor = WorkspaceCodemapSelectionGraphRehearsal(
+        let limitedActor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(maximumInputBindingCount: 1),
+            policy: runtimePolicy(maximumInputBindingCount: 1),
             admission: admission
         )
         let limitedRebuild = await limitedActor.rebuild(from: snapshot1)
@@ -345,9 +345,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             .unavailable(.explicitRootUnavailable(.authorityRevoked))
         )
 
-        let outputBounded = WorkspaceCodemapSelectionGraphRehearsal(
+        let outputBounded = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(maximumResolvedTargetCountPerQuery: 1),
+            policy: runtimePolicy(maximumResolvedTargetCountPerQuery: 1),
             admission: admission
         )
         let duplicateTargetBindings = try await duplicateTargetGraphBindings(authority: authority)
@@ -404,13 +404,13 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             bindings: [firstSource, secondSource, target],
             generation: 1
         )
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 1,
             maximumReservedBindingCount: 10
         ))
-        let bounded = WorkspaceCodemapSelectionGraphRehearsal(
+        let bounded = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(
+            policy: runtimePolicy(
                 maximumSelectedSourceCountPerQuery: 2,
                 maximumResolvedTargetCountPerQuery: 1
             ),
@@ -418,11 +418,11 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         )
         try await requirePublished(bounded.rebuild(from: sharedTargetSnapshot))
 
-        let firstQuerySource = WorkspaceCodemapSelectionGraphRehearsalQuerySource(
+        let firstQuerySource = WorkspaceCodemapSelectionGraphRuntimeQuerySource(
             fileID: firstSourceID,
             requestGeneration: 7
         )
-        let secondQuerySource = WorkspaceCodemapSelectionGraphRehearsalQuerySource(
+        let secondQuerySource = WorkspaceCodemapSelectionGraphRuntimeQuerySource(
             fileID: secondSourceID,
             requestGeneration: 7
         )
@@ -455,9 +455,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             bindings: [failureSource],
             generation: 2
         )
-        let exactFailureBound = WorkspaceCodemapSelectionGraphRehearsal(
+        let exactFailureBound = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(maximumReferenceFailureCountPerQuery: 2),
+            policy: runtimePolicy(maximumReferenceFailureCountPerQuery: 2),
             admission: admission
         )
         try await requirePublished(exactFailureBound.rebuild(from: failureSnapshot))
@@ -467,9 +467,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         )))
         XCTAssertEqual(exactFailures.referenceFailures.map(\.referencedName), ["MissingA", "MissingB"])
 
-        let rejectedFailurePrefix = WorkspaceCodemapSelectionGraphRehearsal(
+        let rejectedFailurePrefix = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(maximumReferenceFailureCountPerQuery: 1),
+            policy: runtimePolicy(maximumReferenceFailureCountPerQuery: 1),
             admission: admission
         )
         try await requirePublished(rejectedFailurePrefix.rebuild(from: failureSnapshot))
@@ -488,11 +488,11 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
         let value = snapshot(authority: authority, bindings: bindings, generation: 1)
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 1,
             maximumReservedBindingCount: 4
         ))
-        let baseline = WorkspaceCodemapSelectionGraphRehearsal(
+        let baseline = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission
         )
@@ -508,9 +508,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
 
         for (dimension, attempted) in boundaries {
             XCTAssertGreaterThan(attempted, 0)
-            let exact = WorkspaceCodemapSelectionGraphRehearsal(
+            let exact = WorkspaceCodemapSelectionGraph(
                 rootEpoch: authority.capability.rootEpoch,
-                policy: rehearsalPolicy(graphSizePolicy: graphPolicy(limit: attempted, for: dimension)),
+                policy: runtimePolicy(graphSizePolicy: graphPolicy(limit: attempted, for: dimension)),
                 admission: admission
             )
             try await requirePublished(exact.rebuild(from: value))
@@ -522,9 +522,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             )
 
             let limit = attempted - 1
-            let rejected = WorkspaceCodemapSelectionGraphRehearsal(
+            let rejected = WorkspaceCodemapSelectionGraph(
                 rootEpoch: authority.capability.rootEpoch,
-                policy: rehearsalPolicy(graphSizePolicy: graphPolicy(limit: limit, for: dimension)),
+                policy: runtimePolicy(graphSizePolicy: graphPolicy(limit: limit, for: dimension)),
                 admission: admission
             )
             let rejection = await rejected.rebuild(from: value)
@@ -565,9 +565,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         let conflictingBindings = try await graphBindings(authority: conflictingAuthority)
         let first = snapshot(authority: firstAuthority, bindings: firstBindings, generation: 1)
         let conflict = snapshot(authority: conflictingAuthority, bindings: conflictingBindings, generation: 1)
-        let actor = WorkspaceCodemapSelectionGraphRehearsal(
+        let actor = WorkspaceCodemapSelectionGraph(
             rootEpoch: firstAuthority.capability.rootEpoch,
-            admission: CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+            admission: CodeMapSelectionGraphAdmission(policy: .init(
                 maximumActiveReservationCount: 1,
                 maximumReservedBindingCount: 4
             ))
@@ -607,9 +607,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             targetID: targetID
         )
         let firstSnapshot = snapshot(authority: authority, bindings: firstBindings, generation: 1)
-        let actor = WorkspaceCodemapSelectionGraphRehearsal(
+        let actor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            admission: CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+            admission: CodeMapSelectionGraphAdmission(policy: .init(
                 maximumActiveReservationCount: 1,
                 maximumReservedBindingCount: 10
             ))
@@ -680,14 +680,14 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
     }
 
     func testActorAndProcessAdmissionAreExactRecoverableAndReleaseOnce() async throws {
-        let direct = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let direct = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 1,
             maximumReservedBindingCount: 2
         ))
         let concurrentPermit = try direct.reserve(bindingCount: 2)
         XCTAssertEqual(direct.accounting().activeReservationCount, 1)
         XCTAssertThrowsError(try direct.reserve(bindingCount: 0)) {
-            XCTAssertEqual($0 as? CodeMapSelectionGraphRehearsalAdmissionError, .busy(.activeReservationCountLimit))
+            XCTAssertEqual($0 as? CodeMapSelectionGraphAdmissionError, .busy(.activeReservationCountLimit))
         }
         await withTaskGroup(of: Void.self) { group in
             for _ in 0 ..< 16 {
@@ -696,33 +696,33 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         }
         concurrentPermit.close()
         XCTAssertEqual(direct.accounting().reservedBindingCount, 0)
-        var deinitPermit: CodeMapSelectionGraphRehearsalAdmissionPermit? = try direct.reserve(bindingCount: 1)
+        var deinitPermit: CodeMapSelectionGraphAdmissionPermit? = try direct.reserve(bindingCount: 1)
         XCTAssertNotNil(deinitPermit)
         deinitPermit = nil
         XCTAssertEqual(direct.accounting().activeReservationCount, 0)
         XCTAssertFalse(direct.accounting().hasFailedClosed)
 
-        let bindingBounded = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let bindingBounded = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 2,
             maximumReservedBindingCount: 2
         ))
         let bindingPermit = try bindingBounded.reserve(bindingCount: 1)
         XCTAssertThrowsError(try bindingBounded.reserve(bindingCount: 2)) {
-            XCTAssertEqual($0 as? CodeMapSelectionGraphRehearsalAdmissionError, .busy(.reservedBindingCountLimit))
+            XCTAssertEqual($0 as? CodeMapSelectionGraphAdmissionError, .busy(.reservedBindingCountLimit))
         }
         bindingPermit.close()
         XCTAssertEqual(bindingBounded.accounting().reservedBindingCount, 0)
 
-        let failedClosed = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let failedClosed = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 1,
             maximumReservedBindingCount: 1
         ))
         XCTAssertThrowsError(try failedClosed.reserve(bindingCount: -1)) {
-            XCTAssertEqual($0 as? CodeMapSelectionGraphRehearsalAdmissionError, .accountingOverflow)
+            XCTAssertEqual($0 as? CodeMapSelectionGraphAdmissionError, .accountingOverflow)
         }
         XCTAssertTrue(failedClosed.accounting().hasFailedClosed)
         XCTAssertThrowsError(try failedClosed.reserve(bindingCount: 0)) {
-            XCTAssertEqual($0 as? CodeMapSelectionGraphRehearsalAdmissionError, .accountingOverflow)
+            XCTAssertEqual($0 as? CodeMapSelectionGraphAdmissionError, .accountingOverflow)
         }
 
         let authority = try await makeAuthority(
@@ -736,15 +736,15 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             generation: 1
         )
 
-        let localAdmission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let localAdmission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 2,
             maximumReservedBindingCount: 4
         ))
-        let localGate = RehearsalBuildGate()
+        let localGate = SelectionGraphBuildGate()
         defer { localGate.releaseAll() }
-        let local = WorkspaceCodemapSelectionGraphRehearsal(
+        let local = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(
+            policy: runtimePolicy(
                 maximumActiveRebuildCount: 2,
                 maximumReservedBindingCount: 2
             ),
@@ -773,18 +773,18 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         XCTAssertEqual(localAdmission.accounting().reservedBindingCount, 0)
         XCTAssertFalse(localGate.didTimeOut)
 
-        let shared = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let shared = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 2,
             maximumReservedBindingCount: 2
         ))
-        let sharedGate = RehearsalBuildGate()
+        let sharedGate = SelectionGraphBuildGate()
         defer { sharedGate.releaseAll() }
-        let first = WorkspaceCodemapSelectionGraphRehearsal(
+        let first = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: shared,
             diagnostics: sharedGate.diagnostics
         )
-        let second = WorkspaceCodemapSelectionGraphRehearsal(
+        let second = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: shared
         )
@@ -843,18 +843,18 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
             bindings: graphBindings(authority: authority),
             generation: 1
         )
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 1,
             maximumReservedBindingCount: 4
         ))
-        let gate = RehearsalBuildGate()
+        let gate = SelectionGraphBuildGate()
         defer { gate.releaseAll() }
-        let first = WorkspaceCodemapSelectionGraphRehearsal(
+        let first = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission,
             diagnostics: gate.diagnostics
         )
-        let second = WorkspaceCodemapSelectionGraphRehearsal(
+        let second = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
             admission: admission
         )
@@ -897,22 +897,22 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         defer { authority.repositoryFixture.cleanup() }
         let bindings = try await graphBindings(authority: authority)
         let base = snapshot(authority: authority, bindings: bindings, generation: 1)
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 2,
             maximumReservedBindingCount: 10
         ))
-        let baseActor = WorkspaceCodemapSelectionGraphRehearsal(
+        let baseActor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(maximumActiveRebuildCount: 2),
+            policy: runtimePolicy(maximumActiveRebuildCount: 2),
             admission: admission
         )
         try await requirePublished(baseActor.rebuild(from: base))
 
-        let gate = RehearsalBuildGate()
+        let gate = SelectionGraphBuildGate()
         defer { gate.releaseAll() }
-        let actor = WorkspaceCodemapSelectionGraphRehearsal(
+        let actor = WorkspaceCodemapSelectionGraph(
             rootEpoch: authority.capability.rootEpoch,
-            policy: rehearsalPolicy(maximumActiveRebuildCount: 2),
+            policy: runtimePolicy(maximumActiveRebuildCount: 2),
             admission: admission,
             diagnostics: gate.diagnostics
         )
@@ -993,13 +993,13 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         let rootEpoch = authority.capability.rootEpoch
         authority.repositoryFixture.cleanup()
 
-        let admission = CodeMapSelectionGraphRehearsalAdmission(policy: .init(
+        let admission = CodeMapSelectionGraphAdmission(policy: .init(
             maximumActiveReservationCount: 1,
             maximumReservedBindingCount: 2
         ))
-        let actor = WorkspaceCodemapSelectionGraphRehearsal(
+        let actor = WorkspaceCodemapSelectionGraph(
             rootEpoch: rootEpoch,
-            policy: rehearsalPolicy(),
+            policy: runtimePolicy(),
             admission: admission,
             diagnostics: .none
         )
@@ -1010,9 +1010,9 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         )))
         XCTAssertEqual(result.targets.map(\.fileID), [targetID])
         XCTAssertEqual(result.targets.map(\.rootEpoch), [rootEpoch])
-        requireSendable(WorkspaceCodemapSelectionGraphRehearsalKey.self)
-        requireSendable(WorkspaceCodemapSelectionGraphRehearsalQueryDisposition.self)
-        requireSendable(CodeMapSelectionGraphRehearsalAdmissionPermit.self)
+        requireSendable(WorkspaceCodemapSelectionGraphRuntimeKey.self)
+        requireSendable(WorkspaceCodemapSelectionGraphRuntimeQueryDisposition.self)
+        requireSendable(CodeMapSelectionGraphAdmissionPermit.self)
     }
 
     private func makeAuthority(
@@ -1162,7 +1162,7 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         )
     }
 
-    private func rehearsalPolicy(
+    private func runtimePolicy(
         maximumActiveRebuildCount: Int = 1,
         maximumReservedBindingCount: Int = 100,
         maximumInputBindingCount: Int = 100,
@@ -1170,7 +1170,7 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
         maximumResolvedTargetCountPerQuery: Int = 100,
         maximumReferenceFailureCountPerQuery: Int = 100,
         graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy? = nil
-    ) -> WorkspaceCodemapSelectionGraphRehearsalPolicy {
+    ) -> WorkspaceCodemapSelectionGraphRuntimePolicy {
         .init(
             maximumActiveRebuildCount: maximumActiveRebuildCount,
             maximumReservedBindingCount: maximumReservedBindingCount,
@@ -1215,18 +1215,18 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
     }
 
     private func requirePublished(
-        _ disposition: WorkspaceCodemapSelectionGraphRehearsalRebuildDisposition
+        _ disposition: WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition
     ) throws {
         guard case .published = disposition else {
-            throw RehearsalTestError.expectedPublished(disposition)
+            throw SelectionGraphTestError.expectedPublished(disposition)
         }
     }
 
     private func requireReady(
-        _ disposition: WorkspaceCodemapSelectionGraphRehearsalQueryDisposition
-    ) throws -> WorkspaceCodemapSelectionGraphRehearsalQueryResult {
+        _ disposition: WorkspaceCodemapSelectionGraphRuntimeQueryDisposition
+    ) throws -> WorkspaceCodemapSelectionGraphRuntimeQueryResult {
         guard case let .readyPartial(result) = disposition else {
-            throw RehearsalTestError.expectedReady(disposition)
+            throw SelectionGraphTestError.expectedReady(disposition)
         }
         return result
     }
@@ -1245,7 +1245,7 @@ final class WorkspaceCodemapSelectionGraphRehearsalTests: XCTestCase {
     }
 }
 
-private final class RehearsalBuildGate: @unchecked Sendable {
+private final class SelectionGraphBuildGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var waitingByGeneration: [UInt64: Int] = [:]
     private var releaseCountByGeneration: [UInt64: Int] = [:]
@@ -1256,8 +1256,8 @@ private final class RehearsalBuildGate: @unchecked Sendable {
         condition.withLock { !timedOutGenerations.isEmpty }
     }
 
-    var diagnostics: WorkspaceCodemapSelectionGraphRehearsalDiagnostics {
-        WorkspaceCodemapSelectionGraphRehearsalDiagnostics { [self] event in
+    var diagnostics: WorkspaceCodemapSelectionGraphRuntimeDiagnostics {
+        WorkspaceCodemapSelectionGraphRuntimeDiagnostics { [self] event in
             guard event.kind == .beforePublication else { return }
             block(generation: event.key.contributionGeneration.rawValue)
         }
@@ -1311,7 +1311,7 @@ private final class RehearsalBuildGate: @unchecked Sendable {
     }
 }
 
-private enum RehearsalTestError: Error {
-    case expectedPublished(WorkspaceCodemapSelectionGraphRehearsalRebuildDisposition)
-    case expectedReady(WorkspaceCodemapSelectionGraphRehearsalQueryDisposition)
+private enum SelectionGraphTestError: Error {
+    case expectedPublished(WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition)
+    case expectedReady(WorkspaceCodemapSelectionGraphRuntimeQueryDisposition)
 }

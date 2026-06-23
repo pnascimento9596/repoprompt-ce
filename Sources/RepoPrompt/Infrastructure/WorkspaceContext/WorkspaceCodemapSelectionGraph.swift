@@ -1,12 +1,12 @@
 import Foundation
 
-actor WorkspaceCodemapSelectionGraphRehearsal {
+actor WorkspaceCodemapSelectionGraph {
     private let rootEpoch: WorkspaceCodemapRootEpoch
-    private let policy: WorkspaceCodemapSelectionGraphRehearsalPolicy
-    private let admission: CodeMapSelectionGraphRehearsalAdmission
-    private let diagnostics: WorkspaceCodemapSelectionGraphRehearsalDiagnostics
+    private let policy: WorkspaceCodemapSelectionGraphRuntimePolicy
+    private let admission: CodeMapSelectionGraphAdmission
+    private let diagnostics: WorkspaceCodemapSelectionGraphRuntimeDiagnostics
 
-    private var observedKey: WorkspaceCodemapSelectionGraphRehearsalKey?
+    private var observedKey: WorkspaceCodemapSelectionGraphRuntimeKey?
     private var observationSerial: UInt64 = 0
     private var nextOperationID: UInt64 = 0
     private var latestOperationID: UInt64?
@@ -14,8 +14,8 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
     private var activeOperations: [UInt64: ActiveOperation] = [:]
     private var activeRebuildCount = 0
     private var reservedInputBindingCount = 0
-    private var lastUnavailableReason: WorkspaceCodemapSelectionGraphRehearsalQueryUnavailableReason?
-    private var revokedReason: WorkspaceCodemapSelectionGraphRehearsalExternalUnavailableReason?
+    private var lastUnavailableReason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason?
+    private var revokedReason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason?
     private var hasCurrentnessConflict = false
 
     private var publishedCount: UInt64 = 0
@@ -29,9 +29,9 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
 
     init(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        policy: WorkspaceCodemapSelectionGraphRehearsalPolicy = .initial,
-        admission: CodeMapSelectionGraphRehearsalAdmission = .processWide,
-        diagnostics: WorkspaceCodemapSelectionGraphRehearsalDiagnostics = .none
+        policy: WorkspaceCodemapSelectionGraphRuntimePolicy = .initial,
+        admission: CodeMapSelectionGraphAdmission = .processWide,
+        diagnostics: WorkspaceCodemapSelectionGraphRuntimeDiagnostics = .none
     ) {
         self.rootEpoch = rootEpoch
         self.policy = policy
@@ -41,8 +41,8 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
 
     func rebuild(
         from snapshot: WorkspaceCodemapLiveGraphSnapshot
-    ) async -> WorkspaceCodemapSelectionGraphRehearsalRebuildDisposition {
-        let key = WorkspaceCodemapSelectionGraphRehearsalKey(snapshot: snapshot)
+    ) async -> WorkspaceCodemapSelectionGraphRuntimeRebuildDisposition {
+        let key = WorkspaceCodemapSelectionGraphRuntimeKey(snapshot: snapshot)
         guard !Task.isCancelled else { return .cancelled(key) }
         guard snapshot.rootEpoch == rootEpoch else {
             return .rejected(key, .rootEpochMismatch)
@@ -100,7 +100,7 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
         }
 
         guard activeRebuildCount < policy.maximumActiveRebuildCount else {
-            let reason = WorkspaceCodemapSelectionGraphRehearsalBusyReason.actorActiveRebuildLimit
+            let reason = WorkspaceCodemapSelectionGraphRuntimeBusyReason.actorActiveRebuildLimit
             lastUnavailableReason = .actorAdmissionRejected(reason)
             increment(&actorBusyCount)
             return .busy(key, reason)
@@ -114,16 +114,16 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
             return .rejected(key, .accountingOverflow)
         }
         guard nextReservedCount <= policy.maximumReservedBindingCount else {
-            let reason = WorkspaceCodemapSelectionGraphRehearsalBusyReason.actorReservedBindingLimit
+            let reason = WorkspaceCodemapSelectionGraphRuntimeBusyReason.actorReservedBindingLimit
             lastUnavailableReason = .actorAdmissionRejected(reason)
             increment(&actorBusyCount)
             return .busy(key, reason)
         }
 
-        let permit: CodeMapSelectionGraphRehearsalAdmissionPermit
+        let permit: CodeMapSelectionGraphAdmissionPermit
         do {
             permit = try admission.reserve(bindingCount: snapshot.bindings.count)
-        } catch let CodeMapSelectionGraphRehearsalAdmissionError.busy(reason) {
+        } catch let CodeMapSelectionGraphAdmissionError.busy(reason) {
             lastUnavailableReason = .processAdmissionRejected(reason)
             increment(&processBusyCount)
             return .busy(key, .processAdmission(reason))
@@ -216,8 +216,8 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
     }
 
     func query(
-        _ query: WorkspaceCodemapSelectionGraphRehearsalQuery
-    ) -> WorkspaceCodemapSelectionGraphRehearsalQueryDisposition {
+        _ query: WorkspaceCodemapSelectionGraphRuntimeQuery
+    ) -> WorkspaceCodemapSelectionGraphRuntimeQueryDisposition {
         if let revokedReason {
             return .unavailable(.explicitRootUnavailable(revokedReason))
         }
@@ -237,7 +237,7 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
 
     func invalidateCurrentness(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        reason: WorkspaceCodemapSelectionGraphRehearsalExternalUnavailableReason
+        reason: WorkspaceCodemapSelectionGraphRuntimeExternalUnavailableReason
     ) -> Bool {
         guard rootEpoch == self.rootEpoch, revokedReason == nil else { return false }
         revokedReason = reason
@@ -249,8 +249,8 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
         return true
     }
 
-    func accounting() -> WorkspaceCodemapSelectionGraphRehearsalAccounting {
-        let unavailableReason: WorkspaceCodemapSelectionGraphRehearsalQueryUnavailableReason? = if let revokedReason {
+    func accounting() -> WorkspaceCodemapSelectionGraphRuntimeAccounting {
+        let unavailableReason: WorkspaceCodemapSelectionGraphRuntimeQueryUnavailableReason? = if let revokedReason {
             .explicitRootUnavailable(revokedReason)
         } else if hasCurrentnessConflict {
             .invalidSnapshot
@@ -263,7 +263,7 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
         } else {
             lastUnavailableReason
         }
-        return WorkspaceCodemapSelectionGraphRehearsalAccounting(
+        return WorkspaceCodemapSelectionGraphRuntimeAccounting(
             activeRebuildCount: activeRebuildCount,
             reservedInputBindingCount: reservedInputBindingCount,
             publishedSummary: publishedShard?.summary,
@@ -281,9 +281,9 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
     }
 
     private func queryShard(
-        _ query: WorkspaceCodemapSelectionGraphRehearsalQuery,
+        _ query: WorkspaceCodemapSelectionGraphRuntimeQuery,
         in shard: ImmutableShard
-    ) -> WorkspaceCodemapSelectionGraphRehearsalQueryDisposition {
+    ) -> WorkspaceCodemapSelectionGraphRuntimeQueryDisposition {
         guard query.selectedSources.count <= policy.maximumSelectedSourceCountPerQuery else {
             return .unavailable(.budgetExceeded)
         }
@@ -296,7 +296,7 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
             generationsByFileID[source.fileID] = source.requestGeneration
         }
         let selectedSources = generationsByFileID.map {
-            WorkspaceCodemapSelectionGraphRehearsalQuerySource(
+            WorkspaceCodemapSelectionGraphRuntimeQuerySource(
                 fileID: $0.key,
                 requestGeneration: $0.value
             )
@@ -306,7 +306,7 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
         }
 
         let selectedFileIDs = Set(generationsByFileID.keys)
-        var coverage: [WorkspaceCodemapSelectionGraphRehearsalSourceCoverage] = []
+        var coverage: [WorkspaceCodemapSelectionGraphRuntimeSourceCoverage] = []
         var resolutions: [IndexedResolution] = []
         var targetIndices = Set<Int>()
         var failures: [IndexedFailure] = []
@@ -391,8 +391,8 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
     }
 
     private func recordRejection(
-        _ reason: WorkspaceCodemapSelectionGraphRehearsalRejectionReason,
-        key: WorkspaceCodemapSelectionGraphRehearsalKey
+        _ reason: WorkspaceCodemapSelectionGraphRuntimeRejectionReason,
+        key: WorkspaceCodemapSelectionGraphRuntimeKey
     ) {
         guard observedKey == key, publishedShard?.key != key else { return }
         switch reason {
@@ -439,14 +439,14 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
 
     private static func buildShard(
         snapshot: WorkspaceCodemapLiveGraphSnapshot,
-        key: WorkspaceCodemapSelectionGraphRehearsalKey,
+        key: WorkspaceCodemapSelectionGraphRuntimeKey,
         sizePolicy: WorkspaceCodemapSelectionGraphSizePolicy
     ) -> BuildOutput {
         do {
             try Task.checkCancellation()
             let bindings = try validatedSortedBindings(snapshot: snapshot, key: key)
             if bindings.isEmpty {
-                let summary = WorkspaceCodemapSelectionGraphRehearsalPublishedSummary(
+                let summary = WorkspaceCodemapSelectionGraphRuntimePublishedSummary(
                     key: key,
                     nodeCount: 0,
                     uniqueEdgeCount: 0,
@@ -559,8 +559,8 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
             }
             try Task.checkCancellation()
 
-            let accounting = WorkspaceCodemapSelectionGraphRehearsalSizeAccounting(store.accounting)
-            let summary = WorkspaceCodemapSelectionGraphRehearsalPublishedSummary(
+            let accounting = WorkspaceCodemapSelectionGraphRuntimeSizeAccounting(store.accounting)
+            let summary = WorkspaceCodemapSelectionGraphRuntimePublishedSummary(
                 key: key,
                 nodeCount: accounting.nodes,
                 uniqueEdgeCount: accounting.edges,
@@ -586,7 +586,7 @@ actor WorkspaceCodemapSelectionGraphRehearsal {
 
     private static func validatedSortedBindings(
         snapshot: WorkspaceCodemapLiveGraphSnapshot,
-        key: WorkspaceCodemapSelectionGraphRehearsalKey
+        key: WorkspaceCodemapSelectionGraphRuntimeKey
     ) throws -> [WorkspaceCodemapArtifactBinding] {
         var fileIDs = Set<UUID>()
         var relativePaths = Set<String>()
@@ -660,14 +660,14 @@ private struct ImmutableReferenceFailure: Hashable {
 }
 
 private struct ImmutableShard: Hashable {
-    let key: WorkspaceCodemapSelectionGraphRehearsalKey
+    let key: WorkspaceCodemapSelectionGraphRuntimeKey
     let nodes: [ImmutableNode]
     let nodeIndexByFileID: [UUID: Int]
     let adjacency: [Int: [Int]]
     let referenceFailures: [Int: [ImmutableReferenceFailure]]
-    let summary: WorkspaceCodemapSelectionGraphRehearsalPublishedSummary
+    let summary: WorkspaceCodemapSelectionGraphRuntimePublishedSummary
 
-    func endpoint(at index: Int) -> WorkspaceCodemapSelectionGraphRehearsalEndpoint {
+    func endpoint(at index: Int) -> WorkspaceCodemapSelectionGraphRuntimeEndpoint {
         let node = nodes[index]
         return .init(rootEpoch: key.rootEpoch, fileID: node.fileID, requestGeneration: node.requestGeneration)
     }
@@ -685,33 +685,33 @@ private enum CachedLookup {
 
 private enum BuildOutput: Equatable {
     case success(ImmutableShard)
-    case rejected(WorkspaceCodemapSelectionGraphRehearsalRejectionReason)
+    case rejected(WorkspaceCodemapSelectionGraphRuntimeRejectionReason)
     case cancelled
 }
 
 private enum BuildValidationError: Error {
-    case reason(WorkspaceCodemapSelectionGraphRehearsalValidationReason)
+    case reason(WorkspaceCodemapSelectionGraphRuntimeValidationReason)
 }
 
 private struct ActiveOperation {
-    let key: WorkspaceCodemapSelectionGraphRehearsalKey
+    let key: WorkspaceCodemapSelectionGraphRuntimeKey
     let task: Task<BuildOutput, Never>
 }
 
 private struct IndexedResolution {
     let sourceIndex: Int
     let targetIndex: Int
-    let value: WorkspaceCodemapSelectionGraphRehearsalResolution
+    let value: WorkspaceCodemapSelectionGraphRuntimeResolution
 }
 
 private struct IndexedFailure {
     let sourceIndex: Int
-    let record: WorkspaceCodemapSelectionGraphRehearsalReferenceFailureRecord
+    let record: WorkspaceCodemapSelectionGraphRuntimeReferenceFailureRecord
 }
 
 private func querySourcePrecedes(
-    _ lhs: WorkspaceCodemapSelectionGraphRehearsalQuerySource,
-    _ rhs: WorkspaceCodemapSelectionGraphRehearsalQuerySource
+    _ lhs: WorkspaceCodemapSelectionGraphRuntimeQuerySource,
+    _ rhs: WorkspaceCodemapSelectionGraphRuntimeQuerySource
 ) -> Bool {
     if lhs.fileID != rhs.fileID { return uuidPrecedes(lhs.fileID, rhs.fileID) }
     return lhs.requestGeneration < rhs.requestGeneration
