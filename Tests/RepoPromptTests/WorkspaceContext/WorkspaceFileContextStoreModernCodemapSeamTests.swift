@@ -77,6 +77,448 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
         await store.unloadRoot(id: loaded.id)
     }
 
+    func testFrozenPresentationBundleRetainsReadyHandleLeaseAcrossAwaitAndRendersLogicalPaths() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Alpha.swift": """
+                protocol AlphaProtocol {
+                    func alpha() -> String
+                }
+
+                struct Alpha: AlphaProtocol {
+                    func alpha() -> String { "alpha" }
+                }
+                """,
+                "Sources/Zeta.swift": """
+                protocol ZetaProtocol {
+                    func zeta() -> String
+                }
+
+                struct Zeta: ZetaProtocol {
+                    func zeta() -> String { "zeta" }
+                }
+                """
+            ]
+        )
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        let suspensionGate = ModernCodemapSuspensionGate()
+        addTeardownBlock {
+            await suspensionGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let alpha = try XCTUnwrap(files.first {
+            $0.standardizedRelativePath == "Sources/Alpha.swift"
+        })
+        let zeta = try XCTUnwrap(files.first {
+            $0.standardizedRelativePath == "Sources/Zeta.swift"
+        })
+        let alphaTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: alpha.id)
+        )
+        let alphaReady = try await readyResult(
+            settledResult(store: store, ticket: alphaTicket)
+        )
+        let zetaTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: zeta.id)
+        )
+        let zetaReady = try await readyResult(
+            settledResult(store: store, ticket: zetaTicket)
+        )
+        XCTAssertNil(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: root.path,
+            standardizedRelativePath: alpha.standardizedRelativePath
+        ))
+        XCTAssertNil(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Logical Workspace",
+            standardizedRelativePath: alpha.standardizedFullPath
+        ))
+        let alphaPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Logical Workspace",
+            standardizedRelativePath: alpha.standardizedRelativePath
+        ))
+        let zetaPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Logical Workspace",
+            standardizedRelativePath: zeta.standardizedRelativePath
+        ))
+        let engine = try fixture.runtime().bindingEngine()
+        let accountingBeforeFreeze = await engine.accounting()
+
+        var callerBundle: WorkspaceCodemapFrozenPresentationBundle? = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: zetaTicket, logicalPath: zetaPath),
+                WorkspaceCodemapPresentationRequest(ticket: alphaTicket, logicalPath: alphaPath)
+            ])
+        )
+        do {
+            let bundle = try XCTUnwrap(callerBundle)
+            XCTAssertEqual(bundle.rootEpoch, alphaTicket.rootEpoch)
+            XCTAssertEqual(
+                bundle.entries.map(\.logicalPath.displayPath),
+                ["Logical Workspace/Sources/Alpha.swift", "Logical Workspace/Sources/Zeta.swift"]
+            )
+            XCTAssertEqual(
+                bundle.entries.map(\.artifactKey),
+                [alphaReady.snapshot.artifactKey, zetaReady.snapshot.artifactKey]
+            )
+            XCTAssertEqual(
+                bundle.entries.map(\.artifactKey.pipelineIdentity),
+                [
+                    alphaReady.snapshot.artifactKey.pipelineIdentity,
+                    zetaReady.snapshot.artifactKey.pipelineIdentity
+                ]
+            )
+
+            let rendered = try await renderedPresentationEntries(
+                store.renderCodemapPresentation(bundle)
+            )
+            XCTAssertEqual(
+                rendered.map(\.logicalPath.displayPath),
+                ["Logical Workspace/Sources/Alpha.swift", "Logical Workspace/Sources/Zeta.swift"]
+            )
+            XCTAssertTrue(rendered[0].text.contains("File: Logical Workspace/Sources/Alpha.swift"))
+            XCTAssertTrue(rendered[1].text.contains("File: Logical Workspace/Sources/Zeta.swift"))
+            XCTAssertFalse(rendered.contains { $0.text.contains(root.path) })
+            XCTAssertTrue(rendered.allSatisfy { $0.tokenCount > 0 })
+
+            let accountingAfterRender = await engine.accounting()
+            XCTAssertEqual(
+                accountingAfterRender.counters.validatedWorktreeReads,
+                accountingBeforeFreeze.counters.validatedWorktreeReads
+            )
+            XCTAssertEqual(accountingAfterRender.counters.builds, accountingBeforeFreeze.counters.builds)
+            XCTAssertEqual(
+                accountingAfterRender.counters.manifestLoads,
+                accountingBeforeFreeze.counters.manifestLoads
+            )
+            XCTAssertEqual(fixture.buildCount.value, 2)
+        }
+
+        var suspendedRenderTask: Task<WorkspaceCodemapPresentationRenderDisposition, Never>?
+        if let bundle = callerBundle {
+            suspendedRenderTask = Task { [bundle] in
+                await suspensionGate.enterAndWait()
+                return await store.renderCodemapPresentation(bundle)
+            }
+        }
+        let suspensionEntered = await suspensionGate.waitUntilEntered()
+        XCTAssertTrue(suspensionEntered)
+        if let bundle = callerBundle {
+            let bundleReleased = await store.releaseCodemapPresentation(bundle)
+            XCTAssertTrue(bundleReleased)
+        } else {
+            XCTFail("The caller bundle must remain alive until its gated owner captures it.")
+        }
+        callerBundle = nil
+
+        await store.unloadRoot(id: loaded.id)
+        let runtime = try fixture.runtime()
+        let callerRetainedAccounting = await runtime.artifactStore.accounting()
+        XCTAssertEqual(callerRetainedAccounting.activeLeaseCount, 2)
+        XCTAssertGreaterThan(callerRetainedAccounting.activeLeaseBytes, 0)
+
+        await suspensionGate.release()
+        let suspendedRender = await suspendedRenderTask?.value
+        if let suspendedRender {
+            assertPresentationRenderUnavailable(suspendedRender, equals: .bundleNotRetained)
+        } else {
+            XCTFail("The suspended caller render task must exist.")
+        }
+        suspendedRenderTask = nil
+
+        let fullyReleasedAccounting = await runtime.artifactStore.accounting()
+        XCTAssertEqual(fullyReleasedAccounting.activeLeaseCount, 0)
+        XCTAssertEqual(fullyReleasedAccounting.activeLeaseBytes, 0)
+    }
+
+    func testPresentationFreezeRejectsPendingForeignEpochDuplicateAndLogicalPathMismatch() async throws {
+        let resolutionGate = ModernCodemapResolutionGate()
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let firstRoot = try repositoryFixture.makeRepository(
+            named: "first",
+            files: ["Sources/First.swift": "struct First {}\n"]
+        )
+        let secondRoot = try repositoryFixture.makeRepository(
+            named: "second",
+            files: ["Sources/Second.swift": "struct Second {}\n"]
+        )
+        let fixture = try ModernCodemapStoreFixture(
+            name: #function,
+            resolutionGate: resolutionGate
+        )
+        addTeardownBlock {
+            await resolutionGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let firstLoaded = try await store.loadRoot(path: firstRoot.path)
+        let secondLoaded = try await store.loadRoot(path: secondRoot.path)
+        let firstFiles = await store.files(inRoot: firstLoaded.id)
+        let secondFiles = await store.files(inRoot: secondLoaded.id)
+        let firstFile = try XCTUnwrap(firstFiles.first)
+        let secondFile = try XCTUnwrap(secondFiles.first)
+        let firstPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "First Logical Root",
+            standardizedRelativePath: firstFile.standardizedRelativePath
+        ))
+        let secondPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Second Logical Root",
+            standardizedRelativePath: secondFile.standardizedRelativePath
+        ))
+        let firstTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: firstFile.id)
+        )
+        let resolutionEntered = await resolutionGate.waitUntilEntered()
+        XCTAssertTrue(resolutionEntered)
+
+        await assertPresentationFreezeUnavailable(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: firstTicket, logicalPath: firstPath)
+            ]),
+            equals: .pending(firstTicket)
+        )
+
+        await resolutionGate.release()
+        let firstReady = try await readyResult(
+            settledResult(store: store, ticket: firstTicket)
+        )
+        let secondTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: secondFile.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: secondTicket))
+
+        await assertPresentationFreezeUnavailable(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: firstTicket, logicalPath: firstPath),
+                WorkspaceCodemapPresentationRequest(ticket: secondTicket, logicalPath: secondPath)
+            ]),
+            equals: .mixedRootEpoch
+        )
+        await assertPresentationFreezeUnavailable(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: firstTicket, logicalPath: firstPath),
+                WorkspaceCodemapPresentationRequest(ticket: firstTicket, logicalPath: firstPath)
+            ]),
+            equals: .duplicateFileID(firstFile.id)
+        )
+
+        let mismatchedPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "First Logical Root",
+            standardizedRelativePath: "Sources/Elsewhere.swift"
+        ))
+        await assertPresentationFreezeUnavailable(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(
+                    ticket: firstTicket,
+                    logicalPath: mismatchedPath
+                )
+            ]),
+            equals: .logicalPathMismatch(firstFile.id)
+        )
+
+        let unretainedEntry = WorkspaceCodemapFrozenPresentationEntry(
+            ticket: firstTicket,
+            logicalPath: firstPath,
+            artifactKey: firstReady.snapshot.artifactKey,
+            outcome: firstReady.snapshot.outcome
+        )
+        let unretainedBundle = WorkspaceCodemapFrozenPresentationBundle(
+            rootEpoch: firstTicket.rootEpoch,
+            entries: [unretainedEntry],
+            handles: [firstReady.handle]
+        )
+        await assertPresentationRenderUnavailable(
+            store.renderCodemapPresentation(unretainedBundle),
+            equals: .bundleNotRetained
+        )
+
+        let plainRoot = try fixture.makePlainRoot(files: [
+            "Sources/Plain.swift": "struct Plain {}\n"
+        ])
+        let plainLoaded = try await store.loadRoot(path: plainRoot.path)
+        let plainFiles = await store.files(inRoot: plainLoaded.id)
+        let plainFile = try XCTUnwrap(plainFiles.first)
+        let plainTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: plainFile.id)
+        )
+        let plainSettled = try await settledResult(store: store, ticket: plainTicket)
+        assertNonGitTerminal(plainSettled)
+        let plainPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Plain Logical Root",
+            standardizedRelativePath: plainFile.standardizedRelativePath
+        ))
+        await assertPresentationFreezeUnavailable(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: plainTicket, logicalPath: plainPath)
+            ]),
+            equals: .demandUnavailable(plainTicket, .gitTerminal(.nonGit))
+        )
+
+        let validBundle = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: firstTicket, logicalPath: firstPath)
+            ])
+        )
+        let validBundleReleased = await store.releaseCodemapPresentation(validBundle)
+        XCTAssertTrue(validBundleReleased)
+        await store.unloadRoot(id: firstLoaded.id)
+        await store.unloadRoot(id: secondLoaded.id)
+        await store.unloadRoot(id: plainLoaded.id)
+    }
+
+    func testPresentationRenderFailsClosedAfterDemandCancellationCatalogAdvanceAndUnload() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let cancellationRoot = try repositoryFixture.makeRepository(
+            named: "cancellation",
+            files: [
+                "Sources/First.swift": "struct First {}\n",
+                "Sources/Second.swift": "struct Second {}\n"
+            ]
+        )
+        let catalogRoot = try repositoryFixture.makeRepository(
+            named: "catalog",
+            files: ["Sources/Catalog.swift": "struct Catalog {}\n"]
+        )
+        let unloadRoot = try repositoryFixture.makeRepository(
+            named: "unload",
+            files: ["Sources/Unload.swift": "struct Unload {}\n"]
+        )
+        let cancellationGate = ModernCodemapSuspensionGate()
+        let fixture = try ModernCodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await cancellationGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(cancellationCleanupHook: { _ in
+            await cancellationGate.enterAndWait()
+        })
+
+        let cancellationLoaded = try await store.loadRoot(path: cancellationRoot.path)
+        let cancellationFiles = await store.files(inRoot: cancellationLoaded.id)
+            .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+        XCTAssertEqual(cancellationFiles.count, 2)
+        let firstCancellationTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: cancellationFiles[0].id)
+        )
+        _ = try await readyResult(
+            settledResult(store: store, ticket: firstCancellationTicket)
+        )
+        let secondCancellationTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: cancellationFiles[1].id)
+        )
+        _ = try await readyResult(
+            settledResult(store: store, ticket: secondCancellationTicket)
+        )
+        let cancellationBundle = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(
+                    ticket: firstCancellationTicket,
+                    logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                        rootDisplayName: "Cancellation Logical Root",
+                        standardizedRelativePath: cancellationFiles[0].standardizedRelativePath
+                    ))
+                ),
+                WorkspaceCodemapPresentationRequest(
+                    ticket: secondCancellationTicket,
+                    logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                        rootDisplayName: "Cancellation Logical Root",
+                        standardizedRelativePath: cancellationFiles[1].standardizedRelativePath
+                    ))
+                )
+            ])
+        )
+
+        let cancellationTask = Task {
+            await store.cancelCodemapArtifactDemand(firstCancellationTicket)
+        }
+        let cancellationEntered = await cancellationGate.waitUntilEntered()
+        XCTAssertTrue(cancellationEntered)
+        await assertPresentationRenderUnavailable(
+            store.renderCodemapPresentation(cancellationBundle),
+            equals: .bundleNotRetained
+        )
+        await cancellationGate.release()
+        let cancellationResult = await cancellationTask.value
+        XCTAssertTrue(cancellationResult)
+
+        let catalogLoaded = try await store.loadRoot(path: catalogRoot.path)
+        let catalogFiles = await store.files(inRoot: catalogLoaded.id)
+        let catalogFile = try XCTUnwrap(catalogFiles.first)
+        let catalogTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: catalogFile.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: catalogTicket))
+        let catalogPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+            rootDisplayName: "Catalog Logical Root",
+            standardizedRelativePath: catalogFile.standardizedRelativePath
+        ))
+        let releaseBundle = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: catalogTicket, logicalPath: catalogPath)
+            ])
+        )
+        let catalogBundle = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(ticket: catalogTicket, logicalPath: catalogPath)
+            ])
+        )
+        let firstRelease = await store.releaseCodemapPresentation(releaseBundle)
+        let secondRelease = await store.releaseCodemapPresentation(releaseBundle)
+        XCTAssertTrue(firstRelease)
+        XCTAssertFalse(secondRelease)
+        await assertPresentationRenderUnavailable(
+            store.renderCodemapPresentation(releaseBundle),
+            equals: .bundleNotRetained
+        )
+
+        try Self.write(
+            "struct Added {}\n",
+            to: catalogRoot.appendingPathComponent("Sources/Added.swift")
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: catalogLoaded.id,
+            deltas: [.fileAdded("Sources/Added.swift")]
+        )
+        await assertPresentationRenderUnavailable(
+            store.renderCodemapPresentation(catalogBundle),
+            equals: .bundleNotRetained
+        )
+
+        let unloadLoaded = try await store.loadRoot(path: unloadRoot.path)
+        let unloadFiles = await store.files(inRoot: unloadLoaded.id)
+        let unloadFile = try XCTUnwrap(unloadFiles.first)
+        let unloadTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: unloadFile.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: unloadTicket))
+        let unloadBundle = try await frozenPresentationBundle(
+            store.freezeCodemapPresentation([
+                WorkspaceCodemapPresentationRequest(
+                    ticket: unloadTicket,
+                    logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                        rootDisplayName: "Unload Logical Root",
+                        standardizedRelativePath: unloadFile.standardizedRelativePath
+                    ))
+                )
+            ])
+        )
+        await store.unloadRoot(id: unloadLoaded.id)
+        await assertPresentationRenderUnavailable(
+            store.renderCodemapPresentation(unloadBundle),
+            equals: .bundleNotRetained
+        )
+
+        await store.unloadRoot(id: cancellationLoaded.id)
+        await store.unloadRoot(id: catalogLoaded.id)
+    }
+
     func testNonGitDemandBecomesTerminalWithoutSourceReadManifestBuildOrGraphWork() async throws {
         let fixture = try ModernCodemapStoreFixture(name: #function)
         addTeardownBlock { await fixture.shutdown() }
@@ -413,6 +855,65 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
         return ready
     }
 
+    private func frozenPresentationBundle(
+        _ disposition: WorkspaceCodemapPresentationFreezeDisposition
+    ) throws -> WorkspaceCodemapFrozenPresentationBundle {
+        guard case let .ready(bundle) = disposition else {
+            throw ModernCodemapStoreTestError.expectedFrozenPresentationBundle
+        }
+        return bundle
+    }
+
+    private func renderedPresentationEntries(
+        _ disposition: WorkspaceCodemapPresentationRenderDisposition,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [WorkspaceCodemapRenderedPresentationEntry] {
+        guard case let .ready(entries) = disposition else {
+            if case let .unavailable(reason) = disposition {
+                XCTFail(
+                    "Expected rendered presentation entries, got \(reason).",
+                    file: file,
+                    line: line
+                )
+            }
+            throw ModernCodemapStoreTestError.expectedRenderedPresentationEntries
+        }
+        return entries
+    }
+
+    private func assertPresentationFreezeUnavailable(
+        _ disposition: WorkspaceCodemapPresentationFreezeDisposition,
+        equals expected: WorkspaceCodemapPresentationFreezeUnavailableReason,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .unavailable(actual) = disposition else {
+            return XCTFail(
+                "Expected presentation freeze unavailability.",
+                file: file,
+                line: line
+            )
+        }
+        XCTAssertEqual(actual, expected, file: file, line: line)
+    }
+
+    private func assertPresentationRenderUnavailable(
+        _ disposition: WorkspaceCodemapPresentationRenderDisposition,
+        equals expected: WorkspaceCodemapPresentationRenderUnavailableReason,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .unavailable(actual) = disposition else {
+            return XCTFail(
+                "Expected presentation render unavailability.",
+                file: file,
+                line: line
+            )
+        }
+        XCTAssertEqual(actual, expected, file: file, line: line)
+    }
+
     private func settledResult(
         store: WorkspaceFileContextStore,
         ticket: WorkspaceCodemapArtifactDemandTicket,
@@ -516,8 +1017,10 @@ final class WorkspaceFileContextStoreModernCodemapSeamTests: XCTestCase {
 }
 
 private enum ModernCodemapStoreTestError: Error {
+    case expectedFrozenPresentationBundle
     case expectedPending
     case expectedReady
+    case expectedRenderedPresentationEntries
     case timedOut
 }
 

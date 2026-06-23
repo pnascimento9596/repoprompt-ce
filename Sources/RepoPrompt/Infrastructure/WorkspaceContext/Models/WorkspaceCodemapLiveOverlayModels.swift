@@ -341,14 +341,22 @@ private final class WorkspaceCodemapLiveOverlayBundleState: @unchecked Sendable 
         }
     }
 
+    func retainingLeaseOwner(fileID: UUID) throws -> WorkspaceCodemapSharedArtifactLease? {
+        try lock.withLock {
+            guard let entries else { throw WorkspaceCodemapLiveOverlayBundleAccessError.closed }
+            return entries.first(where: { $0.snapshot.fileID == fileID })?.leaseOwner
+        }
+    }
+
     func withHandle<T>(
         fileID: UUID,
+        retainedLeaseOwner: WorkspaceCodemapSharedArtifactLease? = nil,
         _ body: (CodeMapArtifactHandle) throws -> T
     ) throws -> T? {
         try lock.withLock {
             guard let entries else { throw WorkspaceCodemapLiveOverlayBundleAccessError.closed }
             guard let entry = entries.first(where: { $0.snapshot.fileID == fileID }) else { return nil }
-            return try body(entry.leaseOwner.lease.handle)
+            return try body((retainedLeaseOwner ?? entry.leaseOwner).lease.handle)
         }
     }
 
@@ -360,30 +368,56 @@ private final class WorkspaceCodemapLiveOverlayBundleState: @unchecked Sendable 
 struct WorkspaceCodemapLiveFrozenArtifactHandle: Sendable {
     private let fileID: UUID
     private let state: WorkspaceCodemapLiveOverlayBundleState
+    private let retainedLeaseOwner: WorkspaceCodemapSharedArtifactLease?
 
-    fileprivate init(fileID: UUID, state: WorkspaceCodemapLiveOverlayBundleState) {
+    fileprivate init(
+        fileID: UUID,
+        state: WorkspaceCodemapLiveOverlayBundleState,
+        retainedLeaseOwner: WorkspaceCodemapSharedArtifactLease? = nil
+    ) {
         self.fileID = fileID
         self.state = state
+        self.retainedLeaseOwner = retainedLeaseOwner
+    }
+
+    func retainingLease() throws -> WorkspaceCodemapLiveFrozenArtifactHandle {
+        guard let leaseOwner = try state.retainingLeaseOwner(fileID: fileID) else {
+            throw WorkspaceCodemapLiveOverlayBundleAccessError.entryUnavailable
+        }
+        return WorkspaceCodemapLiveFrozenArtifactHandle(
+            fileID: fileID,
+            state: state,
+            retainedLeaseOwner: leaseOwner
+        )
     }
 
     func artifactKey() throws -> CodeMapArtifactKey {
-        guard let key = try state.withHandle(fileID: fileID, { $0.key }) else {
+        guard let key = try state.withHandle(
+            fileID: fileID,
+            retainedLeaseOwner: retainedLeaseOwner,
+            { $0.key }
+        ) else {
             throw WorkspaceCodemapLiveOverlayBundleAccessError.entryUnavailable
         }
         return key
     }
 
     func outcome() throws -> WorkspaceCodemapLiveArtifactOutcome {
-        guard let outcome = try state.withHandle(fileID: fileID, {
-            WorkspaceCodemapLiveArtifactOutcome($0.outcome)
-        }) else {
+        guard let outcome = try state.withHandle(
+            fileID: fileID,
+            retainedLeaseOwner: retainedLeaseOwner,
+            { WorkspaceCodemapLiveArtifactOutcome($0.outcome) }
+        ) else {
             throw WorkspaceCodemapLiveOverlayBundleAccessError.entryUnavailable
         }
         return outcome
     }
 
     func renderedCodemap(displayPath: String) throws -> WorkspaceCodemapArtifactRenderedCodemap? {
-        try state.withHandle(fileID: fileID) { handle in
+        try state.withHandle(
+            fileID: fileID,
+            retainedLeaseOwner: retainedLeaseOwner
+        ) { handle in
             guard case let .ready(artifact) = handle.outcome else { return nil }
             let text = CodeMapAPIContentFormatter.pathAndImportsBlock(
                 displayPath: displayPath,

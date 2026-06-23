@@ -176,6 +176,9 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
+    private static let maximumRetainedCodemapPresentationRecordsPerRoot = 64
+    private static let maximumCodemapPresentationRequestsPerBundle = 4096
+
     private struct RootState {
         let lifetimeID: UUID
         let root: WorkspaceRootRecord
@@ -207,6 +210,14 @@ actor WorkspaceFileContextStore {
         var task: Task<Void, Never>?
     }
 
+    private struct ModernCodemapPresentationRecord {
+        let id: WorkspaceCodemapFrozenPresentationBundleID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let entries: [WorkspaceCodemapFrozenPresentationEntry]
+        let handles: [WorkspaceCodemapLiveFrozenArtifactHandle]
+        let requestIDs: Set<UUID>
+    }
+
     private struct ModernCodemapRootSession {
         let authority: ModernCodemapRootAuthority
         var endpoint: WorkspaceCodemapBindingIntegrationEndpoint?
@@ -217,6 +228,9 @@ actor WorkspaceFileContextStore {
         var setupDisposition: ModernCodemapSetupDisposition?
         var demandsByFileID: [UUID: ModernCodemapDemandRecord] = [:]
         var bundlesByRequestID: [UUID: WorkspaceCodemapLiveOverlayBundle] = [:]
+        var presentationRecordsByID: [
+            WorkspaceCodemapFrozenPresentationBundleID: ModernCodemapPresentationRecord
+        ] = [:]
     }
 
     private struct DetachedModernCodemapSession: @unchecked Sendable {
@@ -7211,6 +7225,269 @@ actor WorkspaceFileContextStore {
         return record.result
     }
 
+    func freezeCodemapPresentation(
+        _ requests: [WorkspaceCodemapPresentationRequest]
+    ) -> WorkspaceCodemapPresentationFreezeDisposition {
+        guard !requests.isEmpty else {
+            return .unavailable(.emptyRequest)
+        }
+        let entryLimit = Self.maximumCodemapPresentationRequestsPerBundle
+        guard requests.count <= entryLimit else {
+            return .unavailable(.entryLimitExceeded(limit: entryLimit))
+        }
+
+        let rootEpoch = requests[0].ticket.rootEpoch
+        guard requests.allSatisfy({ $0.ticket.rootEpoch == rootEpoch }) else {
+            return .unavailable(.mixedRootEpoch)
+        }
+
+        var fileIDs = Set<UUID>()
+        for request in requests where !fileIDs.insert(request.ticket.fileID).inserted {
+            return .unavailable(.duplicateFileID(request.ticket.fileID))
+        }
+
+        guard let originalSession = modernCodemapSessionsByRootEpoch[rootEpoch] else {
+            return .unavailable(.staleCurrentness)
+        }
+        let retainedLimit = Self.maximumRetainedCodemapPresentationRecordsPerRoot
+        guard originalSession.presentationRecordsByID.count < retainedLimit else {
+            return .unavailable(.retainedBundleLimitExceeded(limit: retainedLimit))
+        }
+
+        var pairs: [(
+            entry: WorkspaceCodemapFrozenPresentationEntry,
+            handle: WorkspaceCodemapLiveFrozenArtifactHandle
+        )] = []
+        pairs.reserveCapacity(requests.count)
+
+        for request in requests {
+            let ticket = request.ticket
+            guard modernCodemapDemandIsCurrent(ticket),
+                  let demandRecord = modernCodemapSessionsByRootEpoch[rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  demandRecord.ticket == ticket
+            else {
+                return .unavailable(.staleCurrentness)
+            }
+
+            let ready: WorkspaceCodemapArtifactDemandReady
+            switch demandRecord.result {
+            case let .pending(pendingTicket):
+                guard pendingTicket == ticket else {
+                    return .unavailable(.staleCurrentness)
+                }
+                return .unavailable(.pending(ticket))
+            case let .unavailable(reason):
+                return .unavailable(.demandUnavailable(ticket, reason))
+            case let .ready(currentReady):
+                ready = currentReady
+            }
+
+            guard ready.ticket == ticket,
+                  ready.identity == demandRecord.identity,
+                  ready.identity.rootID == ticket.rootEpoch.rootID,
+                  ready.identity.rootLifetimeID == ticket.rootEpoch.rootLifetimeID,
+                  ready.identity.fileID == ticket.fileID,
+                  ready.snapshot.rootEpoch == ticket.rootEpoch,
+                  ready.snapshot.fileID == ticket.fileID,
+                  ready.snapshot.requestGeneration == ticket.requestGeneration
+            else {
+                return .unavailable(.staleCurrentness)
+            }
+            guard request.logicalPath.standardizedRelativePath ==
+                ready.identity.standardizedRelativePath,
+                request.logicalPath.standardizedRelativePath ==
+                ready.snapshot.standardizedRelativePath
+            else {
+                return .unavailable(.logicalPathMismatch(ticket.fileID))
+            }
+
+            let artifactKey: CodeMapArtifactKey
+            let outcome: WorkspaceCodemapLiveArtifactOutcome
+            do {
+                artifactKey = try ready.handle.artifactKey()
+                outcome = try ready.handle.outcome()
+            } catch {
+                return .unavailable(.handleRevoked(ticket.fileID))
+            }
+            guard artifactKey == ready.snapshot.artifactKey,
+                  outcome == ready.snapshot.outcome
+            else {
+                return .unavailable(.staleCurrentness)
+            }
+
+            pairs.append((
+                entry: WorkspaceCodemapFrozenPresentationEntry(
+                    ticket: ticket,
+                    logicalPath: request.logicalPath,
+                    artifactKey: artifactKey,
+                    outcome: outcome
+                ),
+                handle: ready.handle
+            ))
+        }
+
+        pairs.sort { lhs, rhs in
+            let lhsPath = lhs.entry.logicalPath.displayPath
+            let rhsPath = rhs.entry.logicalPath.displayPath
+            if lhsPath != rhsPath {
+                return lhsPath < rhsPath
+            }
+            return lhs.entry.ticket.fileID.uuidString < rhs.entry.ticket.fileID.uuidString
+        }
+
+        for pair in pairs {
+            let entry = pair.entry
+            guard modernCodemapDemandIsCurrent(entry.ticket),
+                  let demandRecord = modernCodemapSessionsByRootEpoch[rootEpoch]?
+                  .demandsByFileID[entry.ticket.fileID],
+                  case let .ready(ready) = demandRecord.result,
+                  modernCodemapPresentationReadyMatches(
+                      ready,
+                      demandRecord: demandRecord,
+                      entry: entry
+                  )
+            else {
+                return .unavailable(.staleCurrentness)
+            }
+            do {
+                guard try pair.handle.artifactKey() == entry.artifactKey,
+                      try pair.handle.outcome() == entry.outcome
+                else {
+                    return .unavailable(.staleCurrentness)
+                }
+            } catch {
+                return .unavailable(.handleRevoked(entry.ticket.fileID))
+            }
+        }
+
+        guard var currentSession = modernCodemapSessionsByRootEpoch[rootEpoch],
+              currentSession.authority == originalSession.authority,
+              currentSession.presentationRecordsByID.count < retainedLimit
+        else {
+            return .unavailable(.staleCurrentness)
+        }
+
+        let id = WorkspaceCodemapFrozenPresentationBundleID()
+        let entries = pairs.map(\.entry)
+        let handles = pairs.map(\.handle)
+        var callerHandles: [WorkspaceCodemapLiveFrozenArtifactHandle] = []
+        callerHandles.reserveCapacity(handles.count)
+        for (index, handle) in handles.enumerated() {
+            do {
+                try callerHandles.append(handle.retainingLease())
+            } catch {
+                return .unavailable(.handleRevoked(entries[index].ticket.fileID))
+            }
+        }
+        let record = ModernCodemapPresentationRecord(
+            id: id,
+            rootEpoch: rootEpoch,
+            entries: entries,
+            handles: handles,
+            requestIDs: Set(entries.map(\.ticket.requestID))
+        )
+        let bundle = WorkspaceCodemapFrozenPresentationBundle(
+            id: id,
+            rootEpoch: rootEpoch,
+            entries: entries,
+            handles: callerHandles
+        )
+        currentSession.presentationRecordsByID[id] = record
+        modernCodemapSessionsByRootEpoch[rootEpoch] = currentSession
+        return .ready(bundle)
+    }
+
+    func renderCodemapPresentation(
+        _ bundle: WorkspaceCodemapFrozenPresentationBundle
+    ) -> WorkspaceCodemapPresentationRenderDisposition {
+        guard let session = modernCodemapSessionsByRootEpoch[bundle.rootEpoch],
+              let record = session.presentationRecordsByID[bundle.id]
+        else {
+            return .unavailable(.bundleNotRetained)
+        }
+        guard record.id == bundle.id,
+              record.rootEpoch == bundle.rootEpoch,
+              record.entries == bundle.entries,
+              record.entries.count == record.handles.count
+        else {
+            return .unavailable(.bundleMetadataMismatch)
+        }
+
+        var renderedEntries: [WorkspaceCodemapRenderedPresentationEntry] = []
+        renderedEntries.reserveCapacity(record.entries.count)
+
+        for (entry, handle) in zip(record.entries, record.handles) {
+            guard modernCodemapDemandIsCurrent(entry.ticket),
+                  let demandRecord = modernCodemapSessionsByRootEpoch[record.rootEpoch]?
+                  .demandsByFileID[entry.ticket.fileID],
+                  case let .ready(ready) = demandRecord.result,
+                  modernCodemapPresentationReadyMatches(
+                      ready,
+                      demandRecord: demandRecord,
+                      entry: entry
+                  )
+            else {
+                return .unavailable(.staleCurrentness(entry.ticket))
+            }
+
+            do {
+                guard try handle.artifactKey() == entry.artifactKey,
+                      try handle.outcome() == entry.outcome
+                else {
+                    return .unavailable(.staleCurrentness(entry.ticket))
+                }
+                guard let rendered = try handle.renderedCodemap(
+                    displayPath: entry.logicalPath.displayPath
+                ) else {
+                    return .unavailable(.noRenderableCodemap(entry.ticket.fileID))
+                }
+                renderedEntries.append(WorkspaceCodemapRenderedPresentationEntry(
+                    ticket: entry.ticket,
+                    logicalPath: entry.logicalPath,
+                    artifactKey: entry.artifactKey,
+                    outcome: entry.outcome,
+                    text: rendered.text,
+                    tokenCount: rendered.tokenCount
+                ))
+            } catch {
+                return .unavailable(.handleRevoked(entry.ticket.fileID))
+            }
+        }
+
+        for (entry, handle) in zip(record.entries, record.handles) {
+            guard modernCodemapDemandIsCurrent(entry.ticket) else {
+                return .unavailable(.staleCurrentness(entry.ticket))
+            }
+            do {
+                guard try handle.artifactKey() == entry.artifactKey,
+                      try handle.outcome() == entry.outcome
+                else {
+                    return .unavailable(.staleCurrentness(entry.ticket))
+                }
+            } catch {
+                return .unavailable(.handleRevoked(entry.ticket.fileID))
+            }
+        }
+
+        return .ready(renderedEntries)
+    }
+
+    func releaseCodemapPresentation(
+        _ bundle: WorkspaceCodemapFrozenPresentationBundle
+    ) -> Bool {
+        guard var session = modernCodemapSessionsByRootEpoch[bundle.rootEpoch],
+              let record = session.presentationRecordsByID[bundle.id],
+              record.rootEpoch == bundle.rootEpoch,
+              record.entries == bundle.entries
+        else {
+            return false
+        }
+        session.presentationRecordsByID.removeValue(forKey: bundle.id)
+        modernCodemapSessionsByRootEpoch[bundle.rootEpoch] = session
+        return true
+    }
+
     func cancelCodemapArtifactDemand(
         _ ticket: WorkspaceCodemapArtifactDemandTicket
     ) async -> Bool {
@@ -7226,6 +7503,12 @@ actor WorkspaceFileContextStore {
         }
 
         record.task?.cancel()
+        let presentationIDs = session.presentationRecordsByID.compactMap { id, presentation in
+            presentation.requestIDs.contains(ticket.requestID) ? id : nil
+        }
+        for id in presentationIDs {
+            session.presentationRecordsByID.removeValue(forKey: id)
+        }
         let retainedBundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
         record.result = .unavailable(.cancelled)
         record.task = nil
@@ -7640,6 +7923,29 @@ actor WorkspaceFileContextStore {
               filesByID[ticket.fileID]?.rootID == ticket.rootEpoch.rootID
         else { return false }
         return true
+    }
+
+    private func modernCodemapPresentationReadyMatches(
+        _ ready: WorkspaceCodemapArtifactDemandReady,
+        demandRecord: ModernCodemapDemandRecord,
+        entry: WorkspaceCodemapFrozenPresentationEntry
+    ) -> Bool {
+        let ticket = entry.ticket
+        return demandRecord.ticket == ticket &&
+            ready.ticket == ticket &&
+            ready.identity == demandRecord.identity &&
+            ready.identity.rootID == ticket.rootEpoch.rootID &&
+            ready.identity.rootLifetimeID == ticket.rootEpoch.rootLifetimeID &&
+            ready.identity.fileID == ticket.fileID &&
+            ready.identity.standardizedRelativePath ==
+            entry.logicalPath.standardizedRelativePath &&
+            ready.snapshot.rootEpoch == ticket.rootEpoch &&
+            ready.snapshot.fileID == ticket.fileID &&
+            ready.snapshot.standardizedRelativePath ==
+            entry.logicalPath.standardizedRelativePath &&
+            ready.snapshot.requestGeneration == ticket.requestGeneration &&
+            ready.snapshot.artifactKey == entry.artifactKey &&
+            ready.snapshot.outcome == entry.outcome
     }
 
     private func modernCodemapUnavailableIsStable(
