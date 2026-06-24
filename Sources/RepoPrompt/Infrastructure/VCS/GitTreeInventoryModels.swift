@@ -137,7 +137,7 @@ enum GitWorktreeInitializationError: LocalizedError, Equatable {
     }
 }
 
-enum GitTreeEntryKind: String, Equatable {
+enum GitTreeEntryKind: String, Equatable, Hashable {
     case blob
     case tree
     case commit

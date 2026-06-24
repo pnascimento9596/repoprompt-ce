@@ -267,8 +267,8 @@ struct AgentRunMCPToolService {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
-        let worktreeStartupContext = WorktreeStartupContext()
-        WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
+        let worktreeStartupCorrelationID = UUID()
+        let worktreeStartupFlags = WorktreeStartupFeatureFlags.current()
         // start always creates a new session — reject explicit session_id
         if normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
@@ -358,6 +358,16 @@ struct AgentRunMCPToolService {
             parentSessionID: spawnParentSessionID,
             inheritWorktreeBindings: worktreeStartRequest.inheritParentWorktreeBindings
         )
+        guard let targetSessionID = target.sessionID else {
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
+        }
+        let worktreeStartupContext = WorktreeStartupContext(
+            agentSessionID: targetSessionID,
+            correlationID: worktreeStartupCorrelationID,
+            flags: worktreeStartupFlags
+        )
+        WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
         do {
             try await startWorktreeCoordinator.prepare(
                 request: worktreeStartRequest,

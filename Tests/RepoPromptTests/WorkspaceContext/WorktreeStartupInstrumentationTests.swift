@@ -55,6 +55,7 @@ import XCTest
                 source: "test"
             )
             let context = WorktreeStartupContext(
+                agentSessionID: UUID(),
                 correlationID: UUID(),
                 flags: .init()
             )

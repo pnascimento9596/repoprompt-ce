@@ -357,14 +357,16 @@ struct WorkspaceRootBindingProjectionMaterializer {
     func prepare(
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding],
-        startupContext: WorktreeStartupContext? = nil
+        startupContext: WorktreeStartupContext? = nil,
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         return try await prepare(
             sessionID: sessionID,
             bindings: bindings,
             visibleRoots: visibleRoots,
-            startupContext: startupContext
+            startupContext: startupContext,
+            initializationHintsByBindingID: initializationHintsByBindingID
         )
     }
 
@@ -372,13 +374,25 @@ struct WorkspaceRootBindingProjectionMaterializer {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding],
         visibleRoots: [WorkspaceRootRef],
-        startupContext: WorktreeStartupContext?
+        startupContext: WorktreeStartupContext?,
+        initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
+        var initializationHintsByPhysicalRootPath: [String: WorkspaceRootMaterializationHint] = [:]
+        for binding in bindings {
+            guard let hint = initializationHintsByBindingID[binding.id] else { continue }
+            let physicalPath = StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
+            initializationHintsByPhysicalRootPath[physicalPath] = hint.validated(
+                matching: binding,
+                sessionID: sessionID,
+                startupContext: startupContext
+            )
+        }
         let ownership = try await store.prepareSessionWorktreeOwnership(
             ownerID: sessionID,
             bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings),
             physicalRootPaths: bindings.map(\.worktreeRootPath),
-            startupContext: startupContext
+            startupContext: startupContext,
+            initializationHintsByPhysicalRootPath: initializationHintsByPhysicalRootPath
         )
         return WorkspaceRootBindingProjectionPreparation(
             sessionID: sessionID,
@@ -472,7 +486,8 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 sessionID: sessionID,
                 bindings: bindings,
                 visibleRoots: visibleRoots,
-                startupContext: nil
+                startupContext: nil,
+                initializationHintsByBindingID: [:]
             )
             #if DEBUG
                 prepareNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(

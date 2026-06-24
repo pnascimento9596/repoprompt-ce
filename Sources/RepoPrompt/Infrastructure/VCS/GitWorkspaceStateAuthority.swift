@@ -2,7 +2,7 @@ import Foundation
 
 /// Owns currentness and metadata observation for worktree bootstrap. Collection
 /// is always bracketed by a scope-bound capture token and conditional install;
-/// reusable snapshot storage/eviction remains a later slice.
+/// reusable snapshot storage/eviction is bounded and remains observation-only.
 actor GitWorkspaceStateAuthority {
     static let shared = GitWorkspaceStateAuthority()
 
@@ -13,6 +13,9 @@ actor GitWorkspaceStateAuthority {
             let activeMutationCount: Int
             let metadataEventCount: Int
             let authorityGenerations: [GitWorkspaceAuthorityRepositoryKey: UInt64]
+            let reusableSnapshotCount: Int
+            let reusableSnapshotAliasCount: Int
+            let reusableSnapshotEstimatedBytes: Int
         }
     #endif
 
@@ -26,19 +29,53 @@ actor GitWorkspaceStateAuthority {
         var acceptedWatermarkByScope: [GitWorkspaceAuthorityScopeKey: UInt64] = [:]
     }
 
+    private struct ReusableSnapshotCacheEntry {
+        let snapshot: WorkspaceRootReusableSnapshot
+        var lastAccessOrdinal: UInt64
+    }
+
+    private struct ReusableSnapshotAlias {
+        let lease: GitWorkspaceAuthorityLease
+        let snapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+        let observationToken: GitWorkspaceMetadataMonitor.RetainToken
+    }
+
     private let metadataMonitor: GitWorkspaceMetadataMonitor
+    private let reusableSnapshotCacheLimits: WorkspaceRootReusableSnapshotCacheLimits
     private var records: [GitWorkspaceAuthorityRepositoryKey: Record] = [:]
     private var activeMutations: [UUID: GitWorkspaceMutationToken] = [:]
+    private var reusableSnapshotsByIdentity: [WorkspaceRootReusableSnapshotIdentity: ReusableSnapshotCacheEntry] = [:]
+    private var reusableSnapshotAliasesByScope: [GitWorkspaceAuthorityScopeKey: ReusableSnapshotAlias] = [:]
+    private var reusableSnapshotAccessOrdinal: UInt64 = 0
+    private var reusableSnapshotEstimatedBytes = 0
 
-    init(metadataMonitor: GitWorkspaceMetadataMonitor = GitWorkspaceMetadataMonitor()) {
+    init(
+        metadataMonitor: GitWorkspaceMetadataMonitor = GitWorkspaceMetadataMonitor(),
+        reusableSnapshotCacheLimits: WorkspaceRootReusableSnapshotCacheLimits = .production
+    ) {
+        precondition(reusableSnapshotCacheLimits.maximumSnapshotCount > 0)
+        precondition(reusableSnapshotCacheLimits.maximumSnapshotsPerRepository > 0)
+        precondition(reusableSnapshotCacheLimits.maximumEstimatedBytes > 0)
         self.metadataMonitor = metadataMonitor
+        self.reusableSnapshotCacheLimits = reusableSnapshotCacheLimits
+    }
+
+    func collectionMutationFenceReason(
+        for repositoryKey: GitWorkspaceAuthorityRepositoryKey
+    ) -> GitWorkspaceAuthorityUnavailableReason? {
+        let record = records[repositoryKey]
+        return hasActiveMutation(for: repositoryKey) || (record?.mutationDepth ?? 0) > 0
+            ? .mutationInProgress
+            : nil
     }
 
     func beginCollection(
         scopeKey: GitWorkspaceAuthorityScopeKey
     ) -> Result<GitWorkspaceAuthorityCaptureToken, GitWorkspaceAuthorityUnavailableReason> {
         let record = records[scopeKey.repositoryKey] ?? Record()
-        guard record.mutationDepth == 0 else { return .failure(.mutationInProgress) }
+        guard !hasActiveMutation(for: scopeKey.repositoryKey),
+              record.mutationDepth == 0
+        else { return .failure(.mutationInProgress) }
         guard !record.monitorCoverageUnavailable else { return .failure(.monitorCoverageUnavailable) }
         records[scopeKey.repositoryKey] = record
         return .success(GitWorkspaceAuthorityCaptureToken(
@@ -75,7 +112,9 @@ actor GitWorkspaceStateAuthority {
         guard var record = records[scopeKey.repositoryKey] else {
             return .failure(.invalidatedDuringCollection)
         }
-        guard record.mutationDepth == 0 else { return .failure(.mutationInProgress) }
+        guard !hasActiveMutation(for: scopeKey.repositoryKey),
+              record.mutationDepth == 0
+        else { return .failure(.mutationInProgress) }
         guard !record.monitorCoverageUnavailable else { return .failure(.monitorCoverageUnavailable) }
         guard record.invalidationGeneration == token.invalidationGeneration,
               (record.publicationGenerationByScope[scopeKey] ?? 0) == token.scopePublicationGeneration,
@@ -133,7 +172,9 @@ actor GitWorkspaceStateAuthority {
             repositoryRelativeRootPrefix: prefix
         )
         guard let record = records[repositoryKey] else { return .failure(.noSnapshot) }
-        guard record.mutationDepth == 0 else { return .failure(.mutationInProgress) }
+        guard !hasActiveMutation(for: scopeKey.repositoryKey),
+              record.mutationDepth == 0
+        else { return .failure(.mutationInProgress) }
         guard !record.monitorCoverageUnavailable else { return .failure(.monitorCoverageUnavailable) }
         guard let snapshot = record.snapshotsByScope[scopeKey] else { return .failure(.metadataEventPending) }
         let watermark = metadataMonitor.acceptedWatermark(for: repositoryKey)
@@ -151,7 +192,8 @@ actor GitWorkspaceStateAuthority {
 
     func isCurrent(_ lease: GitWorkspaceAuthorityLease) -> Bool {
         guard let record = records[lease.repositoryKey] else { return false }
-        return record.mutationDepth == 0
+        return !hasActiveMutation(for: lease.repositoryKey)
+            && record.mutationDepth == 0
             && !record.monitorCoverageUnavailable
             && record.invalidationGeneration == lease.invalidationGeneration
             && record.publicationGenerationByScope[lease.scopeKey] == lease.authorityGeneration
@@ -160,11 +202,183 @@ actor GitWorkspaceStateAuthority {
             && metadataMonitor.acceptedWatermark(for: lease.repositoryKey) == lease.acceptedMetadataWatermark
     }
 
+    @discardableResult
+    func admitReusableSnapshot(
+        _ snapshot: WorkspaceRootReusableSnapshot,
+        capturedUsing lease: GitWorkspaceAuthorityLease,
+        observationToken: GitWorkspaceMetadataMonitor.RetainToken
+    ) async -> Bool {
+        guard isCurrent(lease),
+              snapshot.hasValidContentAddress(),
+              snapshot.compatibilityKey == WorkspaceRootSeedCompatibilityKey(authority: lease.snapshot),
+              snapshot.estimatedByteCount <= reusableSnapshotCacheLimits.maximumEstimatedBytes
+        else {
+            await metadataMonitor.release(observationToken)
+            return false
+        }
+
+        reusableSnapshotAccessOrdinal &+= 1
+        if var existing = reusableSnapshotsByIdentity[snapshot.identity] {
+            guard existing.snapshot.compatibilityKey == snapshot.compatibilityKey,
+                  existing.snapshot.inventory == snapshot.inventory,
+                  existing.snapshot.hasValidContentAddress()
+            else {
+                await metadataMonitor.release(observationToken)
+                return false
+            }
+            existing.lastAccessOrdinal = reusableSnapshotAccessOrdinal
+            reusableSnapshotsByIdentity[snapshot.identity] = existing
+        } else {
+            reusableSnapshotsByIdentity[snapshot.identity] = ReusableSnapshotCacheEntry(
+                snapshot: snapshot,
+                lastAccessOrdinal: reusableSnapshotAccessOrdinal
+            )
+            reusableSnapshotEstimatedBytes += snapshot.estimatedByteCount
+        }
+
+        let previous = reusableSnapshotAliasesByScope.updateValue(
+            ReusableSnapshotAlias(
+                lease: lease,
+                snapshotIdentity: snapshot.identity,
+                observationToken: observationToken
+            ),
+            forKey: lease.scopeKey
+        )
+        let retained = await evictReusableSnapshotsIfNeeded()
+        guard retained,
+              reusableSnapshotsByIdentity[snapshot.identity] != nil
+        else {
+            if let previous {
+                reusableSnapshotAliasesByScope[lease.scopeKey] = previous
+            } else {
+                reusableSnapshotAliasesByScope.removeValue(forKey: lease.scopeKey)
+            }
+            if reusableSnapshotAliasesByScope.values.contains(where: { $0.snapshotIdentity == snapshot.identity }) == false {
+                removeUnaliasedReusableSnapshot(snapshot.identity)
+            }
+            await metadataMonitor.release(observationToken)
+            return false
+        }
+        if let previous {
+            await metadataMonitor.release(previous.observationToken)
+        }
+        return true
+    }
+
+    func currentReusableSnapshot(
+        capturedUsing lease: GitWorkspaceAuthorityLease
+    ) async -> WorkspaceRootReusableSnapshot? {
+        guard isCurrent(lease),
+              let alias = reusableSnapshotAliasesByScope[lease.scopeKey],
+              alias.lease == lease,
+              var entry = reusableSnapshotsByIdentity[alias.snapshotIdentity],
+              entry.snapshot.hasValidContentAddress(),
+              entry.snapshot.compatibilityKey == WorkspaceRootSeedCompatibilityKey(authority: lease.snapshot)
+        else {
+            if let alias = reusableSnapshotAliasesByScope[lease.scopeKey],
+               alias.lease == lease
+            {
+                reusableSnapshotAliasesByScope.removeValue(forKey: lease.scopeKey)
+                await metadataMonitor.release(alias.observationToken)
+            }
+            return nil
+        }
+        reusableSnapshotAccessOrdinal &+= 1
+        entry.lastAccessOrdinal = reusableSnapshotAccessOrdinal
+        reusableSnapshotsByIdentity[alias.snapshotIdentity] = entry
+        return entry.snapshot
+    }
+
+    func reusableSnapshot(
+        compatibleWith snapshot: GitWorkspaceAuthoritySnapshot
+    ) -> WorkspaceRootReusableSnapshot? {
+        let key = WorkspaceRootSeedCompatibilityKey(authority: snapshot)
+        guard let identity = reusableSnapshotsByIdentity.first(where: {
+            $0.value.snapshot.compatibilityKey == key && $0.value.snapshot.hasValidContentAddress()
+        })?.key else { return nil }
+        reusableSnapshotAccessOrdinal &+= 1
+        reusableSnapshotsByIdentity[identity]?.lastAccessOrdinal = reusableSnapshotAccessOrdinal
+        return reusableSnapshotsByIdentity[identity]?.snapshot
+    }
+
+    func reusableSnapshot(
+        identity: WorkspaceRootReusableSnapshotIdentity,
+        expectedCompatibilityKey: WorkspaceRootSeedCompatibilityKey
+    ) -> WorkspaceRootReusableSnapshot? {
+        guard identity.searchABI == .current,
+              var entry = reusableSnapshotsByIdentity[identity],
+              entry.snapshot.compatibilityKey == expectedCompatibilityKey,
+              entry.snapshot.hasValidContentAddress()
+        else { return nil }
+        reusableSnapshotAccessOrdinal &+= 1
+        entry.lastAccessOrdinal = reusableSnapshotAccessOrdinal
+        reusableSnapshotsByIdentity[identity] = entry
+        return entry.snapshot
+    }
+
+    private func evictReusableSnapshotsIfNeeded() async -> Bool {
+        while reusableSnapshotsByIdentity.count > reusableSnapshotCacheLimits.maximumSnapshotCount
+            || reusableSnapshotEstimatedBytes > reusableSnapshotCacheLimits.maximumEstimatedBytes
+            || repositorySnapshotCountExceedsLimit()
+        {
+            let pinnedIdentities = Set(reusableSnapshotAliasesByScope.values.map(\.snapshotIdentity))
+            let overfullNamespaces = repositorySnapshotCounts()
+                .filter { $0.value > reusableSnapshotCacheLimits.maximumSnapshotsPerRepository }
+                .map(\.key)
+            let candidates = reusableSnapshotsByIdentity.filter { identity, entry in
+                !pinnedIdentities.contains(identity)
+                    && (
+                        overfullNamespaces.isEmpty
+                            || overfullNamespaces.contains(entry.snapshot.compatibilityKey.repositoryNamespace)
+                    )
+            }
+            guard let candidate = candidates.min(by: {
+                $0.value.lastAccessOrdinal < $1.value.lastAccessOrdinal
+            }) else { return false }
+            removeUnaliasedReusableSnapshot(candidate.key)
+        }
+        return true
+    }
+
+    private func repositorySnapshotCountExceedsLimit() -> Bool {
+        repositorySnapshotCounts().values.contains {
+            $0 > reusableSnapshotCacheLimits.maximumSnapshotsPerRepository
+        }
+    }
+
+    private func repositorySnapshotCounts() -> [GitBlobRepositoryNamespace: Int] {
+        Dictionary(grouping: reusableSnapshotsByIdentity.values) {
+            $0.snapshot.compatibilityKey.repositoryNamespace
+        }.mapValues(\.count)
+    }
+
+    private func removeReusableSnapshot(_ identity: WorkspaceRootReusableSnapshotIdentity) async {
+        guard let removed = reusableSnapshotsByIdentity.removeValue(forKey: identity) else { return }
+        reusableSnapshotEstimatedBytes = max(0, reusableSnapshotEstimatedBytes - removed.snapshot.estimatedByteCount)
+        let aliases = reusableSnapshotAliasesByScope.filter { $0.value.snapshotIdentity == identity }
+        for (scopeKey, alias) in aliases {
+            reusableSnapshotAliasesByScope.removeValue(forKey: scopeKey)
+            await metadataMonitor.release(alias.observationToken)
+        }
+    }
+
+    private func removeUnaliasedReusableSnapshot(
+        _ identity: WorkspaceRootReusableSnapshotIdentity
+    ) {
+        guard !reusableSnapshotAliasesByScope.values.contains(where: { $0.snapshotIdentity == identity }),
+              let removed = reusableSnapshotsByIdentity.removeValue(forKey: identity)
+        else { return }
+        reusableSnapshotEstimatedBytes = max(
+            0,
+            reusableSnapshotEstimatedBytes - removed.snapshot.estimatedByteCount
+        )
+    }
+
     func beginMutation(
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         kind: GitWorkspaceMutationKind,
         correlationID: UUID? = nil
-    ) -> GitWorkspaceMutationToken {
+    ) async -> GitWorkspaceMutationToken {
         let affectedKeys = Set(records.keys.filter { Self.sameCommonDirectory($0, repositoryKey) })
             .union([repositoryKey])
         let token = GitWorkspaceMutationToken(
@@ -181,6 +395,7 @@ actor GitWorkspaceStateAuthority {
             record.snapshotsByScope.removeAll(keepingCapacity: true)
             records[key] = record
         }
+        await removeReusableSnapshotAliases(for: affectedKeys)
         activeMutations[token.id] = token
         return token
     }
@@ -203,7 +418,7 @@ actor GitWorkspaceStateAuthority {
     func metadataDidChange(
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         kinds: Set<GitWorkspaceMetadataEventKind>
-    ) {
+    ) async {
         var record = records[repositoryKey] ?? Record()
         record.metadataEventCount &+= 1
         record.invalidationGeneration &+= 1
@@ -212,6 +427,19 @@ actor GitWorkspaceStateAuthority {
             record.monitorCoverageUnavailable = true
         }
         records[repositoryKey] = record
+        await removeReusableSnapshotAliases(for: [repositoryKey])
+    }
+
+    private func removeReusableSnapshotAliases(
+        for repositoryKeys: Set<GitWorkspaceAuthorityRepositoryKey>
+    ) async {
+        let aliases = reusableSnapshotAliasesByScope.filter {
+            repositoryKeys.contains($0.key.repositoryKey)
+        }
+        for (scopeKey, alias) in aliases {
+            reusableSnapshotAliasesByScope.removeValue(forKey: scopeKey)
+            await metadataMonitor.release(alias.observationToken)
+        }
     }
 
     func retainMetadataObservation(
@@ -233,6 +461,36 @@ actor GitWorkspaceStateAuthority {
         return token
     }
 
+    func metadataObservationIsCurrent(
+        _ token: GitWorkspaceMetadataMonitor.RetainToken,
+        for layout: GitRepositoryLayout,
+        additionalAuthorityPaths: [URL] = [],
+        expectedAcceptedWatermark: UInt64
+    ) async -> Bool {
+        await metadataMonitor.coverageIsCurrent(
+            token,
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+            paths: Self.metadataPaths(for: layout) + additionalAuthorityPaths,
+            expectedAcceptedWatermark: expectedAcceptedWatermark
+        )
+    }
+
+    func retireEphemeralAuthorityLease(
+        _ lease: GitWorkspaceAuthorityLease,
+        observationToken: GitWorkspaceMetadataMonitor.RetainToken
+    ) async {
+        await metadataMonitor.release(observationToken)
+        guard var record = records[lease.repositoryKey],
+              record.publicationGenerationByScope[lease.scopeKey] == lease.authorityGeneration,
+              record.snapshotsByScope[lease.scopeKey] == lease.snapshot
+        else { return }
+        record.monitorCoverageUnavailable = true
+        record.invalidationGeneration &+= 1
+        record.snapshotsByScope.removeAll(keepingCapacity: true)
+        records[lease.repositoryKey] = record
+        await removeReusableSnapshotAliases(for: [lease.repositoryKey])
+    }
+
     func releaseMetadataObservation(_ token: GitWorkspaceMetadataMonitor.RetainToken) async {
         await metadataMonitor.release(token)
     }
@@ -244,7 +502,10 @@ actor GitWorkspaceStateAuthority {
                 publishedScopeCount: records.values.reduce(0) { $0 + $1.snapshotsByScope.count },
                 activeMutationCount: activeMutations.count,
                 metadataEventCount: records.values.reduce(0) { $0 + $1.metadataEventCount },
-                authorityGenerations: records.mapValues(\.invalidationGeneration)
+                authorityGenerations: records.mapValues(\.invalidationGeneration),
+                reusableSnapshotCount: reusableSnapshotsByIdentity.count,
+                reusableSnapshotAliasCount: reusableSnapshotAliasesByScope.count,
+                reusableSnapshotEstimatedBytes: reusableSnapshotEstimatedBytes
             )
         }
 
@@ -252,6 +513,16 @@ actor GitWorkspaceStateAuthority {
             metadataMonitor
         }
     #endif
+
+    private func hasActiveMutation(
+        for repositoryKey: GitWorkspaceAuthorityRepositoryKey
+    ) -> Bool {
+        activeMutations.values.contains { token in
+            token.affectedRepositoryKeys.contains(where: {
+                Self.sameCommonDirectory($0, repositoryKey)
+            })
+        }
+    }
 
     private nonisolated static func sameCommonDirectory(
         _ lhs: GitWorkspaceAuthorityRepositoryKey,

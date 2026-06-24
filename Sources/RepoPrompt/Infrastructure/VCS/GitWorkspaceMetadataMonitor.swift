@@ -44,6 +44,7 @@ actor GitWorkspaceMetadataMonitor {
     struct RetainToken: Hashable {
         fileprivate let id: UUID
         fileprivate let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+        fileprivate let coveredTargetKeys: Set<String>
     }
 
     #if DEBUG
@@ -93,7 +94,7 @@ actor GitWorkspaceMetadataMonitor {
     }
 
     private struct Record {
-        var tokenIDs: Set<UUID>
+        var targetKeysByTokenID: [UUID: Set<String>]
         var sourcesByTargetKey: [String: GitMetadataFSEventSource]
         let onEvent: @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
     }
@@ -146,10 +147,14 @@ actor GitWorkspaceMetadataMonitor {
         onEvent: @escaping @Sendable (Set<GitWorkspaceMetadataEventKind>) -> Void
     ) throws -> RetainToken {
         let requestedTargets = try Self.resolveWatchTargets(paths)
-        let token = RetainToken(id: UUID(), repositoryKey: repositoryKey)
+        let token = RetainToken(
+            id: UUID(),
+            repositoryKey: repositoryKey,
+            coveredTargetKeys: Set(requestedTargets.map(\.key))
+        )
 
         if var record = records[repositoryKey] {
-            guard record.tokenIDs.count < maximumRetainsPerRepository else {
+            guard record.targetKeysByTokenID.count < maximumRetainsPerRepository else {
                 throw GitWorkspaceMetadataMonitorError.retainLimitExceeded
             }
             let existingKeys = Set(record.sourcesByTargetKey.keys)
@@ -166,7 +171,7 @@ actor GitWorkspaceMetadataMonitor {
                 repositoryKey: repositoryKey
             )
             record.sourcesByTargetKey.merge(newSources) { existing, _ in existing }
-            record.tokenIDs.insert(token.id)
+            record.targetKeysByTokenID[token.id] = token.coveredTargetKeys
             records[repositoryKey] = record
             return token
         }
@@ -185,21 +190,45 @@ actor GitWorkspaceMetadataMonitor {
         }
         let sources = try makeSources(targets: requestedTargets, repositoryKey: repositoryKey)
         records[repositoryKey] = Record(
-            tokenIDs: [token.id],
+            targetKeysByTokenID: [token.id: token.coveredTargetKeys],
             sourcesByTargetKey: sources,
             onEvent: onEvent
         )
         return token
     }
 
+    func coverageIsCurrent(
+        _ token: RetainToken,
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        paths: [URL],
+        expectedAcceptedWatermark: UInt64
+    ) -> Bool {
+        guard token.repositoryKey == repositoryKey,
+              let requestedTargets = try? Self.resolveWatchTargets(paths),
+              token.coveredTargetKeys == Set(requestedTargets.map(\.key)),
+              let record = records[repositoryKey],
+              record.targetKeysByTokenID[token.id] == token.coveredTargetKeys,
+              token.coveredTargetKeys.isSubset(of: Set(record.sourcesByTargetKey.keys)),
+              acceptedWatermark(for: repositoryKey) == expectedAcceptedWatermark
+        else { return false }
+        return true
+    }
+
     func release(_ token: RetainToken) {
-        guard var record = records[token.repositoryKey], record.tokenIDs.remove(token.id) != nil else {
-            return
-        }
-        if record.tokenIDs.isEmpty {
+        guard var record = records[token.repositoryKey],
+              record.targetKeysByTokenID.removeValue(forKey: token.id) != nil
+        else { return }
+        if record.targetKeysByTokenID.isEmpty {
             record.sourcesByTargetKey.values.forEach { $0.cancel() }
             records.removeValue(forKey: token.repositoryKey)
         } else {
+            let retainedTargetKeys = record.targetKeysByTokenID.values.reduce(into: Set<String>()) {
+                $0.formUnion($1)
+            }
+            let obsoleteKeys = Set(record.sourcesByTargetKey.keys).subtracting(retainedTargetKeys)
+            for key in obsoleteKeys {
+                record.sourcesByTargetKey.removeValue(forKey: key)?.cancel()
+            }
             records[token.repositoryKey] = record
         }
     }
@@ -242,7 +271,7 @@ actor GitWorkspaceMetadataMonitor {
         func snapshotForTesting() -> Snapshot {
             Snapshot(
                 retainedRepositoryCount: records.count,
-                retainTokenCount: records.values.reduce(0) { $0 + $1.tokenIDs.count },
+                retainTokenCount: records.values.reduce(0) { $0 + $1.targetKeysByTokenID.count },
                 sourceCount: records.values.reduce(0) { $0 + $1.sourcesByTargetKey.count },
                 coveredPathCount: records.values.reduce(0) { $0 + $1.sourcesByTargetKey.count },
                 acceptedEventCount: acceptedEventCount,

@@ -26,13 +26,16 @@ struct WorktreeStartupFeatureFlags: Equatable {
 }
 
 struct WorktreeStartupContext: Equatable {
+    let agentSessionID: UUID
     let correlationID: UUID
     let flags: WorktreeStartupFeatureFlags
 
     init(
+        agentSessionID: UUID,
         correlationID: UUID = UUID(),
         flags: WorktreeStartupFeatureFlags = .current()
     ) {
+        self.agentSessionID = agentSessionID
         self.correlationID = correlationID
         self.flags = flags
     }

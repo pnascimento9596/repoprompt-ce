@@ -58,6 +58,25 @@ struct WorkspaceSessionWorktreeOwnershipPreparation {
     let bindingFingerprint: String
     let roots: [WorkspaceSessionWorktreeOwnedRoot]
     let reusesInstalledOwnership: Bool
+    let materializationHintObservationsByPhysicalRootPath: [
+        String: WorkspaceRootMaterializationHintObservation
+    ]
+
+    init(
+        token: WorkspaceSessionWorktreeOwnershipToken,
+        bindingFingerprint: String,
+        roots: [WorkspaceSessionWorktreeOwnedRoot],
+        reusesInstalledOwnership: Bool,
+        materializationHintObservationsByPhysicalRootPath: [
+            String: WorkspaceRootMaterializationHintObservation
+        ] = [:]
+    ) {
+        self.token = token
+        self.bindingFingerprint = bindingFingerprint
+        self.roots = roots
+        self.reusesInstalledOwnership = reusesInstalledOwnership
+        self.materializationHintObservationsByPhysicalRootPath = materializationHintObservationsByPhysicalRootPath
+    }
 }
 
 enum WorkspaceSessionWorktreeOwnershipError: LocalizedError, Equatable {

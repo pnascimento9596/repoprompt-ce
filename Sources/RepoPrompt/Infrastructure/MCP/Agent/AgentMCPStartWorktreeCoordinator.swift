@@ -133,6 +133,9 @@ struct AgentMCPStartWorktreeCoordinator {
         }
         let agentModeVM = targetWindow.agentModeViewModel
         if let startupContext {
+            guard startupContext.agentSessionID == targetSessionID else {
+                throw MCPError.internalError("\(operationName) startup context does not belong to the target Agent session.")
+            }
             WorktreeStartupInstrumentation.record(.worktreePreparationStarted, context: startupContext)
         }
         try Task.checkCancellation()
@@ -144,6 +147,10 @@ struct AgentMCPStartWorktreeCoordinator {
                 )
                 try validateRuntimeRoot(context.logicalRoot, targetWindow: targetWindow)
                 let worktree: GitWorktreeDescriptor
+                let initializationReceipt: GitWorktreeCreationReceipt?
+                let expectedOwnerBindingGeneration = await targetWindow.promptManager
+                    .workspaceFileContextStore
+                    .nextSessionWorktreeOwnershipGeneration(ownerID: targetSessionID)
                 switch request.mode {
                 case .none:
                     throw MCPError.internalError("\(operationName) worktree preparation reached an unexpected empty worktree mode.")
@@ -154,15 +161,20 @@ struct AgentMCPStartWorktreeCoordinator {
                             repo: context.repo,
                             allRepos: context.allRepos
                         )
+                        initializationReceipt = nil
                     } catch let error as GitRepoTargetResolverError {
                         throw MCPError.invalidParams(error.message)
                     }
                 case .create:
-                    worktree = try await createWorktree(
+                    let result = try await createWorktree(
                         request: request,
                         context: context,
-                        sessionID: targetSessionID
+                        sessionID: targetSessionID,
+                        expectedOwnerBindingGeneration: expectedOwnerBindingGeneration,
+                        startupContext: startupContext
                     )
+                    worktree = result.descriptor
+                    initializationReceipt = result.initializationReceipt
                 }
                 try Task.checkCancellation()
                 let identity = try persistVisualIdentity(for: worktree, request: request)
@@ -177,11 +189,26 @@ struct AgentMCPStartWorktreeCoordinator {
                 var desiredBindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
                     .filter { standardizedPath($0.logicalRootPath) != standardizedPath(context.logicalRoot.standardizedFullPath) }
                 desiredBindings.append(binding)
+                let initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint] = if let initializationReceipt,
+                                                                                                    let startupContext
+                {
+                    [
+                        binding.id: WorkspaceRootMaterializationHint(
+                            bindingID: binding.id,
+                            standardizedTargetPath: binding.worktreeRootPath,
+                            creationReceipt: initializationReceipt,
+                            correlationID: startupContext.correlationID
+                        )
+                    ]
+                } else {
+                    [:]
+                }
                 _ = try await agentModeVM.transitionWorktreeBindings(
                     desiredBindings,
                     forSessionID: targetSessionID,
                     intent: .initialSend,
-                    startupContext: startupContext
+                    startupContext: startupContext,
+                    initializationHintsByBindingID: initializationHintsByBindingID
                 )
             } catch {
                 throw preparationError(error)
@@ -323,8 +350,10 @@ struct AgentMCPStartWorktreeCoordinator {
     private func createWorktree(
         request: Request,
         context: RepositoryContext,
-        sessionID: UUID
-    ) async throws -> GitWorktreeDescriptor {
+        sessionID: UUID,
+        expectedOwnerBindingGeneration: UInt64,
+        startupContext: WorktreeStartupContext?
+    ) async throws -> GitWorktreeCreateResult {
         let existingWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         let mainRootPath = existingWorktrees.first(where: \.isMain)?.path ?? context.repo.rootPath
         let plan = try GitWorktreeDefaultPathPlanner.plan(
@@ -340,7 +369,43 @@ struct AgentMCPStartWorktreeCoordinator {
                 purpose: .agentStart(sessionID: sessionID.uuidString)
             )
         )
-        return try await vcsService.createGitWorktree(request: plan.createRequest, at: context.repo.rootURL)
+        let initializationContext: GitWorktreeInitializationContext? = if let startupContext,
+                                                                          startupContext.flags.observeDiffSeededWorktreeStartup
+        {
+            try GitWorktreeInitializationContext(
+                agentSessionID: sessionID,
+                correlationID: startupContext.correlationID,
+                logicalRootPath: context.logicalRoot.standardizedFullPath,
+                expectedOwnerBindingGeneration: expectedOwnerBindingGeneration,
+                repositoryRelativeRootPrefix: repositoryRelativeRootPrefix(
+                    logicalRoot: context.logicalRoot,
+                    repositoryRoot: context.repo.rootURL
+                ),
+                observeReceipt: true
+            )
+        } else {
+            nil
+        }
+        return try await vcsService.createGitWorktreeWithResult(
+            request: plan.createRequest,
+            at: context.repo.rootURL,
+            initializationContext: initializationContext
+        )
+    }
+
+    private func repositoryRelativeRootPrefix(
+        logicalRoot: WorkspaceRootRef,
+        repositoryRoot: URL
+    ) throws -> GitRepositoryRelativeRootPrefix {
+        let rootPath = StandardizedPath.absolute(logicalRoot.standardizedFullPath)
+        let repositoryPath = StandardizedPath.absolute(repositoryRoot.path)
+        guard rootPath == repositoryPath || rootPath.hasPrefix(repositoryPath + "/") else {
+            throw MCPError.invalidParams("The logical root is outside the selected Git repository.")
+        }
+        let relative = rootPath == repositoryPath
+            ? ""
+            : String(rootPath.dropFirst(repositoryPath.count + 1))
+        return try GitRepositoryRelativeRootPrefix(relative)
     }
 
     private func persistVisualIdentity(

@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 
 struct GitWorkspaceAuthorityRepositoryKey: Hashable {
@@ -122,6 +123,113 @@ struct GitWorkspaceAuthorityLease: Hashable {
 
     var repositoryKey: GitWorkspaceAuthorityRepositoryKey {
         scopeKey.repositoryKey
+    }
+}
+
+struct GitWorktreeInitializationContext: Equatable {
+    let agentSessionID: UUID
+    let correlationID: UUID
+    let standardizedLogicalRootPath: String
+    let expectedOwnerBindingGeneration: UInt64
+    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    let observeReceipt: Bool
+
+    init(
+        agentSessionID: UUID,
+        correlationID: UUID,
+        logicalRootPath: String,
+        expectedOwnerBindingGeneration: UInt64,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        observeReceipt: Bool
+    ) {
+        self.agentSessionID = agentSessionID
+        self.correlationID = correlationID
+        standardizedLogicalRootPath = StandardizedPath.absolute(logicalRootPath)
+        self.expectedOwnerBindingGeneration = expectedOwnerBindingGeneration
+        self.repositoryRelativeRootPrefix = repositoryRelativeRootPrefix
+        self.observeReceipt = observeReceipt
+    }
+}
+
+struct GitWorktreeCreationWitnessCoverage: Equatable {
+    static let maximumEventCount = 4096
+    static let maximumAffectedDirectoryCount = 256
+    static let maximumLifetime: Duration = .seconds(60)
+
+    let startedAtUptimeNanoseconds: UInt64
+    let endedAtUptimeNanoseconds: UInt64
+    let startEventID: UInt64
+    let endEventID: UInt64
+    let destinationRelativePaths: [String]
+    let affectedDestinationRelativeDirectories: [String]
+    let streamStartedBeforeMutation: Bool
+    let streamEndedAfterInitialization: Bool
+    let hadGap: Bool
+    let hadDrop: Bool
+    let overflowed: Bool
+
+    var provesCreationInterval: Bool {
+        streamStartedBeforeMutation
+            && streamEndedAfterInitialization
+            && !hadGap
+            && !hadDrop
+            && !overflowed
+            && endedAtUptimeNanoseconds >= startedAtUptimeNanoseconds
+            && endEventID >= startEventID
+    }
+}
+
+struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
+    let id: UUID
+    let agentSessionID: UUID
+    let correlationID: UUID
+    let standardizedLogicalRootPath: String
+    let expectedOwnerBindingGeneration: UInt64
+    let mutationID: UUID
+    let parentSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+    let parentCompatibilityKey: WorkspaceRootSeedCompatibilityKey
+    let parentAuthorityBefore: GitWorkspaceAuthoritySnapshot
+    let targetAuthorityAfter: GitWorkspaceAuthoritySnapshot
+    let requestedBaseRef: String?
+    let resolvedBaseTreeOID: GitObjectID
+    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    let plannedTargetPath: String
+    let actualTargetPath: String
+    let exactCopiedRelativePaths: [String]
+    let includeCopyHadFailures: Bool
+    let includeCopyWasComplete: Bool
+    let destinationIsAppManaged: Bool
+    let worktree: GitWorktreeDescriptor
+    let targetLayout: GitRepositoryLayout
+    let witnessCoverage: GitWorktreeCreationWitnessCoverage
+    let expiresAtUptimeNanoseconds: UInt64
+
+    func fallbackReason(
+        nowUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> WorkspaceRootSeedFallbackReason? {
+        guard nowUptimeNanoseconds <= expiresAtUptimeNanoseconds else { return .expiredReceipt }
+        guard witnessCoverage.provesCreationInterval else {
+            if witnessCoverage.overflowed { return .witnessOverflow }
+            if witnessCoverage.hadDrop { return .witnessDrop }
+            return .witnessGap
+        }
+        guard destinationIsAppManaged else { return .unsupportedDestination }
+        guard includeCopyWasComplete,
+              !includeCopyHadFailures
+        else { return .includeCopyFailure }
+        guard parentCompatibilityKey.searchABI == .current else { return .compatibilityMismatch }
+        guard parentCompatibilityKey.treeOID == resolvedBaseTreeOID,
+              parentAuthorityBefore.treeOID == resolvedBaseTreeOID,
+              targetAuthorityAfter.treeOID == resolvedBaseTreeOID,
+              parentCompatibilityKey.repositoryNamespace == targetAuthorityAfter.repositoryNamespace,
+              parentCompatibilityKey.repositoryRelativeRootPrefix == repositoryRelativeRootPrefix,
+              targetAuthorityAfter.repositoryRelativeRootPrefix == repositoryRelativeRootPrefix
+        else { return .compatibilityMismatch }
+        guard StandardizedPath.absolute(plannedTargetPath) == actualTargetPath,
+              worktree.path == actualTargetPath,
+              targetLayout.workTreeRoot.standardizedFileURL.path == actualTargetPath
+        else { return .unsupportedDestination }
+        return nil
     }
 }
 

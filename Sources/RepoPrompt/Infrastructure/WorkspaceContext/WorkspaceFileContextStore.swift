@@ -1614,6 +1614,8 @@ actor WorkspaceFileContextStore {
     private var staticPathMatchSnapshotsByScope: [WorkspaceLookupRootScope: StaticPathMatchSnapshotCacheEntry] = [:]
     private var nextStaticPathMatchSnapshotAccessSequence: UInt64 = 0
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
+    private let rootReusableSnapshotCoordinator = WorkspaceRootReusableSnapshotCoordinator.shared
+    private let rootMaterializationHintEvaluator = WorkspaceRootMaterializationHintEvaluator.shared
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
     private let interactiveReadCache = WorkspaceInteractiveReadCache()
     private let searchContentSchedulerOwnerID = UUID()
@@ -2130,11 +2132,16 @@ actor WorkspaceFileContextStore {
         try? await reconcileAggregateWatcherDemand(rootID: rootID)
     }
 
+    func nextSessionWorktreeOwnershipGeneration(ownerID: UUID) -> UInt64 {
+        (latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] ?? 0) &+ 1
+    }
+
     func prepareSessionWorktreeOwnership(
         ownerID: UUID,
         bindingFingerprint: String,
         physicalRootPaths: [String],
-        startupContext: WorktreeStartupContext? = nil
+        startupContext: WorktreeStartupContext? = nil,
+        initializationHintsByPhysicalRootPath: [String: WorkspaceRootMaterializationHint] = [:]
     ) async throws -> WorkspaceSessionWorktreeOwnershipPreparation {
         let standardizedPaths = Array(Set(physicalRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
@@ -2176,6 +2183,7 @@ actor WorkspaceFileContextStore {
         reserveSessionWorktreePaths(standardizedPaths, for: token)
         do {
             var preparedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+            var materializationHintObservations: [String: WorkspaceRootMaterializationHintObservation] = [:]
             for path in standardizedPaths {
                 try Task.checkCancellation()
                 if let startupContext {
@@ -2191,6 +2199,9 @@ actor WorkspaceFileContextStore {
                 guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
                     throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
                 }
+                let hint = initializationHintsByPhysicalRootPath[path]
+                // Milestone 8B never serves from a receipt or reusable snapshot. The
+                // authoritative full crawler remains the only publication path.
                 let root = try await loadRoot(
                     path: path,
                     kind: .sessionWorktree,
@@ -2224,16 +2235,39 @@ actor WorkspaceFileContextStore {
                 try await reconcileAggregateWatcherDemand(rootID: root.id)
                 try Task.checkCancellation()
                 guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
-                      isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID)
+                      isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID),
+                      let rootCatalogGeneration = catalogGenerationsByRootID[root.id]
                 else {
                     throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
                 }
+
+                let observation: WorkspaceRootMaterializationHintObservation = if let hint,
+                                                                                  hint.expectedOwnerBindingGeneration != generation
+                                                                                  || hint.agentSessionID != ownerID
+                                                                                  || startupContext?.agentSessionID != ownerID
+                {
+                    .fallback(.ownerSuperseded)
+                } else {
+                    await rootMaterializationHintEvaluator.observe(
+                        hint,
+                        observationEnabled: startupContext?.flags.observeDiffSeededWorktreeStartup ?? false
+                    )
+                }
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
+                      isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID),
+                      catalogGenerationsByRootID[root.id] == rootCatalogGeneration
+                else {
+                    materializationHintObservations[path] = .fallback(.serviceIngressGenerationChanged)
+                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                }
+                materializationHintObservations[path] = observation
             }
             return WorkspaceSessionWorktreeOwnershipPreparation(
                 token: token,
                 bindingFingerprint: bindingFingerprint,
                 roots: preparedRoots,
-                reusesInstalledOwnership: false
+                reusesInstalledOwnership: false,
+                materializationHintObservationsByPhysicalRootPath: materializationHintObservations
             )
         } catch {
             let resources = removeSessionWorktreeOwnershipToken(token)
@@ -6053,6 +6087,15 @@ actor WorkspaceFileContextStore {
             reason: .rootLoad,
             affectedRootIDs: [root.id]
         )
+        if WorktreeStartupFeatureFlags.current().observeDiffSeededWorktreeStartup {
+            let authoritativeRelativeFilePaths = Set(
+                stagedIndexes.filesByID.values.map(\.standardizedRelativePath)
+            )
+            _ = await rootReusableSnapshotCoordinator.observeAuthoritativeFullLoad(
+                rootURL: rootURL,
+                authoritativeRelativeFilePaths: authoritativeRelativeFilePaths
+            )
+        }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootLoad.end",

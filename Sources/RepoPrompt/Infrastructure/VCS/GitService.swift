@@ -10,6 +10,12 @@ actor GitService {
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
     private static let gitBlobSizeOutputByteLimit = 64
     private static let gitBlobDiagnosticOutputByteLimit = 64 * 1024
+    /// Root/search startup snapshots and receipts are process-local. A process-local salt
+    /// provides one path-free repository namespace shared by all GitService instances while
+    /// intentionally making restart/receipt loss fall back to the full crawler.
+    private static let workspaceAuthorityNamespaceSalt = Data(
+        SHA256.hash(data: Data((UUID().uuidString + UUID().uuidString).utf8))
+    )
 
     // MARK: - Types
 
@@ -178,6 +184,7 @@ actor GitService {
     private let gitExecutableURL: URL
     private let processAdmissionController: GitProcessAdmissionController
     private let workspaceStateAuthority: GitWorkspaceStateAuthority
+    private let creationReceiptCoordinator = WorkspaceRootCreationReceiptCoordinator()
     private let processTerminationGrace: Duration
     private var preparedBaseProcessEnvironment: [String: String]?
 
@@ -343,34 +350,73 @@ actor GitService {
     }
 
     /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
+    /// Receipt observation is additive and fail-open: creation remains successful when
+    /// authority or witness evidence cannot be proven.
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
-        at repoURL: URL
+        at repoURL: URL,
+        initializationContext: GitWorktreeInitializationContext? = nil
     ) async throws -> GitWorktreeCreateResult {
-        let mutationKey = getLayout(for: repoURL)?.commonDir.standardizedFileURL.path
+        let sourceLayout = getLayout(for: repoURL)
+        let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
             ?? repoURL.standardizedFileURL.path
 
-        let created = try await withWorkspaceAuthorityMutation(at: repoURL, kind: .worktreeCreate) {
-            try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
-                guard let self else {
-                    throw GitError(message: "git service was released before worktree creation")
-                }
-                if let mainWorktreeRoot = request.mainWorktreeRoot {
-                    try GitWorktreeDefaultPathPlanner.validate(
-                        path: request.path,
-                        mainWorktreeRoot: mainWorktreeRoot,
-                        knownWorktreeRoots: request.knownWorktreeRoots,
-                        appManagedContainer: request.appManagedContainer,
-                        allowExternalPath: request.allowExternalPath
-                    )
-                }
+        return try await worktreeMutationCoordinator.withLock(key: mutationKey) { [weak self] in
+            guard let self else {
+                throw GitError(message: "git service was released before worktree creation")
+            }
+            if let mainWorktreeRoot = request.mainWorktreeRoot {
+                try GitWorktreeDefaultPathPlanner.validate(
+                    path: request.path,
+                    mainWorktreeRoot: mainWorktreeRoot,
+                    knownWorktreeRoots: request.knownWorktreeRoots,
+                    appManagedContainer: request.appManagedContainer,
+                    allowExternalPath: request.allowExternalPath
+                )
+            }
+
+            let destinationIsAppManaged = request.appManagedContainer.map {
+                Self.isPath(request.path, equalToOrInside: $0)
+            } ?? false
+            let reusableReceiptDestinationIsEligible = destinationIsAppManaged
+                && request.copyWorktreeIncludeFiles
+            var parentEvidence: (
+                lease: GitWorkspaceAuthorityLease,
+                snapshot: WorkspaceRootReusableSnapshot,
+                baseTree: GitObjectID
+            )?
+            var witnessSession: WorkspaceRootCreationReceiptCoordinator.Session?
+            if let initializationContext,
+               initializationContext.observeReceipt,
+               reusableReceiptDestinationIsEligible,
+               let sourceLayout,
+               let reusableEvidence = try? await reusableParentEvidence(
+                   layout: sourceLayout,
+                   prefix: initializationContext.repositoryRelativeRootPrefix
+               ),
+               let baseTree = try? await resolveTreeOID(
+                   request.baseRef?.isEmpty == false ? request.baseRef! : "HEAD",
+                   in: sourceLayout
+               ),
+               reusableEvidence.snapshot.compatibilityKey.treeOID == baseTree
+            {
+                parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, baseTree)
+                witnessSession = creationReceiptCoordinator.start(destinationURL: request.path)
+            }
+
+            let mutationToken: GitWorkspaceMutationToken? = if let sourceLayout {
+                await workspaceStateAuthority.beginMutation(
+                    repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: sourceLayout),
+                    kind: .worktreeCreate,
+                    correlationID: initializationContext?.correlationID
+                )
+            } else {
+                nil
+            }
+            do {
                 var args = ["worktree", "add"]
-                if request.force {
-                    args.append("--force")
-                }
-                if request.detach {
-                    args.append("--detach")
-                }
+                if request.force { args.append("--force") }
+                if request.detach { args.append("--detach") }
                 if let lockReason = request.lockReason {
                     args.append("--lock")
                     if !lockReason.isEmpty {
@@ -383,9 +429,7 @@ actor GitService {
                     args.append(branch)
                 }
                 args.append(request.path.standardizedFileURL.path)
-                if let baseRef = request.baseRef, !baseRef.isEmpty {
-                    args.append(baseRef)
-                }
+                if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
                 let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
                 guard exitCode == 0 else {
@@ -395,21 +439,283 @@ actor GitService {
                 await clearLayoutCache()
                 let createdPath = request.path.standardizedFileURL.path
                 let worktrees = try await listWorktrees(at: repoURL)
-                if let created = worktrees.first(where: { $0.path == createdPath }) {
-                    return created
+                guard let created = worktrees.first(where: { $0.path == createdPath }) else {
+                    throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
                 }
+                let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
+                let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
+                    request: request,
+                    sourceRepoURL: repoURL,
+                    destinationURL: destinationURL
+                )
 
-                throw GitError(message: "git worktree add succeeded but created worktree was not listed: \(createdPath)")
+                let targetLayout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: destinationURL)
+                let witnessCoverage = witnessSession.map(creationReceiptCoordinator.finish)
+                witnessSession = nil
+                if let mutationToken {
+                    await workspaceStateAuthority.finishMutation(mutationToken, outcome: .succeeded)
+                }
+                let targetAuthority: GitWorkspaceAuthoritySnapshot? = if let targetLayout,
+                                                                         let initializationContext,
+                                                                         parentEvidence != nil
+                {
+                    try? await generationFencedAuthoritySnapshot(
+                        layout: targetLayout,
+                        prefix: initializationContext.repositoryRelativeRootPrefix
+                    )
+                } else {
+                    nil
+                }
+                let includeCopyHadFailures = includeCopyResult.map {
+                    !$0.skippedSummaries.isEmpty || !$0.errorSummaries.isEmpty
+                } ?? false
+                let includeCopyWasComplete = reusableReceiptDestinationIsEligible
+                    && !includeCopyHadFailures
+                    && (includeCopyResult.map {
+                        $0.copiedCount == $0.matchedCount
+                            && $0.copiedRelativePaths.count == $0.copiedCount
+                    } ?? true)
+
+                let receipt: GitWorktreeCreationReceipt? = if let initializationContext,
+                                                              let parentEvidence,
+                                                              let targetLayout,
+                                                              let targetAuthority,
+                                                              let witnessCoverage
+                {
+                    GitWorktreeCreationReceipt(
+                        id: UUID(),
+                        agentSessionID: initializationContext.agentSessionID,
+                        correlationID: initializationContext.correlationID,
+                        standardizedLogicalRootPath: initializationContext.standardizedLogicalRootPath,
+                        expectedOwnerBindingGeneration: initializationContext.expectedOwnerBindingGeneration,
+                        mutationID: mutationToken?.id ?? UUID(),
+                        parentSnapshotIdentity: parentEvidence.snapshot.identity,
+                        parentCompatibilityKey: parentEvidence.snapshot.compatibilityKey,
+                        parentAuthorityBefore: parentEvidence.lease.snapshot,
+                        targetAuthorityAfter: targetAuthority,
+                        requestedBaseRef: request.baseRef,
+                        resolvedBaseTreeOID: parentEvidence.baseTree,
+                        repositoryRelativeRootPrefix: initializationContext.repositoryRelativeRootPrefix,
+                        plannedTargetPath: request.path.standardizedFileURL.path,
+                        actualTargetPath: created.path,
+                        exactCopiedRelativePaths: includeCopyResult?.copiedRelativePaths ?? [],
+                        includeCopyHadFailures: includeCopyHadFailures,
+                        includeCopyWasComplete: includeCopyWasComplete,
+                        destinationIsAppManaged: destinationIsAppManaged,
+                        worktree: created,
+                        targetLayout: targetLayout,
+                        witnessCoverage: witnessCoverage,
+                        expiresAtUptimeNanoseconds: witnessCoverage.endedAtUptimeNanoseconds
+                            + UInt64(60 * NSEC_PER_SEC)
+                    )
+                } else {
+                    nil
+                }
+                let initializationFallbackReason: WorkspaceRootSeedFallbackReason? = if initializationContext?.observeReceipt == true {
+                    if !destinationIsAppManaged {
+                        .unsupportedDestination
+                    } else if !includeCopyWasComplete {
+                        .includeCopyFailure
+                    } else if receipt == nil {
+                        .authorityUnstable
+                    } else {
+                        nil
+                    }
+                } else {
+                    nil
+                }
+                return GitWorktreeCreateResult(
+                    descriptor: created,
+                    includeCopyResult: includeCopyResult,
+                    initializationReceipt: receipt,
+                    initializationFallbackReason: initializationFallbackReason
+                )
+            } catch is CancellationError {
+                if let witnessSession { _ = creationReceiptCoordinator.finish(witnessSession) }
+                if let mutationToken {
+                    await workspaceStateAuthority.finishMutation(mutationToken, outcome: .cancelled)
+                }
+                throw CancellationError()
+            } catch {
+                if let witnessSession { _ = creationReceiptCoordinator.finish(witnessSession) }
+                if let mutationToken {
+                    await workspaceStateAuthority.finishMutation(mutationToken, outcome: .failed)
+                }
+                throw error
             }
         }
+    }
 
-        let destinationURL = URL(fileURLWithPath: created.path, isDirectory: true)
-        let includeCopyResult = await copyWorktreeIncludeFilesIfRequested(
-            request: request,
-            sourceRepoURL: repoURL,
-            destinationURL: destinationURL
+    private func reusableParentEvidence(
+        layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix
+    ) async throws -> (lease: GitWorkspaceAuthorityLease, snapshot: WorkspaceRootReusableSnapshot)? {
+        if let lease = try? await currentAuthorityLease(layout: layout, prefix: prefix),
+           let snapshot = await workspaceStateAuthority.currentReusableSnapshot(capturedUsing: lease)
+        {
+            return (lease, snapshot)
+        }
+
+        var discoveryObservation: GitWorkspaceMetadataMonitor.RetainToken?
+        var replacementObservation: GitWorkspaceMetadataMonitor.RetainToken?
+        do {
+            let discoveryToken = try await workspaceStateAuthority.retainMetadataObservation(for: layout)
+            discoveryObservation = discoveryToken
+            let discovery = try await workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            let discoveredExternalPaths = Self.canonicalPathSet(
+                discovery.metadata.resolvedExternalAuthorityPaths
+            )
+            let observation = try await workspaceStateAuthority.retainMetadataObservation(
+                for: layout,
+                additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
+            )
+            replacementObservation = observation
+            await workspaceStateAuthority.releaseMetadataObservation(discoveryToken)
+            discoveryObservation = nil
+
+            let scope = GitWorkspaceAuthorityScopeKey(
+                repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+                repositoryRelativeRootPrefix: prefix
+            )
+            let captureToken: GitWorkspaceAuthorityCaptureToken
+            switch await workspaceStateAuthority.beginCollection(scopeKey: scope) {
+            case let .success(value): captureToken = value
+            case .failure:
+                await workspaceStateAuthority.releaseMetadataObservation(observation)
+                return nil
+            }
+            let captured = try await workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            guard Self.canonicalPathSet(captured.metadata.resolvedExternalAuthorityPaths) == discoveredExternalPaths,
+                  await workspaceStateAuthority.metadataObservationIsCurrent(
+                      observation,
+                      for: layout,
+                      additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
+                      expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
+                  )
+            else {
+                await workspaceStateAuthority.releaseMetadataObservation(observation)
+                return nil
+            }
+            let lease: GitWorkspaceAuthorityLease
+            switch await workspaceStateAuthority.install(captured.snapshot, capturedUsing: captureToken) {
+            case let .success(value): lease = value
+            case .failure:
+                await workspaceStateAuthority.releaseMetadataObservation(observation)
+                return nil
+            }
+            guard let snapshot = await workspaceStateAuthority.reusableSnapshot(compatibleWith: captured.snapshot) else {
+                await workspaceStateAuthority.releaseMetadataObservation(observation)
+                return nil
+            }
+            replacementObservation = nil
+            guard await workspaceStateAuthority.admitReusableSnapshot(
+                snapshot,
+                capturedUsing: lease,
+                observationToken: observation
+            ) else { return nil }
+            return (lease, snapshot)
+        } catch {
+            if let discoveryObservation {
+                await workspaceStateAuthority.releaseMetadataObservation(discoveryObservation)
+            }
+            if let replacementObservation {
+                await workspaceStateAuthority.releaseMetadataObservation(replacementObservation)
+            }
+            throw error
+        }
+    }
+
+    /// Collects a point-in-time target authority only through the authority's
+    /// generation/watermark conditional install. The observation is held until
+    /// the installed lease is proven current, then discarded with the immutable
+    /// snapshot; milestone 8B never serves from this evidence.
+    func generationFencedAuthoritySnapshot(
+        layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix
+    ) async throws -> GitWorkspaceAuthoritySnapshot {
+        let scope = GitWorkspaceAuthorityScopeKey(
+            repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+            repositoryRelativeRootPrefix: prefix
         )
-        return GitWorktreeCreateResult(descriptor: created, includeCopyResult: includeCopyResult)
+        // Refuse before the first Git command. This catches a newly materialized
+        // linked-worktree key through the common-directory mutation fence.
+        if let reason = await workspaceStateAuthority.collectionMutationFenceReason(
+            for: scope.repositoryKey
+        ) {
+            throw reason
+        }
+
+        var discoveryObservation: GitWorkspaceMetadataMonitor.RetainToken?
+        var replacementObservation: GitWorkspaceMetadataMonitor.RetainToken?
+        do {
+            let discoveryToken = try await workspaceStateAuthority.retainMetadataObservation(for: layout)
+            discoveryObservation = discoveryToken
+            let discovery = try await workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            let discoveredExternalPaths = Self.canonicalPathSet(
+                discovery.metadata.resolvedExternalAuthorityPaths
+            )
+            let observation = try await workspaceStateAuthority.retainMetadataObservation(
+                for: layout,
+                additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
+            )
+            replacementObservation = observation
+            await workspaceStateAuthority.releaseMetadataObservation(discoveryToken)
+            discoveryObservation = nil
+
+            let scope = GitWorkspaceAuthorityScopeKey(
+                repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+                repositoryRelativeRootPrefix: prefix
+            )
+            let captureToken: GitWorkspaceAuthorityCaptureToken
+            switch await workspaceStateAuthority.beginCollection(scopeKey: scope) {
+            case let .success(value): captureToken = value
+            case let .failure(reason): throw reason
+            }
+            let captured = try await workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            guard Self.canonicalPathSet(captured.metadata.resolvedExternalAuthorityPaths) == discoveredExternalPaths,
+                  await workspaceStateAuthority.metadataObservationIsCurrent(
+                      observation,
+                      for: layout,
+                      additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
+                      expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
+                  )
+            else { throw GitWorkspaceAuthorityUnavailableReason.invalidatedDuringCollection }
+            let lease: GitWorkspaceAuthorityLease
+            switch await workspaceStateAuthority.install(captured.snapshot, capturedUsing: captureToken) {
+            case let .success(value): lease = value
+            case let .failure(reason): throw reason
+            }
+            guard await workspaceStateAuthority.isCurrent(lease) else {
+                throw GitWorkspaceAuthorityUnavailableReason.invalidatedDuringCollection
+            }
+            await workspaceStateAuthority.retireEphemeralAuthorityLease(
+                lease,
+                observationToken: observation
+            )
+            replacementObservation = nil
+            return lease.snapshot
+        } catch {
+            if let discoveryObservation {
+                await workspaceStateAuthority.releaseMetadataObservation(discoveryObservation)
+            }
+            if let replacementObservation {
+                await workspaceStateAuthority.releaseMetadataObservation(replacementObservation)
+            }
+            throw error
+        }
+    }
+
+    private func currentAuthorityLease(
+        layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix
+    ) async throws -> GitWorkspaceAuthorityLease {
+        switch await workspaceStateAuthority.currentLease(
+            for: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+            prefix: prefix
+        ) {
+        case let .success(lease): return lease
+        case let .failure(reason): throw reason
+        }
     }
 
     private func copyWorktreeIncludeFilesIfRequested(
@@ -449,6 +755,10 @@ actor GitService {
                 errorSummaries: ["could not copy .worktreeinclude files: \(error.localizedDescription)"]
             )
         }
+    }
+
+    private static func canonicalPathSet(_ paths: [URL]) -> Set<String> {
+        Set(paths.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
     }
 
     private static func isPath(_ path: URL, equalToOrInside root: URL) -> Bool {
@@ -2563,6 +2873,60 @@ actor GitService {
             metadataGeneration: metadataDigest,
             policyIdentity: policyIdentity,
             resolvedExternalAuthorityPaths: [resolvedExcludesFileURL, resolvedAttributesFileURL].compactMap(\.self)
+        )
+    }
+
+    func workspaceAuthoritySnapshot(
+        in layout: GitRepositoryLayout,
+        prefix: GitRepositoryRelativeRootPrefix,
+        priority: GitProcessAdmissionPriority = .rootBootstrap
+    ) async throws -> (metadata: GitWorkspaceAuthorityMetadata, snapshot: GitWorkspaceAuthoritySnapshot) {
+        let metadata = try await authorityMetadata(in: layout, prefix: prefix, priority: priority)
+        return try (metadata, makeWorkspaceAuthoritySnapshot(metadata: metadata, layout: layout))
+    }
+
+    func makeWorkspaceAuthoritySnapshot(
+        metadata: GitWorkspaceAuthorityMetadata,
+        layout: GitRepositoryLayout
+    ) throws -> GitWorkspaceAuthoritySnapshot {
+        let namespace = try GitBlobRepositoryNamespace(
+            repositoryLayout: layout,
+            salt: Self.workspaceAuthorityNamespaceSalt
+        )
+        let repositoryBindingEpoch = Self.sha256Hex(Data(
+            ("workspace-authority-repository-v1\u{0}" + namespace.rawValue).utf8
+        ))
+        let worktreeBindingEpoch = Self.sha256Hex(Data(
+            [
+                "workspace-authority-worktree-v1",
+                layout.gitDir.standardizedFileURL.path,
+                metadata.indexGeneration,
+                metadata.metadataGeneration
+            ].joined(separator: "\u{0}").utf8
+        ))
+        let layoutGeneration = Self.sha256Hex(Data(
+            [
+                "workspace-authority-layout-v1",
+                layout.commonDir.standardizedFileURL.path,
+                layout.gitDir.standardizedFileURL.path,
+                layout.workTreeRoot.standardizedFileURL.path,
+                layout.isLinkedWorktree ? "linked" : "main"
+            ].joined(separator: "\u{0}").utf8
+        ))
+        return GitWorkspaceAuthoritySnapshot(
+            repositoryKey: metadata.repositoryKey,
+            repositoryNamespace: namespace,
+            objectFormat: metadata.objectFormat,
+            headCommitOID: metadata.headCommitOID,
+            treeOID: metadata.treeOID,
+            repositoryRelativeRootPrefix: metadata.repositoryRelativeRootPrefix,
+            repositoryBindingEpoch: repositoryBindingEpoch,
+            worktreeBindingEpoch: worktreeBindingEpoch,
+            layoutGeneration: layoutGeneration,
+            indexGeneration: metadata.indexGeneration,
+            checkoutConfigurationGeneration: metadata.checkoutConfigurationGeneration,
+            metadataGeneration: metadata.metadataGeneration,
+            policyIdentity: metadata.policyIdentity
         )
     }
 

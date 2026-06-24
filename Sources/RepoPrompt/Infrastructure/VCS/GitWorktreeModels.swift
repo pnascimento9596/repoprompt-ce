@@ -227,6 +227,8 @@ public struct GitWorktreeCreateRequest: Sendable, Equatable {
 public struct GitWorktreeCreateResult: Sendable, Equatable {
     public let descriptor: GitWorktreeDescriptor
     public let includeCopyResult: GitWorktreeIncludeCopyResult?
+    let initializationReceipt: GitWorktreeCreationReceipt?
+    let initializationFallbackReason: WorkspaceRootSeedFallbackReason?
 
     public init(
         descriptor: GitWorktreeDescriptor,
@@ -234,23 +236,40 @@ public struct GitWorktreeCreateResult: Sendable, Equatable {
     ) {
         self.descriptor = descriptor
         self.includeCopyResult = includeCopyResult
+        initializationReceipt = nil
+        initializationFallbackReason = nil
+    }
+
+    init(
+        descriptor: GitWorktreeDescriptor,
+        includeCopyResult: GitWorktreeIncludeCopyResult?,
+        initializationReceipt: GitWorktreeCreationReceipt?,
+        initializationFallbackReason: WorkspaceRootSeedFallbackReason? = nil
+    ) {
+        self.descriptor = descriptor
+        self.includeCopyResult = includeCopyResult
+        self.initializationReceipt = initializationReceipt
+        self.initializationFallbackReason = initializationFallbackReason
     }
 }
 
 public struct GitWorktreeIncludeCopyResult: Sendable, Equatable {
     public let copiedCount: Int
     public let matchedCount: Int
+    public let copiedRelativePaths: [String]
     public let skippedSummaries: [String]
     public let errorSummaries: [String]
 
     public init(
         copiedCount: Int,
         matchedCount: Int,
+        copiedRelativePaths: [String] = [],
         skippedSummaries: [String] = [],
         errorSummaries: [String] = []
     ) {
         self.copiedCount = copiedCount
         self.matchedCount = matchedCount
+        self.copiedRelativePaths = copiedRelativePaths
         self.skippedSummaries = skippedSummaries
         self.errorSummaries = errorSummaries
     }
