@@ -123,8 +123,6 @@ actor WorkspaceRootSeedPlanner {
                 policyIgnoredBasePaths: policyIgnoredBasePaths,
                 status: status,
                 copiedRepositoryRelativePaths: receipt.exactCopiedRelativePaths,
-                witnessRepositoryRelativePaths: receipt.witnessCoverage.destinationRelativePaths,
-                witnessRepositoryRelativeDirectories: receipt.witnessCoverage.affectedDestinationRelativeDirectories,
                 prefix: receipt.repositoryRelativeRootPrefix,
                 limits: limits
             )
@@ -575,8 +573,6 @@ actor WorkspaceRootSeedPlanner {
         policyIgnoredBasePaths: Set<String>,
         status: GitStatusPorcelainV2Snapshot,
         copiedRepositoryRelativePaths: [String],
-        witnessRepositoryRelativePaths: [String],
-        witnessRepositoryRelativeDirectories: [String],
         prefix: GitRepositoryRelativeRootPrefix,
         limits: WorkspaceRootSeedPlannerLimits
     ) throws -> (paths: Set<String>, directories: Set<String>) {
@@ -598,11 +594,6 @@ actor WorkspaceRootSeedPlanner {
         for path in copiedRepositoryRelativePaths {
             if let relative = rootRelative(path, prefix: prefix) { pathValues.append(relative) }
         }
-        for path in witnessRepositoryRelativePaths
-            where !path.isEmpty && path != ".git" && !path.hasPrefix(".git/")
-        {
-            if let relative = rootRelative(path, prefix: prefix) { pathValues.append(relative) }
-        }
         pathValues.append(contentsOf: pathValues.flatMap { path in
             ancestorKeys(of: PathKey(path)).map(\.value)
         })
@@ -610,20 +601,14 @@ actor WorkspaceRootSeedPlanner {
             throw WorkspaceRootSeedVerificationError.invalidPath
         }
 
-        let directoryValues = witnessRepositoryRelativeDirectories.compactMap { value -> String? in
-            guard !value.isEmpty, value != ".git", !value.hasPrefix(".git/") else { return nil }
-            guard let relative = rootRelativeDirectory(value, prefix: prefix), relative != ".", !relative.isEmpty else {
-                return nil
-            }
-            return relative
+        guard exactPaths.count <= limits.maximumVerificationPathCount else {
+            throw WorkspaceRootSeedVerificationError.limitExceeded
         }
-        guard let exactDirectories = WorkspaceRootByteExactPathSet(directoryValues) else {
-            throw WorkspaceRootSeedVerificationError.invalidPath
-        }
-        guard exactPaths.count <= limits.maximumVerificationPathCount,
-              exactDirectories.count <= limits.maximumAffectedDirectoryCount
-        else { throw WorkspaceRootSeedVerificationError.limitExceeded }
-        return (Set(exactPaths.stringValues), Set(exactDirectories.stringValues))
+        // Creation-interval contents are represented by final Git/index/status
+        // authority plus the exact include-copy inventory. The seeded watcher is
+        // already attached at the receipt's exact end cut before this plan runs,
+        // so witness event paths are neither retained nor required here.
+        return (Set(exactPaths.stringValues), [])
     }
 
     private static func rootRelative(
@@ -634,15 +619,6 @@ actor WorkspaceRootSeedPlanner {
             repositoryRelativePath: repositoryRelativePath,
             prefix: prefix
         )
-    }
-
-    private static func rootRelativeDirectory(
-        _ repositoryRelativePath: String,
-        prefix: GitRepositoryRelativeRootPrefix
-    ) -> String? {
-        if repositoryRelativePath.isEmpty { return prefix.value.isEmpty ? "" : nil }
-        if PathKey(repositoryRelativePath) == PathKey(prefix.value) { return "" }
-        return rootRelative(repositoryRelativePath, prefix: prefix)
     }
 
     private static func kind(for mode: String) -> GitTreeEntryKind? {

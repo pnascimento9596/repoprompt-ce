@@ -228,8 +228,32 @@ enum WorktreeStartupInstrumentation {
             var witnessRequested: Bool?
             var witnessStarted: Bool?
             var witnessFinished: Bool?
+            var witnessStartEventID: UInt64?
+            var witnessEndEventID: UInt64?
             var witnessStartEventIDValid: Bool?
             var witnessEndEventIDValid: Bool?
+            var witnessStableRootAvailableBeforeMutation: Bool?
+            var witnessDestinationAbsentBeforeMutation: Bool?
+            var witnessDestinationStrictDescendant: Bool?
+            var witnessStableRootUnchangedAfterInitialization: Bool?
+            var witnessStreamCreationSucceeded: Bool?
+            var witnessActivationFlushCompleted: Bool?
+            var witnessActivationCallbackBarrierCompleted: Bool?
+            var witnessEndingFlushCompleted: Bool?
+            var witnessEndingCallbackBarrierCompleted: Bool?
+            var witnessStartAcceptedCallbackWatermark: UInt64?
+            var witnessEndAcceptedCallbackWatermark: UInt64?
+            var witnessAcceptedCallbackCount: Int?
+            var witnessAcceptedEventCount: Int?
+            var witnessAcceptedDestinationEventCount: Int?
+            var witnessAcceptedNonDestinationEventCount: Int?
+            var witnessMustScanSubDirs: Bool?
+            var witnessRootChanged: Bool?
+            var witnessUserDropped: Bool?
+            var witnessKernelDropped: Bool?
+            var witnessEventIDsWrapped: Bool?
+            var witnessEventIDRegressed: Bool?
+            var witnessLifetimeExceeded: Bool?
             var witnessGap: Bool?
             var witnessDrop: Bool?
             var witnessOverflow: Bool?

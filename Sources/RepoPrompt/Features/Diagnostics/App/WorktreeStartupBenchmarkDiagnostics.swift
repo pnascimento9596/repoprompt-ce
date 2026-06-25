@@ -623,7 +623,7 @@
 
                 var payload: [String: Any] = [
                     "ok": true,
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "action": export ? "export" : "snapshot",
                     "scope": [
                         "window_id": scope.windowID,
@@ -808,8 +808,52 @@
                 "witness_requested": optional(decision.witnessRequested),
                 "witness_started": optional(decision.witnessStarted),
                 "witness_finished": optional(decision.witnessFinished),
+                "witness_start_event_id": optional(decision.witnessStartEventID),
+                "witness_end_event_id": optional(decision.witnessEndEventID),
                 "witness_start_event_id_valid": optional(decision.witnessStartEventIDValid),
                 "witness_end_event_id_valid": optional(decision.witnessEndEventIDValid),
+                "witness_stable_root_available_before_mutation": optional(
+                    decision.witnessStableRootAvailableBeforeMutation
+                ),
+                "witness_destination_absent_before_mutation": optional(
+                    decision.witnessDestinationAbsentBeforeMutation
+                ),
+                "witness_destination_strict_descendant": optional(
+                    decision.witnessDestinationStrictDescendant
+                ),
+                "witness_stable_root_unchanged_after_initialization": optional(
+                    decision.witnessStableRootUnchangedAfterInitialization
+                ),
+                "witness_stream_creation_succeeded": optional(decision.witnessStreamCreationSucceeded),
+                "witness_activation_flush_completed": optional(decision.witnessActivationFlushCompleted),
+                "witness_activation_callback_barrier_completed": optional(
+                    decision.witnessActivationCallbackBarrierCompleted
+                ),
+                "witness_ending_flush_completed": optional(decision.witnessEndingFlushCompleted),
+                "witness_ending_callback_barrier_completed": optional(
+                    decision.witnessEndingCallbackBarrierCompleted
+                ),
+                "witness_start_accepted_callback_watermark": optional(
+                    decision.witnessStartAcceptedCallbackWatermark
+                ),
+                "witness_end_accepted_callback_watermark": optional(
+                    decision.witnessEndAcceptedCallbackWatermark
+                ),
+                "witness_accepted_callback_count": optional(decision.witnessAcceptedCallbackCount),
+                "witness_accepted_event_count": optional(decision.witnessAcceptedEventCount),
+                "witness_accepted_destination_event_count": optional(
+                    decision.witnessAcceptedDestinationEventCount
+                ),
+                "witness_accepted_non_destination_event_count": optional(
+                    decision.witnessAcceptedNonDestinationEventCount
+                ),
+                "witness_must_scan_sub_dirs": optional(decision.witnessMustScanSubDirs),
+                "witness_root_changed": optional(decision.witnessRootChanged),
+                "witness_user_dropped": optional(decision.witnessUserDropped),
+                "witness_kernel_dropped": optional(decision.witnessKernelDropped),
+                "witness_event_ids_wrapped": optional(decision.witnessEventIDsWrapped),
+                "witness_event_id_regressed": optional(decision.witnessEventIDRegressed),
+                "witness_lifetime_exceeded": optional(decision.witnessLifetimeExceeded),
                 "witness_gap": optional(decision.witnessGap),
                 "witness_drop": optional(decision.witnessDrop),
                 "witness_overflow": optional(decision.witnessOverflow),

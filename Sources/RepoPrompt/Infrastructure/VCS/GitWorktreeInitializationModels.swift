@@ -195,30 +195,68 @@ struct GitWorktreeInitializationContext: Equatable {
     }
 }
 
+/// Scalar-only proof that the creation interval was continuously observed.
+/// Creation contents come from final Git/index/status authority and exact
+/// include-copy inventory; post-cut mutations replay from `endEventID`.
 struct GitWorktreeCreationWitnessCoverage: Equatable {
-    static let maximumEventCount = 4096
-    static let maximumAffectedDirectoryCount = 256
     static let maximumLifetime: Duration = .seconds(60)
 
     let startedAtUptimeNanoseconds: UInt64
     let endedAtUptimeNanoseconds: UInt64
     let startEventID: UInt64
     let endEventID: UInt64
-    let destinationRelativePaths: [String]
-    let affectedDestinationRelativeDirectories: [String]
+    let stableWatchRootAvailableBeforeMutation: Bool
+    let destinationWasAbsentBeforeMutation: Bool
+    let destinationWasStrictDescendant: Bool
+    let stableWatchRootUnchangedAfterInitialization: Bool
+    let streamCreationSucceeded: Bool
     let streamStartedBeforeMutation: Bool
+    let activationFlushCompleted: Bool
+    let activationCallbackBarrierCompleted: Bool
     let streamEndedAfterInitialization: Bool
+    let endingFlushCompleted: Bool
+    let endingCallbackBarrierCompleted: Bool
+    let startAcceptedCallbackWatermark: UInt64
+    let endAcceptedCallbackWatermark: UInt64
+    let acceptedCallbackCount: Int
+    let acceptedEventCount: Int
+    let acceptedDestinationEventCount: Int
+    let acceptedNonDestinationEventCount: Int
+    let mustScanSubDirs: Bool
+    let rootChanged: Bool
+    let userDropped: Bool
+    let kernelDropped: Bool
+    let eventIDsWrapped: Bool
+    let eventIDRegressed: Bool
+    let lifetimeExceeded: Bool
     let hadGap: Bool
     let hadDrop: Bool
     let overflowed: Bool
 
     var provesCreationInterval: Bool {
-        streamStartedBeforeMutation
+        stableWatchRootAvailableBeforeMutation
+            && destinationWasAbsentBeforeMutation
+            && destinationWasStrictDescendant
+            && stableWatchRootUnchangedAfterInitialization
+            && streamCreationSucceeded
+            && streamStartedBeforeMutation
+            && activationFlushCompleted
+            && activationCallbackBarrierCompleted
             && streamEndedAfterInitialization
+            && endingFlushCompleted
+            && endingCallbackBarrierCompleted
             && startEventID > 0
             && endEventID > 0
             && startEventID != UInt64.max
             && endEventID != UInt64.max
+            && endAcceptedCallbackWatermark >= startAcceptedCallbackWatermark
+            && !mustScanSubDirs
+            && !rootChanged
+            && !userDropped
+            && !kernelDropped
+            && !eventIDsWrapped
+            && !eventIDRegressed
+            && !lifetimeExceeded
             && !hadGap
             && !hadDrop
             && !overflowed

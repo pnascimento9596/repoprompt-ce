@@ -11,10 +11,30 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
                 endedAtUptimeNanoseconds: 2,
                 startEventID: start,
                 endEventID: end,
-                destinationRelativePaths: [],
-                affectedDestinationRelativeDirectories: [],
+                stableWatchRootAvailableBeforeMutation: true,
+                destinationWasAbsentBeforeMutation: true,
+                destinationWasStrictDescendant: true,
+                stableWatchRootUnchangedAfterInitialization: true,
+                streamCreationSucceeded: true,
                 streamStartedBeforeMutation: true,
+                activationFlushCompleted: true,
+                activationCallbackBarrierCompleted: true,
                 streamEndedAfterInitialization: true,
+                endingFlushCompleted: true,
+                endingCallbackBarrierCompleted: true,
+                startAcceptedCallbackWatermark: 0,
+                endAcceptedCallbackWatermark: 0,
+                acceptedCallbackCount: 0,
+                acceptedEventCount: 0,
+                acceptedDestinationEventCount: 0,
+                acceptedNonDestinationEventCount: 0,
+                mustScanSubDirs: false,
+                rootChanged: false,
+                userDropped: false,
+                kernelDropped: false,
+                eventIDsWrapped: false,
+                eventIDRegressed: false,
+                lifetimeExceeded: false,
                 hadGap: false,
                 hadDrop: false,
                 overflowed: false
@@ -437,7 +457,11 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
         XCTAssertEqual(receipt.repositoryRelativeRootPrefix.value, "")
         XCTAssertEqual(receipt.worktree.worktreeID, result.descriptor.worktreeID)
         XCTAssertEqual(receipt.targetLayout.workTreeRoot.standardizedFileURL.path, result.descriptor.path)
-        XCTAssertEqual(receipt.exactCopiedRelativePaths, ["secret.txt"])
+        XCTAssertEqual(receipt.exactCopiedRelativePaths, ["nested/ignored.txt", "secret.txt"])
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: URL(fileURLWithPath: result.descriptor.path)
+                .appendingPathComponent("nested/ignored.txt").path
+        ))
         XCTAssertTrue(receipt.witnessCoverage.provesCreationInterval)
         XCTAssertNil(receipt.fallbackReason())
 
@@ -937,19 +961,28 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
 
     func testCreationWitnessRecordsParentAndGlobalGapFlagsBeforePathFiltering() {
         let destination = "/tmp/receipt-witness-\(UUID().uuidString)"
-        let recorder = WorkspaceRootCreationReceiptCoordinator.Recorder(destinationPath: destination)
+        let recorder = WorkspaceRootCreationReceiptCoordinator.Recorder(
+            destinationPath: destination,
+            watchRootPath: "/tmp",
+            startEventID: 39
+        )
         let gapFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
             | FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)
             | FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged)
         let dropFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped)
             | FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped)
-        recorder.accept(path: "/tmp", flags: gapFlags, eventID: 40)
-        recorder.accept(path: "/", flags: dropFlags, eventID: 41)
+        recorder.accept([
+            WorkspaceRootCreationFSEvent(path: "/tmp", flags: gapFlags, eventID: 40),
+            WorkspaceRootCreationFSEvent(path: "/", flags: dropFlags, eventID: 41)
+        ])
         let snapshot = recorder.snapshot()
-        XCTAssertTrue(snapshot.hadGap)
-        XCTAssertTrue(snapshot.hadDrop)
-        XCTAssertEqual(snapshot.latestEventID, 41)
-        XCTAssertTrue(snapshot.paths.isEmpty)
+        XCTAssertTrue(snapshot.mustScanSubDirs)
+        XCTAssertTrue(snapshot.rootChanged)
+        XCTAssertTrue(snapshot.eventIDsWrapped)
+        XCTAssertTrue(snapshot.userDropped)
+        XCTAssertTrue(snapshot.kernelDropped)
+        XCTAssertEqual(snapshot.acceptedDestinationEventCount, 0)
+        XCTAssertEqual(snapshot.acceptedNonDestinationEventCount, 1)
     }
 
     func testReceiptReplayFailsAcrossSessionLogicalRootAndOwnerGeneration() async throws {
@@ -1659,9 +1692,10 @@ private struct ReceiptFixture {
         try git(["config", "user.email", "repoprompt@example.test"])
         try git(["config", "commit.gpgSign", "false"])
         try write("Tracked.swift", "let value = 1\n")
-        try write(".gitignore", "secret.txt\n")
-        try write(".worktreeinclude", "secret.txt\n")
+        try write(".gitignore", "secret.txt\nnested/ignored.txt\n")
+        try write(".worktreeinclude", "secret.txt\nnested/ignored.txt\n")
         try write("secret.txt", "ephemeral secret\n")
+        try write("nested/ignored.txt", "nested ephemeral secret\n")
         try git(["add", "Tracked.swift", ".gitignore", ".worktreeinclude"])
         try git(["commit", "-m", "base"])
     }

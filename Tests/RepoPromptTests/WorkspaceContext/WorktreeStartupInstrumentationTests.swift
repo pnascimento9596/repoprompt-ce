@@ -537,7 +537,7 @@ import XCTest
             XCTAssertEqual(duplicate.creationAttemptCount, 2)
         }
 
-        func testReceiptDecisionSchemaV3ExportIsTerminalBoundedAndPathFree() throws {
+        func testReceiptDecisionSchemaV4ExportIsTerminalBoundedAndPathFree() throws {
             WorktreeStartupInstrumentation.resetForTesting()
             WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
             defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
@@ -578,6 +578,20 @@ import XCTest
             )
             creation.outcome = .receiptEmitted
             creation.receiptEmitted = true
+            creation.witnessStartEventID = 100
+            creation.witnessEndEventID = 200
+            creation.witnessStartAcceptedCallbackWatermark = 2
+            creation.witnessEndAcceptedCallbackWatermark = 4
+            creation.witnessAcceptedCallbackCount = 4
+            creation.witnessAcceptedEventCount = 300
+            creation.witnessAcceptedDestinationEventCount = 257
+            creation.witnessAcceptedNonDestinationEventCount = 43
+            creation.witnessMustScanSubDirs = false
+            creation.witnessRootChanged = false
+            creation.witnessUserDropped = false
+            creation.witnessKernelDropped = false
+            creation.witnessEventIDsWrapped = false
+            creation.witnessEventIDRegressed = false
             WorktreeStartupInstrumentation.recordReceiptCreationDecision(
                 correlationID: arm.correlationID,
                 decision: creation
@@ -611,7 +625,7 @@ import XCTest
                 correlationID: arm.correlationID,
                 export: true
             )
-            XCTAssertEqual(payload["schema_version"] as? Int, 3)
+            XCTAssertEqual(payload["schema_version"] as? Int, 4)
             XCTAssertEqual(payload["bounded"] as? Bool, true)
             XCTAssertEqual(payload["contains_paths"] as? Bool, false)
             XCTAssertEqual(payload["receipt_decision_count"] as? Int, 1)
@@ -624,6 +638,11 @@ import XCTest
             let exported = try XCTUnwrap(String(data: data, encoding: .utf8))
             XCTAssertFalse(exported.contains(pathSentinel))
             XCTAssertTrue(exported.contains("source_common_directory_digest"))
+            XCTAssertTrue(exported.contains("\"witness_start_event_id\":100"))
+            XCTAssertTrue(exported.contains("\"witness_end_event_id\":200"))
+            XCTAssertTrue(exported.contains("\"witness_accepted_destination_event_count\":257"))
+            XCTAssertTrue(exported.contains("\"witness_accepted_non_destination_event_count\":43"))
+            XCTAssertTrue(exported.contains("\"witness_user_dropped\":false"))
         }
 
         func testReceiptDecisionEvictionInvalidatesBenchmarkSampleAndResetClearsState() throws {

@@ -542,12 +542,10 @@ enum WorkspaceRootMaterializationHintObservation: Equatable {
 
 struct WorkspaceRootSeedPlannerLimits: Equatable {
     let maximumVerificationPathCount: Int
-    let maximumAffectedDirectoryCount: Int
     let maximumOverlayChangedFileCount: Int
 
     static let production = WorkspaceRootSeedPlannerLimits(
         maximumVerificationPathCount: 512,
-        maximumAffectedDirectoryCount: 64,
         maximumOverlayChangedFileCount: WorkspaceSearchRootPathIndex.maxOverlayChangedFileCount
     )
 }

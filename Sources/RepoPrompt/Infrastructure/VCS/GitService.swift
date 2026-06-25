@@ -327,10 +327,35 @@ actor GitService {
         ) {
             decision.witnessFinished = coverage != nil
             guard let coverage else { return }
+            decision.witnessStartEventID = coverage.startEventID
+            decision.witnessEndEventID = coverage.endEventID
             decision.witnessStartEventIDValid = coverage.startEventID > 0
                 && coverage.startEventID != UInt64.max
             decision.witnessEndEventIDValid = coverage.endEventID > 0
                 && coverage.endEventID != UInt64.max
+            decision.witnessStableRootAvailableBeforeMutation = coverage.stableWatchRootAvailableBeforeMutation
+            decision.witnessDestinationAbsentBeforeMutation = coverage.destinationWasAbsentBeforeMutation
+            decision.witnessDestinationStrictDescendant = coverage.destinationWasStrictDescendant
+            decision.witnessStableRootUnchangedAfterInitialization =
+                coverage.stableWatchRootUnchangedAfterInitialization
+            decision.witnessStreamCreationSucceeded = coverage.streamCreationSucceeded
+            decision.witnessActivationFlushCompleted = coverage.activationFlushCompleted
+            decision.witnessActivationCallbackBarrierCompleted = coverage.activationCallbackBarrierCompleted
+            decision.witnessEndingFlushCompleted = coverage.endingFlushCompleted
+            decision.witnessEndingCallbackBarrierCompleted = coverage.endingCallbackBarrierCompleted
+            decision.witnessStartAcceptedCallbackWatermark = coverage.startAcceptedCallbackWatermark
+            decision.witnessEndAcceptedCallbackWatermark = coverage.endAcceptedCallbackWatermark
+            decision.witnessAcceptedCallbackCount = coverage.acceptedCallbackCount
+            decision.witnessAcceptedEventCount = coverage.acceptedEventCount
+            decision.witnessAcceptedDestinationEventCount = coverage.acceptedDestinationEventCount
+            decision.witnessAcceptedNonDestinationEventCount = coverage.acceptedNonDestinationEventCount
+            decision.witnessMustScanSubDirs = coverage.mustScanSubDirs
+            decision.witnessRootChanged = coverage.rootChanged
+            decision.witnessUserDropped = coverage.userDropped
+            decision.witnessKernelDropped = coverage.kernelDropped
+            decision.witnessEventIDsWrapped = coverage.eventIDsWrapped
+            decision.witnessEventIDRegressed = coverage.eventIDRegressed
+            decision.witnessLifetimeExceeded = coverage.lifetimeExceeded
             decision.witnessGap = coverage.hadGap
             decision.witnessDrop = coverage.hadDrop
             decision.witnessOverflow = coverage.overflowed
@@ -652,9 +677,14 @@ actor GitService {
                             receiptDecision?.witnessRequested = true
                         #endif
                         parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
-                        witnessSession = creationReceiptCoordinator.start(destinationURL: request.path)
+                        if let stableWatchRootURL = request.appManagedContainer {
+                            witnessSession = creationReceiptCoordinator.start(
+                                destinationURL: request.path,
+                                stableWatchRootURL: stableWatchRootURL
+                            )
+                        }
                         #if DEBUG
-                            receiptDecision?.witnessStarted = witnessSession != nil
+                            receiptDecision?.witnessStarted = witnessSession?.streamStartedBeforeMutation ?? false
                         #endif
                     } else {
                         #if DEBUG
@@ -742,25 +772,41 @@ actor GitService {
                                 endedAtUptimeNanoseconds: coverage.endedAtUptimeNanoseconds,
                                 startEventID: coverage.startEventID,
                                 endEventID: coverage.endEventID,
-                                destinationRelativePaths: coverage.destinationRelativePaths,
-                                affectedDestinationRelativeDirectories: coverage.affectedDestinationRelativeDirectories,
+                                stableWatchRootAvailableBeforeMutation: coverage
+                                    .stableWatchRootAvailableBeforeMutation,
+                                destinationWasAbsentBeforeMutation: coverage.destinationWasAbsentBeforeMutation,
+                                destinationWasStrictDescendant: coverage.destinationWasStrictDescendant,
+                                stableWatchRootUnchangedAfterInitialization: coverage
+                                    .stableWatchRootUnchangedAfterInitialization,
+                                streamCreationSucceeded: coverage.streamCreationSucceeded,
                                 streamStartedBeforeMutation: coverage.streamStartedBeforeMutation,
+                                activationFlushCompleted: coverage.activationFlushCompleted,
+                                activationCallbackBarrierCompleted: coverage
+                                    .activationCallbackBarrierCompleted,
                                 streamEndedAfterInitialization: coverage.streamEndedAfterInitialization,
+                                endingFlushCompleted: coverage.endingFlushCompleted,
+                                endingCallbackBarrierCompleted: coverage.endingCallbackBarrierCompleted,
+                                startAcceptedCallbackWatermark: coverage.startAcceptedCallbackWatermark,
+                                endAcceptedCallbackWatermark: coverage.endAcceptedCallbackWatermark,
+                                acceptedCallbackCount: coverage.acceptedCallbackCount,
+                                acceptedEventCount: coverage.acceptedEventCount,
+                                acceptedDestinationEventCount: coverage.acceptedDestinationEventCount,
+                                acceptedNonDestinationEventCount: coverage.acceptedNonDestinationEventCount,
+                                mustScanSubDirs: coverage.mustScanSubDirs,
+                                rootChanged: coverage.rootChanged,
+                                userDropped: coverage.userDropped,
+                                kernelDropped: coverage.kernelDropped,
+                                eventIDsWrapped: coverage.eventIDsWrapped,
+                                eventIDRegressed: coverage.eventIDRegressed,
+                                lifetimeExceeded: coverage.lifetimeExceeded,
                                 hadGap: true,
                                 hadDrop: coverage.hadDrop,
                                 overflowed: coverage.overflowed
                             )
                         }
-                        receiptDecision?.witnessFinished = witnessCoverage != nil
-                        if let witnessCoverage {
-                            receiptDecision?.witnessStartEventIDValid = witnessCoverage.startEventID > 0
-                                && witnessCoverage.startEventID != UInt64.max
-                            receiptDecision?.witnessEndEventIDValid = witnessCoverage.endEventID > 0
-                                && witnessCoverage.endEventID != UInt64.max
-                            receiptDecision?.witnessGap = witnessCoverage.hadGap
-                            receiptDecision?.witnessDrop = witnessCoverage.hadDrop
-                            receiptDecision?.witnessOverflow = witnessCoverage.overflowed
-                            receiptDecision?.witnessProvesInterval = witnessCoverage.provesCreationInterval
+                        if var decision = receiptDecision {
+                            Self.applyReceiptWitnessCoverage(witnessCoverage, to: &decision)
+                            receiptDecision = decision
                         }
                     #endif
                     if let mutationToken {

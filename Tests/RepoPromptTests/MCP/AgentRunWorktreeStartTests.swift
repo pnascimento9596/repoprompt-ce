@@ -2381,6 +2381,25 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             XCTAssertEqual(creation.repositoryNamespaceMatch, .match)
             XCTAssertEqual(creation.targetPrefixMatch, .match)
             XCTAssertEqual(creation.targetTreeAuthorityMatch, .match)
+            XCTAssertEqual(creation.witnessStableRootAvailableBeforeMutation, true)
+            XCTAssertEqual(creation.witnessDestinationAbsentBeforeMutation, true)
+            XCTAssertEqual(creation.witnessDestinationStrictDescendant, true)
+            XCTAssertEqual(creation.witnessStableRootUnchangedAfterInitialization, true)
+            XCTAssertEqual(creation.witnessStreamCreationSucceeded, true)
+            XCTAssertEqual(creation.witnessActivationFlushCompleted, true)
+            XCTAssertEqual(creation.witnessActivationCallbackBarrierCompleted, true)
+            XCTAssertEqual(creation.witnessEndingFlushCompleted, true)
+            XCTAssertEqual(creation.witnessEndingCallbackBarrierCompleted, true)
+            XCTAssertEqual(creation.witnessOverflow, false)
+            XCTAssertEqual(creation.witnessProvesInterval, true)
+            XCTAssertGreaterThanOrEqual(
+                try XCTUnwrap(creation.witnessAcceptedDestinationEventCount),
+                0
+            )
+            XCTAssertGreaterThanOrEqual(
+                try XCTUnwrap(creation.witnessEndAcceptedCallbackWatermark),
+                try XCTUnwrap(creation.witnessStartAcceptedCallbackWatermark)
+            )
             XCTAssertTrue(creation.receiptEmitted)
             XCTAssertEqual(creation.outcome, .receiptEmitted)
             XCTAssertNil(creation.receiptFallbackReason)
