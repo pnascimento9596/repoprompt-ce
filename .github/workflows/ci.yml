@@ -100,7 +100,7 @@ jobs:
               for process_id in process_ids:
                   try:
                       groups.add(os.getpgid(process_id))
-                  except ProcessLookupError:
+                  except (PermissionError, ProcessLookupError):
                       pass
               groups.discard(os.getpgrp())
               return groups
@@ -109,7 +109,7 @@ jobs:
               for group in groups:
                   try:
                       os.killpg(group, sent_signal)
-                  except ProcessLookupError:
+                  except (PermissionError, ProcessLookupError):
                       pass
 
           def live_process_groups(groups):
@@ -117,25 +117,37 @@ jobs:
               for group in groups:
                   try:
                       os.killpg(group, 0)
-                  except ProcessLookupError:
+                  except (PermissionError, ProcessLookupError):
                       continue
                   live.add(group)
               return live
 
           def stop_process_tree(process):
               groups = descendant_process_groups(process.pid)
+              try:
+                  groups.add(os.getpgid(process.pid))
+              except (PermissionError, ProcessLookupError):
+                  pass
               signal_process_groups(groups, signal.SIGTERM)
 
               deadline = time.monotonic() + 10
               while time.monotonic() < deadline:
                   process.poll()
+                  if process.returncode is not None:
+                      break
                   groups = live_process_groups(groups)
                   if not groups:
                       break
                   time.sleep(0.1)
 
-              signal_process_groups(groups, signal.SIGKILL)
-              process.wait()
+              process.poll()
+              if process.returncode is None:
+                  signal_process_groups(groups, signal.SIGKILL)
+                  try:
+                      process.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      process.kill()
+                      process.wait()
 
           def relay_output(process, output_seen):
               for line in process.stdout:
