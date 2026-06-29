@@ -127,6 +127,8 @@ run_pr_ready_path_validations() {
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
   local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
   local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'
+  local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
+  local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
 
   run_pr_ready_validation_if_range_contains "$files" "$control_plane_paths_pattern" "Run conductor self-tests" \
     make conductor-selftest
@@ -140,6 +142,10 @@ run_pr_ready_path_validations() {
     make dev-swift-build PRODUCT=RepoPrompt
   run_pr_ready_validation_if_range_contains "$files" "$mcp_product_paths_pattern" "Build repoprompt-mcp product" \
     make dev-swift-build PRODUCT=repoprompt-mcp
+  run_pr_ready_validation_if_range_contains "$files" "$xcode_generator_test_paths_pattern" "Run Xcode workspace generator tests" \
+    make xcode-generator-test
+  run_pr_ready_validation_if_range_contains "$files" "$xcode_full_validation_paths_pattern" "Validate generated Xcode workspace" \
+    make xcode-validate
 }
 
 push_success() {

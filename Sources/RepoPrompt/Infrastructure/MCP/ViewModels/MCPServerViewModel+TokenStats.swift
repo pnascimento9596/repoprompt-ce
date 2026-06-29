@@ -95,12 +95,14 @@ extension MCPServerViewModel {
         collections: SelectionReplyAssembler.SelectionCollections,
         resolvedContext: PromptContextResolved,
         lookupContext: WorkspaceLookupContext,
-        activeTabCompatibility: Bool
+        activeTabCompatibility: Bool,
+        allowActivePublishedSnapshotRefresh: Bool = true
     ) async -> MCPPreparedTokenAccounting {
         let cachedEvaluation = await cachedPromptEntriesEvaluation(collections: collections)
         if activeTabCompatibility {
             let published = promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
-                for: effectiveSelection
+                for: effectiveSelection,
+                scheduleRefreshIfNeeded: allowActivePublishedSnapshotRefresh
             )
             var entryResults = cachedEvaluation.entryResultsByFileID
             for entry in collections.selected {

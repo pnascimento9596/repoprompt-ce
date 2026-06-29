@@ -21,6 +21,8 @@ ROOT_TEST_TARGET = "dev-test"
 PROVIDER_TEST_TARGET = "dev-provider-test"
 REPOPROMPT_BUILD_TARGET = "dev-swift-build PRODUCT=RepoPrompt"
 MCP_BUILD_TARGET = "dev-swift-build PRODUCT=repoprompt-mcp"
+XCODE_GENERATOR_TEST_TARGET = "xcode-generator-test"
+XCODE_VALIDATE_TARGET = "xcode-validate"
 HEAVYWEIGHT_MAKE_TARGETS = [
     CONDUCTOR_SELFTEST_TARGET,
     SWIFT_LINT_TARGET,
@@ -28,6 +30,8 @@ HEAVYWEIGHT_MAKE_TARGETS = [
     PROVIDER_TEST_TARGET,
     REPOPROMPT_BUILD_TARGET,
     MCP_BUILD_TARGET,
+    XCODE_GENERATOR_TEST_TARGET,
+    XCODE_VALIDATE_TARGET,
 ]
 
 
@@ -158,6 +162,68 @@ class ContributionPreflightTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, CONDUCTOR_SELFTEST_TARGET])
+
+    def test_pr_ready_runs_xcode_validation_for_workspace_boundary_changes(self) -> None:
+        cases = [
+            (
+                "generator",
+                "Scripts/generate_xcode_workspace.py",
+                [GUARDRAILS_TARGET, XCODE_GENERATOR_TEST_TARGET, XCODE_VALIDATE_TARGET],
+            ),
+            (
+                "workflow wrapper",
+                "Scripts/xcode_developer_workflow.sh",
+                [GUARDRAILS_TARGET, XCODE_GENERATOR_TEST_TARGET, XCODE_VALIDATE_TARGET],
+            ),
+            (
+                "package lockfile",
+                "Package.resolved",
+                [GUARDRAILS_TARGET, XCODE_GENERATOR_TEST_TARGET, XCODE_VALIDATE_TARGET],
+            ),
+            (
+                "hosted workflow",
+                ".github/workflows/xcode-workspace.yml",
+                [GUARDRAILS_TARGET, XCODE_GENERATOR_TEST_TARGET, XCODE_VALIDATE_TARGET],
+            ),
+            (
+                "package manifest",
+                "Package.swift",
+                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, XCODE_GENERATOR_TEST_TARGET, XCODE_VALIDATE_TARGET],
+            ),
+            (
+                "makefile targets",
+                "Makefile",
+                [
+                    GUARDRAILS_TARGET,
+                    CONDUCTOR_SELFTEST_TARGET,
+                    XCODE_GENERATOR_TEST_TARGET,
+                    XCODE_VALIDATE_TARGET,
+                ],
+            ),
+        ]
+
+        for name, outgoing_path, expected_make_lines in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo, preflight, env = self.create_repo(Path(tmp), outgoing_path=outgoing_path)
+
+                    result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    self.assert_make_lines_equal(env, expected_make_lines)
+                    self.assertIn("PR-ready preflight passed", result.stdout)
+
+    def test_pr_ready_runs_generator_tests_only_for_generator_test_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(
+                Path(tmp), outgoing_path="Scripts/test_xcode_workspace_generator.py"
+            )
+
+            result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assert_make_lines_equal(env, [GUARDRAILS_TARGET, XCODE_GENERATOR_TEST_TARGET])
+            self.assertNotIn(XCODE_VALIDATE_TARGET, self.make_lines(env))
 
     def test_pr_ready_selects_expected_heavyweight_targets_by_changed_path(self) -> None:
         cases = [

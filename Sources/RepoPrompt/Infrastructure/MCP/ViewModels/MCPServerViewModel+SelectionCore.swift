@@ -865,9 +865,18 @@ extension MCPServerViewModel {
             }
 
             // MCP replies never await an immediate recount. Use the latest published
-            // active-tab snapshot when no tab-scoped override was prepared.
-            let fallbackPublished = await MainActor.run {
-                tokens?.owner.promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(for: nil)
+            // active-tab snapshot only when no tab-scoped override was prepared, and do not
+            // schedule a refresh from reply formatting itself.
+            let needsFallbackPublished = tokenStatsOverride == nil || tokenAccountingOverride == nil
+            let fallbackPublished: TokenCountingViewModel.PublishedTokenSnapshot? = if needsFallbackPublished {
+                await MainActor.run {
+                    tokens?.owner.promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
+                        for: nil,
+                        scheduleRefreshIfNeeded: false
+                    )
+                }
+            } else {
+                nil
             }
             let tokenStats: ToolResultDTOs.TokenStats? = tokenStatsOverride
                 ?? fallbackPublished.map(MCPServerViewModel.publishedTokenStats)

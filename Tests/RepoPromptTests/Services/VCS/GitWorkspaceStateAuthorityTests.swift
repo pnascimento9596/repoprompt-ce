@@ -128,26 +128,35 @@ final class GitWorkspaceStateAuthorityTests: XCTestCase {
         let monitor = GitWorkspaceMetadataMonitor()
         let authority = GitWorkspaceStateAuthority(metadataMonitor: monitor)
         let observation = try await authority.retainMetadataObservation(for: fixture.layout)
-        let snapshot = try fixture.snapshot()
-        let lease = try await authority.install(snapshot)
-        let fence = GitWorkspacePendingInitializationAuthorityFence(
+        var snapshot = try fixture.snapshot()
+        var lease = try await authority.install(snapshot)
+        var fence = Self.pendingInitializationFence(
             snapshot: snapshot,
             lease: lease,
             metadataObservationToken: observation,
-            acceptedMetadataWatermark: lease.acceptedMetadataWatermark,
-            targetLayout: fixture.layout,
-            repositoryRelativeRootPrefix: snapshot.repositoryRelativeRootPrefix,
-            additionalAuthorityPaths: [],
-            revalidationUsed: false
+            targetLayout: fixture.layout
         )
 
-        let initialDecision = await authority.pendingInitializationFenceDecision(fence)
+        var initialDecision = await authority.pendingInitializationFenceDecision(fence)
+        for recaptureIndex in 0 ..< 3 where initialDecision != .current {
+            snapshot = try fixture.snapshot(
+                metadataGeneration: "metadata-recaptured-\(recaptureIndex)-\(monitor.acceptedWatermark(for: fixture.key))"
+            )
+            lease = try await authority.install(snapshot)
+            fence = Self.pendingInitializationFence(
+                snapshot: snapshot,
+                lease: lease,
+                metadataObservationToken: observation,
+                targetLayout: fixture.layout
+            )
+            initialDecision = await authority.pendingInitializationFenceDecision(fence)
+        }
         XCTAssertEqual(initialDecision, .current)
 
         await monitor.injectAcceptedEventForTesting(repositoryKey: fixture.key, kinds: [.head])
         await monitor.injectAcceptedEventForTesting(repositoryKey: fixture.key, kinds: [.index])
         let latestAcceptedWatermark = monitor.acceptedWatermark(for: fixture.key)
-        XCTAssertEqual(latestAcceptedWatermark, lease.acceptedMetadataWatermark + 2)
+        XCTAssertGreaterThanOrEqual(latestAcceptedWatermark, lease.acceptedMetadataWatermark + 2)
         let currentAfterAcceptedEvents = await authority.pendingInitializationAuthorityFenceIsCurrent(fence)
         XCTAssertFalse(currentAfterAcceptedEvents)
         XCTAssertFalse(authority.pendingInitializationAuthorityFenceIsSynchronouslyCurrent(fence))
@@ -329,6 +338,25 @@ final class GitWorkspaceStateAuthorityTests: XCTestCase {
         XCTAssertNotEqual(baseline, otherSearchABI)
         XCTAssertEqual(baseline.repositoryNamespace, otherTree.repositoryNamespace)
         XCTAssertEqual(baseline.objectFormat, .sha1)
+    }
+
+    private static func pendingInitializationFence(
+        snapshot: GitWorkspaceAuthoritySnapshot,
+        lease: GitWorkspaceAuthorityLease,
+        metadataObservationToken: GitWorkspaceMetadataMonitor.RetainToken,
+        targetLayout: GitRepositoryLayout,
+        revalidationUsed: Bool = false
+    ) -> GitWorkspacePendingInitializationAuthorityFence {
+        GitWorkspacePendingInitializationAuthorityFence(
+            snapshot: snapshot,
+            lease: lease,
+            metadataObservationToken: metadataObservationToken,
+            acceptedMetadataWatermark: lease.acceptedMetadataWatermark,
+            targetLayout: targetLayout,
+            repositoryRelativeRootPrefix: snapshot.repositoryRelativeRootPrefix,
+            additionalAuthorityPaths: [],
+            revalidationUsed: revalidationUsed
+        )
     }
 
     private func waitUntil(

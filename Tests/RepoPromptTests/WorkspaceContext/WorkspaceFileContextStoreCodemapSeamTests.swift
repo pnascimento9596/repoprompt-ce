@@ -7921,7 +7921,10 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         let source = try XCTUnwrap(coldFiles.first {
             $0.standardizedRelativePath == "Sources/Source.swift"
         })
-        let service = WorkspaceSelectionMutationService(store: coldStore)
+        let service = WorkspaceSelectionMutationService(
+            store: coldStore,
+            automaticSelectionPolicy: .init(maximumTotalWait: .seconds(10))
+        )
         let result = try await service.resolveAutomaticCodemapSelection(
             sourceFileIDs: [source.id],
             rootScope: .visibleWorkspace
@@ -9066,11 +9069,14 @@ private final class CodemapSelectionGraphProbe: @unchecked Sendable {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while clock.now < deadline {
-            if let graph = graph(rootEpoch: rootEpoch),
-               let summary = await (graph.accounting()).publishedSummary,
-               case .complete = summary.definitionUniverseCoverage
-            {
-                return true
+            if let graph = graph(rootEpoch: rootEpoch) {
+                let accounting = await graph.accounting()
+                if let summary = accounting.publishedSummary,
+                   accounting.currentObservedKey == summary.key,
+                   case .complete = summary.definitionUniverseCoverage
+                {
+                    return true
+                }
             }
             try? await Task.sleep(for: .milliseconds(10))
         }
@@ -9422,12 +9428,23 @@ private actor CodemapRetrySleepGate {
 private actor CodemapSuspensionGate {
     private var entered = false
     private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func enterAndWait() async {
         entered = true
-        guard !released else { return }
-        await withCheckedContinuation { continuation = $0 }
+        guard !released, !Task.isCancelled else { return }
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if released || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    continuations[waiterID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(waiterID) }
+        }
     }
 
     func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
@@ -9441,8 +9458,15 @@ private actor CodemapSuspensionGate {
 
     func release() {
         released = true
-        continuation?.resume()
-        continuation = nil
+        let pending = Array(continuations.values)
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancel(_ waiterID: UUID) {
+        continuations.removeValue(forKey: waiterID)?.resume()
     }
 }
 
@@ -9450,7 +9474,7 @@ private actor CodemapArmableSuspensionGate {
     private var armed = false
     private var entered = false
     private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func arm() {
         armed = true
@@ -9459,8 +9483,19 @@ private actor CodemapArmableSuspensionGate {
     func enterIfArmedAndWait() async {
         guard armed else { return }
         entered = true
-        guard !released else { return }
-        await withCheckedContinuation { continuation = $0 }
+        guard !released, !Task.isCancelled else { return }
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if released || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    continuations[waiterID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(waiterID) }
+        }
     }
 
     func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
@@ -9474,8 +9509,15 @@ private actor CodemapArmableSuspensionGate {
 
     func release() {
         released = true
-        continuation?.resume()
-        continuation = nil
+        let pending = Array(continuations.values)
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancel(_ waiterID: UUID) {
+        continuations.removeValue(forKey: waiterID)?.resume()
     }
 }
 
@@ -9534,13 +9576,24 @@ private actor CodemapGraphPublicationGate {
 private actor CodemapRootSuspensionGate {
     private var enteredRootEpoch: WorkspaceCodemapRootEpoch?
     private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func enterAndWait(_ rootEpoch: WorkspaceCodemapRootEpoch) async {
         guard enteredRootEpoch == nil else { return }
         enteredRootEpoch = rootEpoch
-        guard !released else { return }
-        await withCheckedContinuation { continuation = $0 }
+        guard !released, !Task.isCancelled else { return }
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if released || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    continuations[waiterID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(waiterID) }
+        }
     }
 
     func waitUntilEntered(timeout: Duration = .seconds(10)) async -> WorkspaceCodemapRootEpoch? {
@@ -9554,22 +9607,40 @@ private actor CodemapRootSuspensionGate {
 
     func release() {
         released = true
-        continuation?.resume()
-        continuation = nil
+        let pending = Array(continuations.values)
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancel(_ waiterID: UUID) {
+        continuations.removeValue(forKey: waiterID)?.resume()
     }
 }
 
 private actor CodemapResolutionGate {
     private var entered = false
     private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
     private(set) var resolutionCount = 0
 
     func enterAndWait() async {
         resolutionCount += 1
         entered = true
-        guard !released else { return }
-        await withCheckedContinuation { continuation = $0 }
+        guard !released, !Task.isCancelled else { return }
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if released || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    continuations[waiterID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(waiterID) }
+        }
     }
 
     func waitUntilEntered(timeout: Duration = .seconds(10)) async -> Bool {
@@ -9583,7 +9654,14 @@ private actor CodemapResolutionGate {
 
     func release() {
         released = true
-        continuation?.resume()
-        continuation = nil
+        let pending = Array(continuations.values)
+        continuations.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancel(_ waiterID: UUID) {
+        continuations.removeValue(forKey: waiterID)?.resume()
     }
 }

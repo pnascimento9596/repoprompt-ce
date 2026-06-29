@@ -16244,6 +16244,9 @@ final class AgentModeViewModel: ObservableObject {
         overTokenCapSummaryWillBegin: (() async -> Void)? = nil
     ) async -> String {
         guard let promptManager else { return "" }
+        let tokenCounter = promptManager.tokenCountingViewModel
+        tokenCounter.suspendAutomaticRecounts()
+        defer { tokenCounter.resumeAutomaticRecounts() }
 
         return await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,

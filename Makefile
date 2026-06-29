@@ -45,7 +45,7 @@ help:
 	@printf '  %-30s %s\n' 'xcode' 'Generate and open the disposable Xcode workspace'
 	@printf '  %-30s %s\n' 'xcode-generate' 'Generate the disposable Xcode workspace'
 	@printf '  %-30s %s\n' 'xcode-check' 'Check generated Xcode workspace state'
-	@printf '  %-30s %s\n' 'xcode-validate' 'Generate and validate the Xcode workspace'
+	@printf '  %-30s %s\n' 'xcode-validate' 'Full Xcode workspace validation, including xcodebuild -list'
 	@printf '  %-30s %s\n' 'xcode-generator-test' 'Run Xcode workspace generator tests'
 	@printf '  %-30s %s\n' 'xcode-clean' 'Remove generated Xcode workspace metadata'
 	@printf '\n%s\n' 'Release targets:'

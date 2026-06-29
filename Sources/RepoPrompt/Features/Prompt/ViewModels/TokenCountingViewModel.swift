@@ -383,15 +383,20 @@ class TokenCountingViewModel: ObservableObject {
         let refreshPending: Bool
     }
 
-    func latestPublishedTokenSnapshot(for expectedSelection: StoredSelection?) -> PublishedTokenSnapshot {
+    func latestPublishedTokenSnapshot(
+        for expectedSelection: StoredSelection?,
+        scheduleRefreshIfNeeded: Bool = true
+    ) -> PublishedTokenSnapshot {
         let selectionMatches = expectedSelection == nil || expectedSelection == lastPublishedSelection
         let calculationPending = tokenUpdateDebounceTask != nil || updateTokenCountTask != nil || isImmediateRecountInProgress
         let isComplete = didComputeBaseline
         let isStale = !pendingDirty.isEmpty || calculationPending || !selectionMatches
-        if !isComplete {
-            markDirty()
-        } else if !selectionMatches {
-            markDirty(.selection)
+        if scheduleRefreshIfNeeded {
+            if !isComplete {
+                markDirty()
+            } else if !selectionMatches {
+                markDirty(.selection)
+            }
         }
         return PublishedTokenSnapshot(
             breakdown: latestTokenBreakdown(),

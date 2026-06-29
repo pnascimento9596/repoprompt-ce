@@ -401,6 +401,7 @@ extension MCPServerViewModel {
             includeBlocks: includeBlocks,
             display: display,
             lookupContextOverride: lookupContext,
+            ingressPolicy: .alreadyAwaited,
             codemapPresentationOverride: codemapPresentation
         )
     }
@@ -487,7 +488,8 @@ extension MCPServerViewModel {
             collections: collections,
             resolvedContext: resolvedPromptContext,
             lookupContext: lookupContext,
-            activeTabCompatibility: virtualContext == nil
+            activeTabCompatibility: virtualContext == nil,
+            allowActivePublishedSnapshotRefresh: codemapPresentationOverride == nil
         )
         let artifactRootMetadata: [String: PathFormatter.RootMetadata] = Dictionary(
             uniqueKeysWithValues: artifactAuthorization.displayAliasesByAbsolutePath.compactMap { path, alias in
