@@ -316,6 +316,13 @@ struct WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate: Hashable {
     let catalogGeneration: UInt64
     let pathGeneration: UInt64
     let ingressGeneration: UInt64
+
+    var rootEpoch: WorkspaceCodemapRootEpoch {
+        WorkspaceCodemapRootEpoch(
+            rootID: identity.rootID,
+            rootLifetimeID: identity.rootLifetimeID
+        )
+    }
 }
 
 struct WorkspaceCodemapBindingAutomaticSelectionPlanRequest: Hashable {

@@ -11088,7 +11088,7 @@ extension WorkspaceFilesViewModel {
             sourceIDs: sourceIDs
         ) else { return }
         switch result.aggregateCoverage {
-        case .complete, .partial:
+        case .complete, .partial, .provisional:
             break
         case .incomplete, .pending, .busy:
             resetAutoCodemapFiles([])

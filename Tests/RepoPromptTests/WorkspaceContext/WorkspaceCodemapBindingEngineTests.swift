@@ -2283,6 +2283,130 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
         XCTAssertEqual(source, .cleanManifest)
     }
 
+    func testManifestAdoptionSkipsRecordWhenCandidateGenerationIsNewerThanBindingGeneration() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Warm.swift": "struct Warm {}\n"]
+        )
+        let artifactRoot = try makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+        let seedRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
+        let seed = try await makeEngineFixture(root: root, runtime: seedRuntime)
+        _ = await seed.engine.registerRoot(seed.registration)
+        let seedResult = await seed.engine.demand(seed.demand(path: "Sources/Warm.swift"))
+        let seedReady: WorkspaceCodemapLiveReadySnapshot
+        guard case let .ready(ready) = seedResult else {
+            return XCTFail("Expected warm artifact seed, got \(seedResult).")
+        }
+        seedReady = ready
+        XCTAssertGreaterThan(seedReady.requestGeneration, 0)
+        let seedRecord = try await publishVerifiedManifestRecord(
+            fixture: seed,
+            runtime: seedRuntime,
+            ready: seedReady
+        )
+        XCTAssertEqual(seedRecord.bindingGeneration, seedReady.requestGeneration)
+        let seedCapability = try await eligible(seed.capabilityService.resolve(
+            root: seed.registration.capabilityRequest
+        ))
+        let seedPipeline = try SyntaxManager.shared.pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let seedNamespace = try CodeMapRootManifestNamespace(
+            capability: seedCapability,
+            pipelineIdentity: seedPipeline
+        )
+        let seedAuthority = try CodeMapRootManifestAuthority(
+            namespace: seedNamespace,
+            token: seedCapability.repositoryAuthority
+        )
+        await seed.engine.unloadRoot(rootEpoch: seed.rootEpoch)
+        let persistedLoad = try await seedRuntime.manifestStore.loadCurrentManifest(
+            namespace: seedNamespace,
+            currentAuthority: seedAuthority
+        )
+        guard case let .hit(persistedSnapshot) = persistedLoad else {
+            return XCTFail("Expected seeded manifest to be persisted, got \(persistedLoad).")
+        }
+        let persistedRecord = try XCTUnwrap(persistedSnapshot.records.first {
+            $0.repositoryRelativePath == seedRecord.repositoryRelativePath
+        })
+        XCTAssertEqual(persistedRecord.bindingGeneration, seedReady.requestGeneration)
+
+        let currentGeneration = seedReady.requestGeneration + 1
+        let warmCatalogResolutions = EngineManifestBindingResolutionRecorder()
+        let warmRuntime = try CodeMapArtifactRuntime(rootURL: artifactRoot)
+        let warm = try await makeEngineFixture(
+            root: root,
+            runtime: warmRuntime,
+            projectionCatalogFactory: { rootEpoch, fileIDs in
+                WorkspaceCodemapBindingCatalogClient { epoch, relativePath in
+                    guard epoch == rootEpoch,
+                          let identity = WorkspaceCodemapArtifactBindingIdentity(
+                              rootID: rootEpoch.rootID,
+                              rootLifetimeID: rootEpoch.rootLifetimeID,
+                              fileID: fileIDs.id(for: relativePath),
+                              standardizedRootPath: root.path,
+                              standardizedRelativePath: relativePath,
+                              standardizedFullPath: root.appendingPathComponent(relativePath).path
+                          )
+                    else { return nil }
+                    let candidate = WorkspaceCodemapManifestBindingCandidate(
+                        identity: identity,
+                        requestGeneration: currentGeneration,
+                        pathGeneration: currentGeneration,
+                        ingressGeneration: 1
+                    )
+                    await warmCatalogResolutions.record(candidate)
+                    return candidate
+                }
+            }
+        )
+        _ = await warm.engine.registerRoot(warm.registration)
+        let result = await warm.engine.demand(warm.demand(
+            path: "Sources/Warm.swift",
+            priority: .background,
+            requestGeneration: currentGeneration,
+            pathGeneration: currentGeneration
+        ))
+
+        guard isReady(result) else {
+            return XCTFail("Generation-skewed manifest record should be skipped and rebuilt, got \(result).")
+        }
+        let warmResolutions = await warmCatalogResolutions.entries
+        XCTAssertFalse(warmResolutions.isEmpty)
+        XCTAssertTrue(warmResolutions.allSatisfy {
+            $0.relativePath == "Sources/Warm.swift" &&
+                $0.requestGeneration == currentGeneration &&
+                $0.pathGeneration == currentGeneration &&
+                $0.ingressGeneration == 1
+        })
+        let accounting = await warm.engine.accounting()
+        XCTAssertEqual(accounting.manifestAdoptionLeaseCount, 0)
+        XCTAssertEqual(accounting.manifestAdoptionLeaseByteCount, 0)
+        XCTAssertEqual(accounting.counters.demandManifestAdoptionWaits, 1)
+        XCTAssertEqual(accounting.counters.locatorFastPaths, 1)
+        XCTAssertEqual(accounting.counters.casFastPaths, 1)
+        XCTAssertEqual(accounting.counters.builds, 0)
+        XCTAssertEqual(accounting.counters.materializations, 0)
+        let snapshotValue = await warm.engine.snapshot(rootEpoch: warm.rootEpoch)
+        let snapshot = try XCTUnwrap(snapshotValue)
+        let entry = try XCTUnwrap(snapshot.entries.first {
+            $0.standardizedRelativePath == "Sources/Warm.swift"
+        })
+        guard case let .ready(source, _, _) = entry.state else {
+            return XCTFail("Expected live ready entry.")
+        }
+        XCTAssertEqual(source, .live)
+        switch result {
+        case let .ready(snapshot), let .alreadyReady(snapshot):
+            XCTAssertEqual(snapshot.requestGeneration, currentGeneration)
+        case .unavailable, .busy, .rejected, .cancelled:
+            XCTFail("Expected ready rebuilt demand, got \(result).")
+        }
+    }
+
     func testDemandWarmLocatorAndCASBypassUnstartedManifestAdoption() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
@@ -4651,7 +4775,8 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
     private func publishVerifiedManifestRecord(
         fixture: EngineFixture,
         runtime: CodeMapArtifactRuntime,
-        ready: WorkspaceCodemapLiveReadySnapshot
+        ready: WorkspaceCodemapLiveReadySnapshot,
+        bindingGeneration: UInt64? = nil
     ) async throws -> CodeMapRootManifestRecord {
         let capabilityState = await fixture.capabilityService.state(for: fixture.rootEpoch)
         let capability = try eligible(capabilityState)
@@ -4721,7 +4846,7 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             association: association,
             contribution: contribution,
             authority: authority,
-            bindingGeneration: ready.requestGeneration
+            bindingGeneration: bindingGeneration ?? ready.requestGeneration
         )
         _ = try await runtime.manifestStore.replaceCurrentManifest(
             namespace: namespace,
@@ -5126,7 +5251,10 @@ private struct EngineFixture {
         path: String,
         owner: WorkspaceCodemapLiveDemandOwner = WorkspaceCodemapLiveDemandOwner(),
         priority: CodeMapArtifactBuildPriority = .demand,
-        language: LanguageType = .swift
+        language: LanguageType = .swift,
+        requestGeneration: UInt64 = 1,
+        pathGeneration: UInt64 = 1,
+        ingressGeneration: UInt64 = 1
     ) -> WorkspaceCodemapBindingDemand {
         let identity = WorkspaceCodemapArtifactBindingIdentity(
             rootID: rootEpoch.rootID,
@@ -5139,10 +5267,10 @@ private struct EngineFixture {
         return WorkspaceCodemapBindingDemand(
             owner: owner,
             identity: identity,
-            requestGeneration: 1,
+            requestGeneration: requestGeneration,
             catalogGeneration: 1,
-            pathGeneration: 1,
-            ingressGeneration: 1,
+            pathGeneration: pathGeneration,
+            ingressGeneration: ingressGeneration,
             priority: priority,
             language: language
         )
@@ -5167,6 +5295,26 @@ private actor EngineAsyncCounter {
     private(set) var value = 0
     func increment() {
         value += 1
+    }
+}
+
+private actor EngineManifestBindingResolutionRecorder {
+    struct Entry: Equatable {
+        let relativePath: String
+        let requestGeneration: UInt64
+        let pathGeneration: UInt64
+        let ingressGeneration: UInt64
+    }
+
+    private(set) var entries: [Entry] = []
+
+    func record(_ candidate: WorkspaceCodemapManifestBindingCandidate) {
+        entries.append(Entry(
+            relativePath: candidate.identity.standardizedRelativePath,
+            requestGeneration: candidate.requestGeneration,
+            pathGeneration: candidate.pathGeneration,
+            ingressGeneration: candidate.ingressGeneration
+        ))
     }
 }
 

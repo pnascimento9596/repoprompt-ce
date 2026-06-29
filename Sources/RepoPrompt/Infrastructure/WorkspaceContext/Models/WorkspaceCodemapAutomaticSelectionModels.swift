@@ -107,6 +107,11 @@ enum WorkspaceCodemapAutomaticSelectionPartialReason: Equatable {
     case graph(WorkspaceCodemapStoreSelectionGraphPartialReason)
     case source(WorkspaceCodemapAutomaticSelectionSourceIssue)
     case sourceDemandTimedOut(WorkspaceCodemapAutomaticSelectionSourceIdentity)
+    case candidateUnavailable(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        fileID: UUID,
+        reason: WorkspaceCodemapArtifactDemandUnavailableReason
+    )
 }
 
 enum WorkspaceCodemapAutomaticSelectionIncompleteReason: Equatable {
@@ -176,6 +181,11 @@ enum WorkspaceCodemapAutomaticSelectionCoverage: Equatable {
         proof: WorkspaceCodemapProjectionCoverageProof,
         reasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
     )
+    case provisional(
+        incomplete: [WorkspaceCodemapAutomaticSelectionIncompleteReason],
+        pending: [WorkspaceCodemapAutomaticSelectionPendingReason],
+        partial: [WorkspaceCodemapAutomaticSelectionPartialReason]
+    )
     case incomplete([WorkspaceCodemapAutomaticSelectionIncompleteReason])
     case pending([WorkspaceCodemapAutomaticSelectionPendingReason])
     case unavailable(WorkspaceCodemapAutomaticSelectionUnavailableReason)
@@ -189,6 +199,11 @@ enum WorkspaceCodemapAutomaticSelectionAggregateCoverage: Equatable {
     case partial(
         proofs: [WorkspaceCodemapProjectionCoverageProof],
         reasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
+    )
+    case provisional(
+        incomplete: [WorkspaceCodemapAutomaticSelectionIncompleteReason],
+        pending: [WorkspaceCodemapAutomaticSelectionPendingReason],
+        partial: [WorkspaceCodemapAutomaticSelectionPartialReason]
     )
     case incomplete([WorkspaceCodemapAutomaticSelectionIncompleteReason])
     case pending([WorkspaceCodemapAutomaticSelectionPendingReason])
@@ -235,6 +250,316 @@ struct WorkspaceCodemapAutomaticSelectionRootResult: Equatable {
     }
 }
 
+enum WorkspaceCodemapAutomaticSelectionPublicationBasis: Equatable {
+    case projectionCoverage
+    case provisionalCandidates([WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate])
+}
+
+struct WorkspaceCodemapRootScopedFileSlot: Hashable {
+    let rootEpoch: WorkspaceCodemapRootEpoch
+    let fileID: UUID
+
+    init(rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID) {
+        self.rootEpoch = rootEpoch
+        self.fileID = fileID
+    }
+
+    init(candidate: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate) {
+        self.init(rootEpoch: candidate.rootEpoch, fileID: candidate.identity.fileID)
+    }
+
+    init(target: WorkspaceCodemapAutomaticSelectionTarget) {
+        self.init(rootEpoch: target.rootEpoch, fileID: target.fileID)
+    }
+
+    init(ticket: WorkspaceCodemapArtifactDemandTicket) {
+        self.init(rootEpoch: ticket.rootEpoch, fileID: ticket.fileID)
+    }
+
+    init(source: WorkspaceCodemapAutomaticSelectionSourceIdentity) {
+        self.init(rootEpoch: source.rootEpoch, fileID: source.fileID)
+    }
+}
+
+func workspaceCodemapRootEpochPrecedes(
+    _ lhs: WorkspaceCodemapRootEpoch,
+    _ rhs: WorkspaceCodemapRootEpoch
+) -> Bool {
+    if lhs.rootID != rhs.rootID { return lhs.rootID.uuidString < rhs.rootID.uuidString }
+    return lhs.rootLifetimeID.uuidString < rhs.rootLifetimeID.uuidString
+}
+
+func automaticSelectionCandidatePrecedes(
+    _ lhs: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate,
+    _ rhs: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate
+) -> Bool {
+    if lhs.rootEpoch != rhs.rootEpoch {
+        return workspaceCodemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch)
+    }
+    if lhs.identity.standardizedRelativePath != rhs.identity.standardizedRelativePath {
+        return lhs.identity.standardizedRelativePath.utf8.lexicographicallyPrecedes(
+            rhs.identity.standardizedRelativePath.utf8
+        )
+    }
+    return lhs.identity.fileID.uuidString < rhs.identity.fileID.uuidString
+}
+
+func automaticSelectionPendingReasonPrecedes(
+    _ lhs: WorkspaceCodemapAutomaticSelectionPendingReason,
+    _ rhs: WorkspaceCodemapAutomaticSelectionPendingReason
+) -> Bool {
+    automaticSelectionIssueSortKey(lhs) < automaticSelectionIssueSortKey(rhs)
+}
+
+func automaticSelectionPartialReasonPrecedes(
+    _ lhs: WorkspaceCodemapAutomaticSelectionPartialReason,
+    _ rhs: WorkspaceCodemapAutomaticSelectionPartialReason
+) -> Bool {
+    automaticSelectionIssueSortKey(lhs) < automaticSelectionIssueSortKey(rhs)
+}
+
+private struct WorkspaceCodemapAutomaticSelectionIssueSortKey: Comparable {
+    let components: [String]
+
+    static func < (
+        lhs: WorkspaceCodemapAutomaticSelectionIssueSortKey,
+        rhs: WorkspaceCodemapAutomaticSelectionIssueSortKey
+    ) -> Bool {
+        lhs.components.lexicographicallyPrecedes(rhs.components)
+    }
+}
+
+private func automaticSelectionIssueSortKey(
+    _ reason: WorkspaceCodemapAutomaticSelectionPendingReason
+) -> WorkspaceCodemapAutomaticSelectionIssueSortKey {
+    switch reason {
+    case let .sourceDemand(source, ticket):
+        automaticSelectionIssueSortKey(
+            tag: "sourceDemand",
+            source: source,
+            details: automaticSelectionTicketSortComponents(ticket)
+        )
+    case let .sourceBusy(source, attempts):
+        automaticSelectionIssueSortKey(
+            tag: "sourceBusy",
+            source: source,
+            details: [String(attempts)]
+        )
+    case let .candidateDemand(rootEpoch, fileID, ticket):
+        automaticSelectionIssueSortKey(
+            tag: "candidateDemand",
+            rootEpoch: rootEpoch,
+            fileID: fileID,
+            details: automaticSelectionTicketSortComponents(ticket)
+        )
+    case let .candidateBusy(rootEpoch, fileID, attempts):
+        automaticSelectionIssueSortKey(
+            tag: "candidateBusy",
+            rootEpoch: rootEpoch,
+            fileID: fileID,
+            details: [String(attempts)]
+        )
+    case let .manifestAdmission(rootEpoch):
+        automaticSelectionIssueSortKey(tag: "manifestAdmission", rootEpoch: rootEpoch)
+    case let .graphRebuild(rootEpoch):
+        automaticSelectionIssueSortKey(tag: "graphRebuild", rootEpoch: rootEpoch)
+    }
+}
+
+private func automaticSelectionIssueSortKey(
+    _ reason: WorkspaceCodemapAutomaticSelectionPartialReason
+) -> WorkspaceCodemapAutomaticSelectionIssueSortKey {
+    switch reason {
+    case let .graph(reason):
+        WorkspaceCodemapAutomaticSelectionIssueSortKey(
+            components: ["graph"] + automaticSelectionGraphPartialReasonSortComponents(reason)
+        )
+    case let .source(issue):
+        WorkspaceCodemapAutomaticSelectionIssueSortKey(
+            components: ["source"] + automaticSelectionSourceIssueSortKey(issue).components
+        )
+    case let .sourceDemandTimedOut(source):
+        automaticSelectionIssueSortKey(tag: "sourceDemandTimedOut", source: source)
+    case let .candidateUnavailable(rootEpoch, fileID, reason):
+        automaticSelectionIssueSortKey(
+            tag: "candidateUnavailable",
+            rootEpoch: rootEpoch,
+            fileID: fileID,
+            details: automaticSelectionUnavailableReasonSortComponents(reason)
+        )
+    }
+}
+
+private func automaticSelectionSourceIssueSortKey(
+    _ issue: WorkspaceCodemapAutomaticSelectionSourceIssue
+) -> WorkspaceCodemapAutomaticSelectionIssueSortKey {
+    switch issue {
+    case let .outsideRootScope(source):
+        automaticSelectionIssueSortKey(tag: "outsideRootScope", source: source)
+    case let .notCataloged(source):
+        automaticSelectionIssueSortKey(tag: "notCataloged", source: source)
+    case let .notDemanded(source):
+        automaticSelectionIssueSortKey(tag: "notDemanded", source: source)
+    case let .pending(source, ticket):
+        automaticSelectionIssueSortKey(
+            tag: "pending",
+            source: source,
+            details: automaticSelectionTicketSortComponents(ticket)
+        )
+    case let .unavailable(source, reason):
+        automaticSelectionIssueSortKey(
+            tag: "unavailable",
+            source: source,
+            details: automaticSelectionUnavailableReasonSortComponents(reason)
+        )
+    case let .staleCatalogGeneration(source, currentCatalogGeneration):
+        automaticSelectionIssueSortKey(
+            tag: "staleCatalogGeneration",
+            source: source,
+            details: [automaticSelectionOptionalUInt64SortComponent(currentCatalogGeneration)]
+        )
+    }
+}
+
+private func automaticSelectionIssueSortKey(
+    tag: String,
+    source: WorkspaceCodemapAutomaticSelectionSourceIdentity,
+    details: [String] = []
+) -> WorkspaceCodemapAutomaticSelectionIssueSortKey {
+    automaticSelectionIssueSortKey(
+        tag: tag,
+        rootEpoch: source.rootEpoch,
+        fileID: source.fileID,
+        details: [String(source.catalogGeneration)] + details
+    )
+}
+
+private func automaticSelectionIssueSortKey(
+    tag: String,
+    rootEpoch: WorkspaceCodemapRootEpoch? = nil,
+    fileID: UUID? = nil,
+    details: [String] = []
+) -> WorkspaceCodemapAutomaticSelectionIssueSortKey {
+    var components = [tag]
+    if let rootEpoch {
+        components.append(contentsOf: automaticSelectionRootEpochSortComponents(rootEpoch))
+    } else {
+        components.append(contentsOf: ["", ""])
+    }
+    components.append(fileID?.uuidString ?? "")
+    components.append(contentsOf: details)
+    return WorkspaceCodemapAutomaticSelectionIssueSortKey(components: components)
+}
+
+private func automaticSelectionRootEpochSortComponents(
+    _ rootEpoch: WorkspaceCodemapRootEpoch
+) -> [String] {
+    [rootEpoch.rootID.uuidString, rootEpoch.rootLifetimeID.uuidString]
+}
+
+private func automaticSelectionTicketSortComponents(
+    _ ticket: WorkspaceCodemapArtifactDemandTicket
+) -> [String] {
+    [
+        ticket.retainID.uuidString,
+        ticket.requestID.uuidString
+    ] + automaticSelectionRootEpochSortComponents(ticket.rootEpoch) + [
+        ticket.fileID.uuidString,
+        String(ticket.requestGeneration),
+        String(ticket.catalogGeneration),
+        String(ticket.pathGeneration),
+        String(ticket.ingressGeneration)
+    ]
+}
+
+private func automaticSelectionGraphPartialReasonSortComponents(
+    _ reason: WorkspaceCodemapStoreSelectionGraphPartialReason
+) -> [String] {
+    switch reason {
+    case .referenceFailuresPresent: ["referenceFailuresPresent"]
+    case .sourceCoverageIncomplete: ["sourceCoverageIncomplete"]
+    }
+}
+
+private func automaticSelectionUnavailableReasonSortComponents(
+    _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+) -> [String] {
+    switch reason {
+    case .rootNotLoaded: ["rootNotLoaded"]
+    case .fileNotCataloged: ["fileNotCataloged"]
+    case .unsupportedFileType: ["unsupportedFileType"]
+    case let .gitTerminal(reason): ["gitTerminal", reason.rawValue]
+    case let .gitTransient(reason): ["gitTransient", reason.rawValue]
+    case let .demandUnavailable(reason):
+        ["demandUnavailable"] + automaticSelectionDemandUnavailableReasonSortComponents(reason)
+    case let .busy(retryAfterMilliseconds):
+        ["busy", automaticSelectionOptionalIntSortComponent(retryAfterMilliseconds)]
+    case let .rejected(reason):
+        ["rejected"] + automaticSelectionDemandRejectionSortComponents(reason)
+    case .routeConflict: ["routeConflict"]
+    case .registrationFailed: ["registrationFailed"]
+    case .runtimeFailure: ["runtimeFailure"]
+    case .staleCurrentness: ["staleCurrentness"]
+    case .cancelled: ["cancelled"]
+    }
+}
+
+private func automaticSelectionDemandUnavailableReasonSortComponents(
+    _ reason: WorkspaceCodemapBindingDemandUnavailableReason
+) -> [String] {
+    switch reason {
+    case .unsupportedFileType: ["unsupportedFileType"]
+    case .missing: ["missing"]
+    case .securityExcluded: ["securityExcluded"]
+    case .nonRegular: ["nonRegular"]
+    case .oversized: ["oversized"]
+    case .transient: ["transient"]
+    case let .terminalArtifact(outcome):
+        ["terminalArtifact"] + automaticSelectionLiveArtifactOutcomeSortComponents(outcome)
+    }
+}
+
+private func automaticSelectionDemandRejectionSortComponents(
+    _ reason: WorkspaceCodemapBindingDemandRejection
+) -> [String] {
+    switch reason {
+    case .rootNotRegistered: ["rootNotRegistered"]
+    case .capabilityUnavailable: ["capabilityUnavailable"]
+    case .rootEpochMismatch: ["rootEpochMismatch"]
+    case .rootPathMismatch: ["rootPathMismatch"]
+    case .invalidIdentity: ["invalidIdentity"]
+    case .catalogGenerationMismatch: ["catalogGenerationMismatch"]
+    case .requestGenerationInvalid: ["requestGenerationInvalid"]
+    case .stalePathGeneration: ["stalePathGeneration"]
+    case .staleIngressGeneration: ["staleIngressGeneration"]
+    case .languageMismatch: ["languageMismatch"]
+    case .classificationMismatch: ["classificationMismatch"]
+    case .sourceAuthorityUnavailable: ["sourceAuthorityUnavailable"]
+    case .overlayRejected: ["overlayRejected"]
+    case .staleCompletion: ["staleCompletion"]
+    }
+}
+
+private func automaticSelectionLiveArtifactOutcomeSortComponents(
+    _ outcome: WorkspaceCodemapLiveArtifactOutcome
+) -> [String] {
+    switch outcome {
+    case .ready: ["ready"]
+    case .readyNoSymbols: ["readyNoSymbols"]
+    case .oversize: ["oversize"]
+    case .decodeFailed: ["decodeFailed"]
+    case .parseFailed: ["parseFailed"]
+    }
+}
+
+private func automaticSelectionOptionalIntSortComponent(_ value: Int?) -> String {
+    value.map { String($0) } ?? "nil"
+}
+
+private func automaticSelectionOptionalUInt64SortComponent(_ value: UInt64?) -> String {
+    value.map { String($0) } ?? "nil"
+}
+
 struct WorkspaceCodemapAutomaticSelectionPublicationReceipt: Equatable {
     let requestID: UUID
     let rootScope: WorkspaceLookupRootScope
@@ -243,6 +568,7 @@ struct WorkspaceCodemapAutomaticSelectionPublicationReceipt: Equatable {
     let graphKeys: [WorkspaceCodemapSelectionGraphRuntimeKey]
     let coverageProofs: [WorkspaceCodemapProjectionCoverageProof]
     let targets: [WorkspaceCodemapAutomaticSelectionTarget]
+    let publicationBasis: WorkspaceCodemapAutomaticSelectionPublicationBasis
     let publicationPermit: WorkspaceCodemapAutomaticSelectionPublicationPermit
     let publicationLease: WorkspaceCodemapAutomaticSelectionPublicationLease?
 
@@ -254,6 +580,7 @@ struct WorkspaceCodemapAutomaticSelectionPublicationReceipt: Equatable {
         graphKeys: [WorkspaceCodemapSelectionGraphRuntimeKey],
         coverageProofs: [WorkspaceCodemapProjectionCoverageProof],
         targets: [WorkspaceCodemapAutomaticSelectionTarget],
+        publicationBasis: WorkspaceCodemapAutomaticSelectionPublicationBasis = .projectionCoverage,
         publicationPermit: WorkspaceCodemapAutomaticSelectionPublicationPermit,
         publicationLease: WorkspaceCodemapAutomaticSelectionPublicationLease? = nil
     ) {
@@ -264,6 +591,7 @@ struct WorkspaceCodemapAutomaticSelectionPublicationReceipt: Equatable {
         self.graphKeys = graphKeys
         self.coverageProofs = coverageProofs
         self.targets = targets
+        self.publicationBasis = publicationBasis
         self.publicationPermit = publicationPermit
         self.publicationLease = publicationLease
     }
@@ -321,7 +649,7 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
 
     var targets: [WorkspaceCodemapAutomaticSelectionTarget] {
         switch aggregateCoverage {
-        case .complete, .partial:
+        case .complete, .partial, .provisional:
             roots.flatMap(\.targets)
         case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
             []
@@ -333,6 +661,10 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
     ) -> WorkspaceCodemapAutomaticSelectionAggregateCoverage {
         var proofs: [WorkspaceCodemapProjectionCoverageProof] = []
         var partial: [WorkspaceCodemapAutomaticSelectionPartialReason] = []
+        var provisionalIncomplete: [WorkspaceCodemapAutomaticSelectionIncompleteReason] = []
+        var provisionalPending: [WorkspaceCodemapAutomaticSelectionPendingReason] = []
+        var provisionalPartial: [WorkspaceCodemapAutomaticSelectionPartialReason] = []
+        var sawProvisional = false
         for root in roots {
             switch root.coverage {
             case let .complete(proof):
@@ -340,6 +672,11 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
             case let .partial(proof, reasons):
                 proofs.append(proof)
                 partial.append(contentsOf: reasons)
+            case let .provisional(incomplete, pending, provisionalReasons):
+                sawProvisional = true
+                provisionalIncomplete.append(contentsOf: incomplete)
+                provisionalPending.append(contentsOf: pending)
+                provisionalPartial.append(contentsOf: provisionalReasons)
             case let .incomplete(reasons):
                 return .incomplete(reasons)
             case let .pending(reasons):
@@ -354,6 +691,13 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
                 return .budget(.graph(rootEpoch: root.rootEpoch, reason: reason))
             }
         }
+        if sawProvisional {
+            return .provisional(
+                incomplete: provisionalIncomplete,
+                pending: provisionalPending,
+                partial: partial + provisionalPartial
+            )
+        }
         return partial.isEmpty ? .complete(proofs) : .partial(proofs: proofs, reasons: partial)
     }
 
@@ -364,15 +708,24 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
         guard let receipt,
               receipt.publicationPermit.withCurrent({ true }) == true
         else { return nil }
-        let proofs: [WorkspaceCodemapProjectionCoverageProof]
         switch coverage {
-        case let .complete(coverageProofs):
-            proofs = coverageProofs
-        case let .partial(coverageProofs, _):
-            proofs = coverageProofs
+        case let .complete(coverageProofs), let .partial(coverageProofs, _):
+            guard receipt.publicationBasis == .projectionCoverage,
+                  receipt.coverageProofs == coverageProofs
+            else { return nil }
+            return receipt
+        case .provisional:
+            guard case let .provisionalCandidates(candidates) = receipt.publicationBasis,
+                  receipt.coverageProofs.isEmpty,
+                  receipt.graphKeys.isEmpty,
+                  !receipt.targets.isEmpty,
+                  candidates.count == receipt.targets.count
+            else { return nil }
+            let candidateSlots = Set(candidates.map { WorkspaceCodemapRootScopedFileSlot(candidate: $0) })
+            let targetSlots = Set(receipt.targets.map { WorkspaceCodemapRootScopedFileSlot(target: $0) })
+            return candidateSlots == targetSlots ? receipt : nil
         case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
             return nil
         }
-        return receipt.coverageProofs == proofs ? receipt : nil
     }
 }

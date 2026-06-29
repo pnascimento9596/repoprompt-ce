@@ -4356,7 +4356,9 @@ actor WorkspaceCodemapBindingEngine {
                   candidate.identity.standardizedRootPath ==
                   initial.registration.capabilityRequest.loadedRootURL.path,
                   candidate.identity.standardizedRelativePath == loadedPath,
-                  candidate.ingressGeneration == initial.registration.ingressGeneration
+                  candidate.ingressGeneration == initial.registration.ingressGeneration,
+                  candidate.requestGeneration == candidate.pathGeneration,
+                  candidate.pathGeneration == record.bindingGeneration
             else { continue }
 
             let classificationBatch = await identityService.classify(

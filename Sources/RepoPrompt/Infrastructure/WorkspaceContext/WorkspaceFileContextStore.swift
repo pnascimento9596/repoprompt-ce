@@ -470,11 +470,6 @@ actor WorkspaceFileContextStore {
         var task: Task<Void, Never>?
     }
 
-    private struct CodemapGraphSourceSlot: Hashable {
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let fileID: UUID
-    }
-
     private final class CodemapAutomaticSelectionWeakPublicationPermit {
         weak var permit: WorkspaceCodemapAutomaticSelectionPublicationPermit?
 
@@ -10541,29 +10536,14 @@ actor WorkspaceFileContextStore {
                 )))
             }
         }
-        if !provisionalCandidates.isEmpty {
-            provisionalCandidates.sort {
-                let lhsRoot = WorkspaceCodemapRootEpoch(
-                    rootID: $0.identity.rootID,
-                    rootLifetimeID: $0.identity.rootLifetimeID
-                )
-                let rhsRoot = WorkspaceCodemapRootEpoch(
-                    rootID: $1.identity.rootID,
-                    rootLifetimeID: $1.identity.rootLifetimeID
-                )
-                if lhsRoot != rhsRoot { return codemapRootEpochPrecedes(lhsRoot, rhsRoot) }
-                if $0.identity.standardizedRelativePath != $1.identity.standardizedRelativePath {
-                    return $0.identity.standardizedRelativePath.utf8.lexicographicallyPrecedes(
-                        $1.identity.standardizedRelativePath.utf8
-                    )
-                }
-                return $0.identity.fileID.uuidString < $1.identity.fileID.uuidString
-            }
-            return .provisional(WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan(
-                candidates: provisionalCandidates,
+        let provisionalFallbackDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition? = if !provisionalCandidates.isEmpty {
+            .provisional(WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan(
+                candidates: provisionalCandidates.sorted(by: automaticSelectionCandidatePrecedes),
                 rootScopeEpochs: rootScopeEpochs,
                 incompleteReasons: provisionalIncompleteReasons
             ))
+        } else {
+            nil
         }
 
         let basePolicy = selectionGraphQueryBudgetPolicy
@@ -10605,7 +10585,7 @@ actor WorkspaceFileContextStore {
         switch disposition {
         case let .readyPartial(queryResult):
             guard queryResult.roots.count == orderedRootEpochs.count else {
-                return .unavailable(.graph(.invalidGraphResult(orderedRootEpochs[0])))
+                return provisionalFallbackDisposition ?? .unavailable(.graph(.invalidGraphResult(orderedRootEpochs[0])))
             }
             let selectedFileIDs = Set(sources.map(\.fileID))
             var plannedCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
@@ -10621,7 +10601,7 @@ actor WorkspaceFileContextStore {
                       candidateCount == supportedCandidateCount,
                       proof.catalogCompletion.supportedCandidateCount == candidateCount,
                       automaticSelectionCoverageProofIsCurrent(proof)
-                else { return .stale(.coverageProof(rootEpoch)) }
+                else { return provisionalFallbackDisposition ?? .stale(.coverageProof(rootEpoch)) }
                 for endpoint in rootResult.result.targets where !selectedFileIDs.contains(endpoint.fileID) {
                     guard let candidate = automaticSelectionCatalogCandidate(
                         endpoint: endpoint,
@@ -10633,47 +10613,33 @@ actor WorkspaceFileContextStore {
                 }
                 coverageProofs.append(proof)
             }
-            plannedCandidates.sort {
-                let lhsEpoch = WorkspaceCodemapRootEpoch(
-                    rootID: $0.identity.rootID,
-                    rootLifetimeID: $0.identity.rootLifetimeID
-                )
-                let rhsEpoch = WorkspaceCodemapRootEpoch(
-                    rootID: $1.identity.rootID,
-                    rootLifetimeID: $1.identity.rootLifetimeID
-                )
-                if lhsEpoch != rhsEpoch { return codemapRootEpochPrecedes(lhsEpoch, rhsEpoch) }
-                if $0.identity.standardizedRelativePath != $1.identity.standardizedRelativePath {
-                    return $0.identity.standardizedRelativePath.utf8.lexicographicallyPrecedes(
-                        $1.identity.standardizedRelativePath.utf8
-                    )
-                }
-                return $0.identity.fileID.uuidString < $1.identity.fileID.uuidString
-            }
+            plannedCandidates.sort(by: automaticSelectionCandidatePrecedes)
             return .ready(WorkspaceCodemapAutomaticSelectionCandidatePlan(
                 candidates: plannedCandidates,
                 rootScopeEpochs: rootScopeEpochs,
                 coverageProofs: coverageProofs
             ))
         case let .incomplete(reason):
-            return .incomplete([.graph(reason)])
+            return provisionalFallbackDisposition ?? .incomplete([.graph(reason)])
         case let .busy(reason):
-            return .busy(reason)
+            return provisionalFallbackDisposition ?? .busy(reason)
         case let .unavailable(reason):
-            return .unavailable(.graph(reason))
+            return provisionalFallbackDisposition ?? .unavailable(.graph(reason))
         case let .stale(reason):
-            return .stale(.graph(reason))
+            return provisionalFallbackDisposition ?? .stale(.graph(reason))
         case let .budget(reason):
-            if case let .targetLimit(attempted, _) = reason {
-                return .budget(.candidateDemandLimit(
+            let budgetDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition = if case let .targetLimit(attempted, _) = reason {
+                .budget(.candidateDemandLimit(
                     attempted: attempted,
                     limit: maximumCandidateDemandCount
                 ))
+            } else {
+                .budget(codemapAutomaticSelectionBudgetReason(
+                    reason,
+                    rootEpoch: orderedRootEpochs.first
+                ))
             }
-            return .budget(codemapAutomaticSelectionBudgetReason(
-                reason,
-                rootEpoch: orderedRootEpochs.first
-            ))
+            return provisionalFallbackDisposition ?? budgetDisposition
         }
     }
 
@@ -10821,6 +10787,228 @@ actor WorkspaceFileContextStore {
             else { return false }
         }
         return true
+    }
+
+    func provisionalAutomaticCodemapSelectionResult(
+        sources: [WorkspaceCodemapAutomaticSelectionSourceIdentity],
+        plan: WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan,
+        readyCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate],
+        pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason],
+        partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason],
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspaceCodemapAutomaticSelectionResult {
+        guard codemapAutomaticSelectionRootScopeEpochs(rootScope) == plan.rootScopeEpochs else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .stale(.publicationReceipt)
+            )
+        }
+
+        var sourceTickets: [WorkspaceCodemapArtifactDemandTicket] = []
+        sourceTickets.reserveCapacity(sources.count)
+        for source in sources {
+            guard let record = codemapSessionsByRootEpoch[source.rootEpoch]?
+                .demandsByFileID[source.fileID],
+                case let .ready(ready) = record.result,
+                codemapTicketsShareDemand(record.ticket, ready.ticket),
+                codemapDemandIsCurrent(ready.ticket),
+                ready.snapshot.requestGeneration == ready.ticket.requestGeneration
+            else {
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .stale(.sourceStateChanged(source))
+                )
+            }
+            sourceTickets.append(ready.ticket)
+        }
+
+        let sourceSlots = Set(sources.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        var selectedCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var seenCandidateSlots = Set<WorkspaceCodemapRootScopedFileSlot>()
+        for candidate in readyCandidates.sorted(by: automaticSelectionCandidatePrecedes) {
+            let slot = WorkspaceCodemapRootScopedFileSlot(candidate: candidate)
+            guard seenCandidateSlots.insert(slot).inserted else { continue }
+            selectedCandidates.append(candidate)
+        }
+
+        var targetCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var targets: [WorkspaceCodemapAutomaticSelectionTarget] = []
+        var provisionalPartial = partialReasons
+        for candidate in selectedCandidates {
+            let rootEpoch = candidate.rootEpoch
+            let slot = WorkspaceCodemapRootScopedFileSlot(candidate: candidate)
+            guard !sourceSlots.contains(slot),
+                  provisionalAutomaticSelectionCandidateDemandIsCurrent(
+                      candidate: candidate,
+                      rootScope: rootScope,
+                      rootScopeEpochs: plan.rootScopeEpochs
+                  ),
+                  let state = rootStatesByID[rootEpoch.rootID],
+                  let file = filesByID[candidate.identity.fileID],
+                  let session = codemapSessionsByRootEpoch[rootEpoch],
+                  let record = session.demandsByFileID[file.id],
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(record.ticket, ready.ticket),
+                  ready.ticket.requestGeneration == candidate.requestGeneration,
+                  ready.snapshot.requestGeneration == candidate.requestGeneration,
+                  codemapDemandIsCurrent(ready.ticket),
+                  let logicalPath = WorkspaceCodemapLogicalPresentationPath(
+                      rootDisplayName: state.root.name,
+                      standardizedRelativePath: file.standardizedRelativePath
+                  )
+            else {
+                // Revalidation cannot distinguish unavailable causes here; staleCurrentness is the conservative catch-all.
+                provisionalPartial.append(.candidateUnavailable(
+                    rootEpoch: rootEpoch,
+                    fileID: candidate.identity.fileID,
+                    reason: .staleCurrentness
+                ))
+                continue
+            }
+            targetCandidates.append(candidate)
+            targets.append(WorkspaceCodemapAutomaticSelectionTarget(
+                rootEpoch: rootEpoch,
+                fileID: file.id,
+                catalogGeneration: candidate.catalogGeneration,
+                requestGeneration: candidate.requestGeneration,
+                logicalPath: logicalPath
+            ))
+        }
+
+        targets.sort(by: automaticSelectionTargetPrecedes)
+        let targetSlots = Set(targets.map { WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID) })
+        targetCandidates.sort(by: automaticSelectionCandidatePrecedes)
+        let diagnosticRootEpochs = Set(
+            plan.incompleteReasons.compactMap(automaticSelectionIncompleteReasonRootEpoch) +
+                pendingReasons.compactMap(automaticSelectionPendingReasonRootEpoch) +
+                provisionalPartial.compactMap(automaticSelectionPartialReasonRootEpoch) +
+                sources.map(\.rootEpoch) +
+                targetSlots.map(\.rootEpoch)
+        )
+        let orderedRootEpochs = diagnosticRootEpochs.sorted(by: codemapRootEpochPrecedes)
+        let fallbackRootEpoch = orderedRootEpochs.first
+        let roots: [WorkspaceCodemapAutomaticSelectionRootResult] = orderedRootEpochs.map { rootEpoch in
+            let rootTargets = targets.filter { $0.rootEpoch == rootEpoch }
+            let rootIncomplete = plan.incompleteReasons.filter {
+                automaticSelectionIncompleteReasonRootEpoch($0) == rootEpoch
+            }
+            let rootPending = pendingReasons.filter {
+                automaticSelectionPendingReasonRootEpoch($0) == rootEpoch
+            }
+            let rootPartial = provisionalPartial.filter {
+                let reasonRoot = automaticSelectionPartialReasonRootEpoch($0)
+                return reasonRoot == rootEpoch || (reasonRoot == nil && rootEpoch == fallbackRootEpoch)
+            }
+            return WorkspaceCodemapAutomaticSelectionRootResult(
+                rootEpoch: rootEpoch,
+                targets: rootTargets,
+                sourceIssues: [],
+                targetIssues: [],
+                coverage: .provisional(
+                    incomplete: rootIncomplete,
+                    pending: rootPending,
+                    partial: rootPartial
+                )
+            )
+        }
+        let aggregateCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage.provisional(
+            incomplete: plan.incompleteReasons,
+            pending: pendingReasons,
+            partial: provisionalPartial
+        )
+        guard !targets.isEmpty else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: roots,
+                aggregateCoverage: aggregateCoverage
+            )
+        }
+        guard Set(targets).count == targets.count,
+              targetCandidates.count == targets.count
+        else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .stale(.publicationReceipt)
+            )
+        }
+        let requestID = UUID()
+        let publicationPermit = WorkspaceCodemapAutomaticSelectionPublicationPermit()
+        registerAutomaticSelectionPublicationPermit(
+            publicationPermit,
+            requestID: requestID,
+            rootScopeEpochs: plan.rootScopeEpochs
+        )
+        let receipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: requestID,
+            rootScope: rootScope,
+            rootScopeEpochs: plan.rootScopeEpochs,
+            sourceTickets: sourceTickets,
+            graphKeys: [],
+            coverageProofs: [],
+            targets: targets,
+            publicationBasis: .provisionalCandidates(targetCandidates),
+            publicationPermit: publicationPermit
+        )
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: roots,
+            aggregateCoverage: aggregateCoverage,
+            publicationReceipt: receipt
+        )
+    }
+
+    private func automaticSelectionTargetPrecedes(
+        _ lhs: WorkspaceCodemapAutomaticSelectionTarget,
+        _ rhs: WorkspaceCodemapAutomaticSelectionTarget
+    ) -> Bool {
+        if lhs.rootEpoch != rhs.rootEpoch { return codemapRootEpochPrecedes(lhs.rootEpoch, rhs.rootEpoch) }
+        if lhs.logicalPath.standardizedRelativePath != rhs.logicalPath.standardizedRelativePath {
+            return lhs.logicalPath.standardizedRelativePath.utf8.lexicographicallyPrecedes(
+                rhs.logicalPath.standardizedRelativePath.utf8
+            )
+        }
+        return lhs.fileID.uuidString < rhs.fileID.uuidString
+    }
+
+    private func automaticSelectionIncompleteReasonRootEpoch(
+        _ reason: WorkspaceCodemapAutomaticSelectionIncompleteReason
+    ) -> WorkspaceCodemapRootEpoch? {
+        switch reason {
+        case let .graph(.definitionUniverse(rootEpoch, _, _, _)):
+            rootEpoch
+        }
+    }
+
+    private func automaticSelectionPendingReasonRootEpoch(
+        _ reason: WorkspaceCodemapAutomaticSelectionPendingReason
+    ) -> WorkspaceCodemapRootEpoch? {
+        switch reason {
+        case let .sourceDemand(source, _), let .sourceBusy(source, _):
+            source.rootEpoch
+        case let .candidateDemand(rootEpoch, _, _), let .candidateBusy(rootEpoch, _, _),
+             let .manifestAdmission(rootEpoch), let .graphRebuild(rootEpoch):
+            rootEpoch
+        }
+    }
+
+    private func automaticSelectionPartialReasonRootEpoch(
+        _ reason: WorkspaceCodemapAutomaticSelectionPartialReason
+    ) -> WorkspaceCodemapRootEpoch? {
+        switch reason {
+        case .graph:
+            nil
+        case let .source(issue):
+            switch issue {
+            case let .outsideRootScope(source), let .notCataloged(source),
+                 let .notDemanded(source), let .pending(source, _),
+                 let .unavailable(source, _), let .staleCatalogGeneration(source, _):
+                source.rootEpoch
+            }
+        case let .sourceDemandTimedOut(source):
+            source.rootEpoch
+        case let .candidateUnavailable(rootEpoch, _, _):
+            rootEpoch
+        }
     }
 
     private func registerAutomaticSelectionPublicationPermit(
@@ -11041,7 +11229,7 @@ actor WorkspaceFileContextStore {
             switch rootResult.coverage {
             case .complete, .partial:
                 break
-            case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
+            case .provisional, .incomplete, .pending, .unavailable, .stale, .busy, .budget:
                 return WorkspaceCodemapAutomaticSelectionResult(roots: [rootResult])
             }
 
@@ -11113,7 +11301,7 @@ actor WorkspaceFileContextStore {
             coverageProofs = proofs
         case let .partial(proofs, _):
             coverageProofs = proofs
-        case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
+        case .provisional, .incomplete, .pending, .unavailable, .stale, .busy, .budget:
             return WorkspaceCodemapAutomaticSelectionResult(
                 roots: rootResults,
                 aggregateCoverage: aggregate
@@ -11124,10 +11312,10 @@ actor WorkspaceFileContextStore {
         let graphKeys = rootResults.compactMap(\.graphKey)
         let resultRootEpochs = rootResults.map(\.rootEpoch)
         guard sourceTickets.count == orderedSources.count,
-              Set(sourceTickets.map { CodemapGraphSourceSlot(
+              Set(sourceTickets.map { WorkspaceCodemapRootScopedFileSlot(
                   rootEpoch: $0.rootEpoch,
                   fileID: $0.fileID
-              ) }) == Set(orderedSources.map { CodemapGraphSourceSlot(
+              ) }) == Set(orderedSources.map { WorkspaceCodemapRootScopedFileSlot(
                   rootEpoch: $0.rootEpoch,
                   fileID: $0.fileID
               ) }),
@@ -11924,26 +12112,43 @@ actor WorkspaceFileContextStore {
               receipt.publicationPermit.withCurrent({ true }) == true,
               receipt.rootScope == rootScope,
               receipt.rootScopeEpochs == codemapAutomaticSelectionRootScopeEpochs(rootScope),
-              receipt.coverageProofs.count == receipt.graphKeys.count,
-              !receipt.coverageProofs.isEmpty,
               sourceTickets.count == receipt.sourceTickets.count
         else { return nil }
 
-        let allowedRootIDs = Set(receipt.rootScopeEpochs.map(\.rootID))
-        for ticket in sourceTickets {
-            guard allowedRootIDs.contains(ticket.rootEpoch.rootID),
-                  codemapDemandIsCurrent(ticket),
-                  let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
-                  .demandsByFileID[ticket.fileID],
-                  record.retainIDs.contains(ticket.retainID),
-                  codemapTicketsShareDemand(record.ticket, ticket),
-                  case let .ready(ready) = record.result,
-                  codemapTicketsShareDemand(ready.ticket, ticket),
-                  ready.snapshot.requestGeneration == ticket.requestGeneration
-            else {
-                return nil
-            }
+        switch receipt.publicationBasis {
+        case .projectionCoverage:
+            return await refreshProjectionAutomaticCodemapSelectionResult(
+                result,
+                receipt: receipt,
+                sourceTickets: sourceTickets,
+                rootScope: rootScope,
+                deadline: deadline
+            )
+        case .provisionalCandidates:
+            return refreshProvisionalAutomaticCodemapSelectionResult(
+                result,
+                receipt: receipt,
+                sourceTickets: sourceTickets,
+                rootScope: rootScope,
+                deadline: deadline
+            )
         }
+    }
+
+    private func refreshProjectionAutomaticCodemapSelectionResult(
+        _ result: WorkspaceCodemapAutomaticSelectionResult,
+        receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScope: WorkspaceLookupRootScope,
+        deadline: ContinuousClock.Instant? = nil
+    ) async -> WorkspaceCodemapAutomaticSelectionResult? {
+        guard receipt.coverageProofs.count == receipt.graphKeys.count,
+              !receipt.coverageProofs.isEmpty,
+              automaticSelectionSourceTicketsAreCurrent(
+                  sourceTickets,
+                  rootScopeEpochs: receipt.rootScopeEpochs
+              )
+        else { return nil }
 
         let sources = sourceTickets.map {
             WorkspaceCodemapAutomaticSelectionSourceIdentity(
@@ -11981,13 +12186,14 @@ actor WorkspaceFileContextStore {
             }
         )
         let sourceSlots = Set(sourceTickets.map {
-            CodemapGraphSourceSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
         })
         let refreshedSourceSlots = Set(refreshedReceipt.sourceTickets.map {
-            CodemapGraphSourceSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
         })
         guard refreshedReceipt.rootScope == receipt.rootScope,
               refreshedReceipt.rootScopeEpochs == receipt.rootScopeEpochs,
+              refreshedReceipt.publicationBasis == .projectionCoverage,
               refreshedReceipt.coverageProofs.count == receipt.coverageProofs.count,
               predecessorProofs.count == receipt.coverageProofs.count,
               refreshedProofs.count == refreshedReceipt.coverageProofs.count,
@@ -12025,6 +12231,136 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    private func refreshProvisionalAutomaticCodemapSelectionResult(
+        _ result: WorkspaceCodemapAutomaticSelectionResult,
+        receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScope _: WorkspaceLookupRootScope,
+        deadline: ContinuousClock.Instant? = nil
+    ) -> WorkspaceCodemapAutomaticSelectionResult? {
+        guard codemapDeadlineIsCurrent(deadline),
+              provisionalAutomaticSelectionReceiptIsCurrent(
+                  receipt,
+                  sourceTickets: sourceTickets
+              )
+        else { return nil }
+        receipt.publicationPermit.revoke()
+        let requestID = UUID()
+        let publicationPermit = WorkspaceCodemapAutomaticSelectionPublicationPermit()
+        registerAutomaticSelectionPublicationPermit(
+            publicationPermit,
+            requestID: requestID,
+            rootScopeEpochs: receipt.rootScopeEpochs
+        )
+        let replacementReceipt = WorkspaceCodemapAutomaticSelectionPublicationReceipt(
+            requestID: requestID,
+            rootScope: receipt.rootScope,
+            rootScopeEpochs: receipt.rootScopeEpochs,
+            sourceTickets: sourceTickets,
+            graphKeys: [],
+            coverageProofs: [],
+            targets: receipt.targets,
+            publicationBasis: receipt.publicationBasis,
+            publicationPermit: publicationPermit
+        )
+        return WorkspaceCodemapAutomaticSelectionResult(
+            roots: result.roots,
+            aggregateCoverage: result.aggregateCoverage,
+            publicationReceipt: replacementReceipt
+        )
+    }
+
+    private func automaticSelectionSourceTicketsAreCurrent(
+        _ sourceTickets: [WorkspaceCodemapArtifactDemandTicket],
+        rootScopeEpochs: [WorkspaceCodemapRootEpoch]
+    ) -> Bool {
+        let allowedRootIDs = Set(rootScopeEpochs.map(\.rootID))
+        for ticket in sourceTickets {
+            guard allowedRootIDs.contains(ticket.rootEpoch.rootID),
+                  codemapDemandIsCurrent(ticket),
+                  let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
+                  .demandsByFileID[ticket.fileID],
+                  record.retainIDs.contains(ticket.retainID),
+                  codemapTicketsShareDemand(record.ticket, ticket),
+                  case let .ready(ready) = record.result,
+                  codemapTicketsShareDemand(ready.ticket, ticket),
+                  ready.snapshot.requestGeneration == ticket.requestGeneration
+            else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func provisionalAutomaticSelectionReceiptIsCurrent(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        sourceTickets replacementSourceTickets: [WorkspaceCodemapArtifactDemandTicket]? = nil
+    ) -> Bool {
+        guard case let .provisionalCandidates(candidates) = receipt.publicationBasis,
+              receipt.publicationPermit.withCurrent({ true }) == true,
+              receipt.rootScopeEpochs == codemapAutomaticSelectionRootScopeEpochs(receipt.rootScope),
+              receipt.graphKeys.isEmpty,
+              receipt.coverageProofs.isEmpty,
+              !receipt.targets.isEmpty,
+              candidates.count == receipt.targets.count,
+              Set(receipt.targets).count == receipt.targets.count
+        else { return false }
+
+        let sourceTickets = replacementSourceTickets ?? receipt.sourceTickets
+        guard sourceTickets.count == receipt.sourceTickets.count,
+              automaticSelectionSourceTicketsAreCurrent(
+                  sourceTickets,
+                  rootScopeEpochs: receipt.rootScopeEpochs
+              )
+        else { return false }
+        let sourceSlots = Set(sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        let receiptSourceSlots = Set(receipt.sourceTickets.map {
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+        })
+        guard sourceSlots.count == sourceTickets.count,
+              receiptSourceSlots == sourceSlots
+        else { return false }
+
+        var candidatesBySlot: [WorkspaceCodemapRootScopedFileSlot: WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = [:]
+        for candidate in candidates {
+            let rootEpoch = WorkspaceCodemapRootEpoch(
+                rootID: candidate.identity.rootID,
+                rootLifetimeID: candidate.identity.rootLifetimeID
+            )
+            let slot = WorkspaceCodemapRootScopedFileSlot(rootEpoch: rootEpoch, fileID: candidate.identity.fileID)
+            guard candidatesBySlot[slot] == nil else { return false }
+            candidatesBySlot[slot] = candidate
+        }
+
+        for target in receipt.targets {
+            let slot = WorkspaceCodemapRootScopedFileSlot(rootEpoch: target.rootEpoch, fileID: target.fileID)
+            guard !sourceSlots.contains(slot),
+                  let candidate = candidatesBySlot[slot],
+                  candidate.catalogGeneration == target.catalogGeneration,
+                  candidate.requestGeneration == target.requestGeneration,
+                  candidate.pathGeneration == target.requestGeneration,
+                  provisionalAutomaticSelectionCandidateDemandIsCurrent(
+                      candidate: candidate,
+                      rootScope: receipt.rootScope,
+                      rootScopeEpochs: receipt.rootScopeEpochs
+                  ),
+                  let state = rootStatesByID[target.rootEpoch.rootID],
+                  state.lifetimeID == target.rootEpoch.rootLifetimeID,
+                  catalogGenerationsByRootID[target.rootEpoch.rootID] == target.catalogGeneration,
+                  let file = filesByID[target.fileID],
+                  file.rootID == target.rootEpoch.rootID,
+                  isDiscoverableFileID(file.id),
+                  state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+                  file.standardizedRelativePath == candidate.identity.standardizedRelativePath,
+                  file.standardizedFullPath == candidate.identity.standardizedFullPath,
+                  target.logicalPath.standardizedRelativePath == file.standardizedRelativePath
+            else { return false }
+        }
+        return true
+    }
+
     private func revalidateAutomaticCodemapSelectionForPublicationUnreleased(
         _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
         rootScope: WorkspaceLookupRootScope
@@ -12034,6 +12370,24 @@ actor WorkspaceFileContextStore {
         else {
             return .stale(.publicationReceipt)
         }
+        switch receipt.publicationBasis {
+        case .projectionCoverage:
+            return revalidateProjectionAutomaticCodemapSelectionForPublicationUnreleased(
+                receipt,
+                rootScope: rootScope
+            )
+        case .provisionalCandidates:
+            guard provisionalAutomaticSelectionReceiptIsCurrent(receipt) else {
+                return .stale(.publicationReceipt)
+            }
+            return .current(receipt.targets)
+        }
+    }
+
+    private func revalidateProjectionAutomaticCodemapSelectionForPublicationUnreleased(
+        _ receipt: WorkspaceCodemapAutomaticSelectionPublicationReceipt,
+        rootScope: WorkspaceLookupRootScope
+    ) -> WorkspaceCodemapAutomaticSelectionPublicationDisposition {
         let currentRootScopeEpochs = codemapAutomaticSelectionRootScopeEpochs(rootScope)
         guard receipt.rootScopeEpochs == currentRootScopeEpochs,
               !receipt.sourceTickets.isEmpty,
@@ -12044,12 +12398,12 @@ actor WorkspaceFileContextStore {
         else { return .stale(.publicationReceipt) }
         let allowedRootIDs = Set(currentRootScopeEpochs.map(\.rootID))
         let sourceSlots = receipt.sourceTickets.map {
-            CodemapGraphSourceSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
+            WorkspaceCodemapRootScopedFileSlot(rootEpoch: $0.rootEpoch, fileID: $0.fileID)
         }
         let sourceSlotSet = Set(sourceSlots)
         guard sourceSlotSet.count == sourceSlots.count,
               receipt.targets.allSatisfy({ target in
-                  !sourceSlotSet.contains(CodemapGraphSourceSlot(
+                  !sourceSlotSet.contains(WorkspaceCodemapRootScopedFileSlot(
                       rootEpoch: target.rootEpoch,
                       fileID: target.fileID
                   ))
@@ -12062,20 +12416,12 @@ actor WorkspaceFileContextStore {
               Set(receipt.sourceTickets.map(\.rootEpoch)) == Set(coveredRootEpochs),
               zip(receipt.graphKeys, receipt.coverageProofs).allSatisfy({ pair in
                   pair.0 == WorkspaceCodemapSelectionGraphRuntimeKey(generation: pair.1.generation)
-              })
+              }),
+              automaticSelectionSourceTicketsAreCurrent(
+                  receipt.sourceTickets,
+                  rootScopeEpochs: currentRootScopeEpochs
+              )
         else { return .stale(.publicationReceipt) }
-        for ticket in receipt.sourceTickets {
-            guard allowedRootIDs.contains(ticket.rootEpoch.rootID),
-                  codemapDemandIsCurrent(ticket),
-                  let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
-                  .demandsByFileID[ticket.fileID],
-                  record.retainIDs.contains(ticket.retainID),
-                  codemapTicketsShareDemand(record.ticket, ticket),
-                  case let .ready(ready) = record.result,
-                  codemapTicketsShareDemand(ready.ticket, ticket),
-                  ready.snapshot.requestGeneration == ticket.requestGeneration
-            else { return .stale(.publicationReceipt) }
-        }
         for key in receipt.graphKeys {
             guard allowedRootIDs.contains(key.rootEpoch.rootID),
                   let graphState = codemapSessionsByRootEpoch[key.rootEpoch]?.selectionGraph,
@@ -13603,13 +13949,13 @@ actor WorkspaceFileContextStore {
         guard !query.seeds.isEmpty else { return .unavailable(.emptySeeds) }
 
         var uniqueSeeds: [
-            CodemapGraphSourceSlot: WorkspaceCodemapStoreSelectionGraphSourceIdentity
+            WorkspaceCodemapRootScopedFileSlot: WorkspaceCodemapStoreSelectionGraphSourceIdentity
         ] = [:]
         for seed in query.seeds {
             guard seed.rootEpoch == seed.ticket.rootEpoch else {
                 return .unavailable(.foreignRootEpoch(seed.ticket.fileID))
             }
-            let slot = CodemapGraphSourceSlot(
+            let slot = WorkspaceCodemapRootScopedFileSlot(
                 rootEpoch: seed.rootEpoch,
                 fileID: seed.ticket.fileID
             )
@@ -13850,14 +14196,14 @@ actor WorkspaceFileContextStore {
         }
 
         var uniqueSources: [
-            CodemapGraphSourceSlot: WorkspaceCodemapStoreSelectionGraphSourceIdentity
+            WorkspaceCodemapRootScopedFileSlot: WorkspaceCodemapStoreSelectionGraphSourceIdentity
         ] = [:]
         for source in query.selectedSources {
             let ticket = source.ticket
             guard source.rootEpoch == ticket.rootEpoch else {
                 return .unavailable(.foreignRootEpoch(ticket.fileID))
             }
-            let slot = CodemapGraphSourceSlot(
+            let slot = WorkspaceCodemapRootScopedFileSlot(
                 rootEpoch: source.rootEpoch,
                 fileID: ticket.fileID
             )
@@ -16824,7 +17170,9 @@ actor WorkspaceFileContextStore {
     ) -> WorkspaceCodemapManifestBindingCandidate? {
         guard rootEpoch == authority.rootEpoch,
               codemapAuthorityIsCurrent(authority),
-              let state = rootStatesByID[rootEpoch.rootID]
+              let state = rootStatesByID[rootEpoch.rootID],
+              let session = codemapSessionsByRootEpoch[rootEpoch],
+              session.authority == authority
         else { return nil }
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         guard !relativePath.isEmpty,
@@ -16846,10 +17194,13 @@ actor WorkspaceFileContextStore {
                   standardizedFullPath: file.standardizedFullPath
               )
         else { return nil }
+        let pathGeneration = session.pathGenerationsByRelativePath[standardizedRelativePath]
+            ?? authority.ingressGeneration
+        guard pathGeneration > 0 else { return nil }
         return WorkspaceCodemapManifestBindingCandidate(
             identity: identity,
-            requestGeneration: authority.ingressGeneration,
-            pathGeneration: authority.ingressGeneration,
+            requestGeneration: pathGeneration,
+            pathGeneration: pathGeneration,
             ingressGeneration: authority.ingressGeneration
         )
     }

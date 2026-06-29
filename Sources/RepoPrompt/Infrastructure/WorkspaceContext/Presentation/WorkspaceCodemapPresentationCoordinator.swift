@@ -134,6 +134,12 @@ struct WorkspaceCodemapPresentationCoordinator {
         let defensiveRoundLimitReached: Bool
     }
 
+    private struct ProvisionalDemandBatch {
+        let readyCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate]
+        let pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason]
+        let partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason]
+    }
+
     private enum ProjectionDemandWaitOutcome {
         case ready(WorkspaceCodemapProjectionCoverageProof)
         case busy(retryAfterMilliseconds: Int)
@@ -380,7 +386,7 @@ struct WorkspaceCodemapPresentationCoordinator {
 
         var renderedEntries: [WorkspaceCodemapOperationRenderedEntry] = []
         var bundleReceipts: [WorkspaceCodemapOperationPresentationBundleReceipt] = []
-        for rootEpoch in requestsByRoot.keys.sorted(by: rootEpochPrecedes) {
+        for rootEpoch in requestsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
             try Task.checkCancellation()
             let requests = requestsByRoot[rootEpoch] ?? []
             switch await store.freezeCodemapPresentation(requests) {
@@ -412,7 +418,7 @@ struct WorkspaceCodemapPresentationCoordinator {
             }
         }
         renderedEntries.sort(by: renderedEntryPrecedes)
-        issues.sort { stableIssueKey($0) < stableIssueKey($1) }
+        issues.sort { debugReflectionIssueSortKey($0) < debugReflectionIssueSortKey($1) }
         let coverage = coverage(for: renderedEntries, issues: issues)
         let receipt: WorkspaceCodemapOperationPresentationPublicationReceipt?
         if renderedEntries.isEmpty, automaticReceipt == nil {
@@ -519,8 +525,8 @@ struct WorkspaceCodemapPresentationCoordinator {
             }
         }
         guard !readySources.isEmpty else {
-            pendingReasons.sort { stableIssueKey($0) < stableIssueKey($1) }
-            partialReasons.sort { stableIssueKey($0) < stableIssueKey($1) }
+            pendingReasons.sort(by: automaticSelectionPendingReasonPrecedes)
+            partialReasons.sort(by: automaticSelectionPartialReasonPrecedes)
             let automaticCoverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage = pendingReasons.isEmpty
                 ? .unavailable(.noReadySources)
                 : .pending(pendingReasons)
@@ -533,7 +539,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         let allSourceRootEpochs = Set(identities.map(\.rootEpoch))
         let readySourceRootEpochs = Set(readySources.map(\.rootEpoch))
         guard readySourceRootEpochs == allSourceRootEpochs else {
-            pendingReasons.sort { stableIssueKey($0) < stableIssueKey($1) }
+            pendingReasons.sort(by: automaticSelectionPendingReasonPrecedes)
             let automaticCoverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage =
                 pendingReasons.isEmpty ? .unavailable(.noReadySources) : .pending(pendingReasons)
             issues.append(.automatic(automaticCoverage))
@@ -550,7 +556,7 @@ struct WorkspaceCodemapPresentationCoordinator {
             by: \.rootEpoch
         )
         let projectionDeadline = projectionDeadlineUptimeNanoseconds(clock: clock, deadline: deadline)
-        for rootEpoch in sourceTicketsByRoot.keys.sorted(by: rootEpochPrecedes) {
+        for rootEpoch in sourceTicketsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
             let acquisition = await store.acquireCodemapProjectionDemand(
                 sourceTickets: sourceTicketsByRoot[rootEpoch] ?? [],
                 deadlineUptimeNanoseconds: projectionDeadline
@@ -604,10 +610,66 @@ struct WorkspaceCodemapPresentationCoordinator {
         case let .ready(value):
             plan = value
         case let .provisional(value):
-            let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage
-                .incomplete(value.incompleteReasons)
-            issues.append(.automatic(automaticCoverage))
-            return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
+            let provisionalDemand = try await settleProvisionalAutomaticCandidates(
+                plan: value,
+                rootScope: rootScope,
+                ownership: ownership,
+                clock: clock,
+                deadline: deadline
+            )
+            let selection = await store.provisionalAutomaticCodemapSelectionResult(
+                sources: readySources,
+                plan: value,
+                readyCandidates: provisionalDemand.readyCandidates,
+                pendingReasons: pendingReasons + provisionalDemand.pendingReasons,
+                partialReasons: partialReasons + provisionalDemand.partialReasons,
+                rootScope: rootScope
+            )
+            issues.append(.automatic(selection.aggregateCoverage))
+            guard case .provisional = selection.aggregateCoverage else {
+                let coverage: WorkspaceCodemapOperationPresentationCoverage = switch selection.aggregateCoverage {
+                case .unavailable, .stale, .budget:
+                    .unavailable(issues)
+                default:
+                    .pending(issues)
+                }
+                return AutomaticPreparation(candidates: [], issues: issues, coverage: coverage, receipt: nil)
+            }
+            let targets = selection.targets
+            guard let automaticReceipt = selection.publicationReceipt,
+                  automaticReceipt.targets == targets,
+                  automaticReceipt.publicationPermit.withCurrent({ true }) == true,
+                  !targets.isEmpty
+            else {
+                return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
+            }
+            let collection = await store.codemapOperationPresentationCandidates(
+                forFileIDs: targets.map(\.fileID),
+                rootScope: rootScope,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
+            )
+            try await afterAutomaticCandidateReconstruction(automaticReceipt)
+            let publicationDisposition = await store.revalidateAutomaticCodemapSelectionForPublication(
+                automaticReceipt,
+                rootScope: rootScope
+            )
+            guard case let .current(currentTargets) = publicationDisposition,
+                  currentTargets == targets
+            else {
+                return staleAutomaticPreparation(issues: issues)
+            }
+            issues.append(contentsOf: collection.issues.map(WorkspaceCodemapOperationIssue.candidate))
+            guard let preparation = automaticReceipt.publicationPermit.withCurrent({
+                AutomaticPreparation(
+                    candidates: collection.candidates,
+                    issues: issues,
+                    coverage: nil,
+                    receipt: automaticReceipt
+                )
+            }) else {
+                return staleAutomaticPreparation(issues: issues)
+            }
+            return preparation
         case let .incomplete(reasons):
             let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage.incomplete(reasons)
             issues.append(.automatic(automaticCoverage))
@@ -694,7 +756,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         for round in 1 ..< policy.maximumReadinessRounds {
             let shouldRetry = switch selection.aggregateCoverage {
             case .incomplete, .busy, .pending: true
-            case .complete, .partial, .unavailable, .stale, .budget: false
+            case .complete, .partial, .provisional, .unavailable, .stale, .budget: false
             }
             guard shouldRetry, clock.now < deadline else { break }
             try await wait(round: round, suggestedMilliseconds: [], clock: clock, deadline: deadline)
@@ -704,7 +766,7 @@ struct WorkspaceCodemapPresentationCoordinator {
             )
         }
         if !partialReasons.isEmpty {
-            partialReasons.sort { stableIssueKey($0) < stableIssueKey($1) }
+            partialReasons.sort(by: automaticSelectionPartialReasonPrecedes)
             selection = automaticSelectionAppendingSourcePartialReasons(
                 partialReasons,
                 to: selection
@@ -713,6 +775,9 @@ struct WorkspaceCodemapPresentationCoordinator {
         switch selection.aggregateCoverage {
         case .complete:
             break
+        case .provisional:
+            issues.append(.automatic(selection.aggregateCoverage))
+            return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
         case .partial:
             issues.append(.automatic(selection.aggregateCoverage))
             return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
@@ -775,6 +840,143 @@ struct WorkspaceCodemapPresentationCoordinator {
             issues: issues,
             coverage: .pending(issues),
             receipt: nil
+        )
+    }
+
+    private func settleProvisionalAutomaticCandidates(
+        plan: WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan,
+        rootScope: WorkspaceLookupRootScope,
+        ownership: WorkspaceCodemapOperationPresentationOwnership,
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async throws -> ProvisionalDemandBatch {
+        var candidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var seen = Set<UUID>()
+        for candidate in plan.candidates.sorted(by: automaticSelectionCandidatePrecedes)
+            where seen.insert(candidate.identity.fileID).inserted
+        {
+            candidates.append(candidate)
+        }
+
+        var results: [UUID: WorkspaceCodemapArtifactDemandResult] = [:]
+        var ticketsByFileID: [UUID: WorkspaceCodemapArtifactDemandTicket] = [:]
+        var attemptsByFileID: [UUID: Int] = [:]
+        var partialReasons: [WorkspaceCodemapAutomaticSelectionPartialReason] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+            guard let owned = await store.requestProvisionalAutomaticCodemapArtifactWithOwnership(
+                candidate: candidate,
+                rootScope: rootScope,
+                rootScopeEpochs: plan.rootScopeEpochs
+            ) else {
+                // Ownership acquisition only reports nil here; staleCurrentness is the conservative provisional catch-all.
+                partialReasons.append(.candidateUnavailable(
+                    rootEpoch: candidate.rootEpoch,
+                    fileID: candidate.identity.fileID,
+                    reason: .staleCurrentness
+                ))
+                continue
+            }
+            await ownership.record(owned)
+            results[candidate.identity.fileID] = owned.result
+            ticketsByFileID[candidate.identity.fileID] = ticket(from: owned.result)
+        }
+
+        for round in 0 ..< policy.maximumReadinessRounds {
+            try Task.checkCancellation()
+            var hasPending = false
+            var retryAfter: [Int] = []
+            var busyCandidates: [(WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate, WorkspaceCodemapArtifactDemandTicket?)] = []
+            for candidate in candidates {
+                let fileID = candidate.identity.fileID
+                guard let current = results[fileID] else { continue }
+                let refreshed: WorkspaceCodemapArtifactDemandResult = switch current {
+                case let .pending(ticket): await store.codemapArtifactDemandStatus(ticket)
+                case .ready, .unavailable: current
+                }
+                results[fileID] = refreshed
+                switch refreshed {
+                case .pending:
+                    hasPending = true
+                case let .unavailable(.busy(milliseconds)):
+                    hasPending = true
+                    if let milliseconds { retryAfter.append(milliseconds) }
+                    busyCandidates.append((candidate, ticketsByFileID[fileID]))
+                case .ready, .unavailable:
+                    break
+                }
+            }
+            guard hasPending,
+                  round + 1 < policy.maximumReadinessRounds,
+                  clock.now < deadline
+            else { break }
+            try await wait(
+                round: round,
+                suggestedMilliseconds: retryAfter,
+                clock: clock,
+                deadline: deadline
+            )
+            for (candidate, existingTicket) in busyCandidates {
+                let fileID = candidate.identity.fileID
+                attemptsByFileID[fileID, default: 0] += 1
+                let result: WorkspaceCodemapArtifactDemandResult
+                if let existingTicket, await ownership.owns(existingTicket) {
+                    result = await store.retryBusyCodemapArtifactDemand(
+                        existingTicket,
+                        priority: .background
+                    )
+                    await ownership.replaceConsumed(existingTicket, with: result)
+                } else if let owned = await store.requestProvisionalAutomaticCodemapArtifactWithOwnership(
+                    candidate: candidate,
+                    rootScope: rootScope,
+                    rootScopeEpochs: plan.rootScopeEpochs
+                ) {
+                    await ownership.record(owned)
+                    result = owned.result
+                } else {
+                    // Ownership reacquisition only reports nil here; staleCurrentness is the conservative catch-all.
+                    result = .unavailable(.staleCurrentness)
+                }
+                results[fileID] = result
+                ticketsByFileID[fileID] = ticket(from: result)
+            }
+        }
+
+        var readyCandidates: [WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate] = []
+        var pendingReasons: [WorkspaceCodemapAutomaticSelectionPendingReason] = []
+        for candidate in candidates {
+            let fileID = candidate.identity.fileID
+            guard let result = results[fileID] else { continue }
+            let rootEpoch = candidate.rootEpoch
+            switch result {
+            case .ready:
+                readyCandidates.append(candidate)
+            case let .pending(ticket):
+                pendingReasons.append(.candidateDemand(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    ticket: ticket
+                ))
+            case .unavailable(.busy):
+                pendingReasons.append(.candidateBusy(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    attempts: attemptsByFileID[fileID, default: 0]
+                ))
+            case let .unavailable(reason):
+                partialReasons.append(.candidateUnavailable(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    reason: reason
+                ))
+            }
+        }
+        pendingReasons.sort(by: automaticSelectionPendingReasonPrecedes)
+        partialReasons.sort(by: automaticSelectionPartialReasonPrecedes)
+        return ProvisionalDemandBatch(
+            readyCandidates: readyCandidates,
+            pendingReasons: pendingReasons,
+            partialReasons: partialReasons
         )
     }
 
@@ -898,6 +1100,8 @@ struct WorkspaceCodemapPresentationCoordinator {
                 }
             case let .sourceDemandTimedOut(source):
                 source.rootEpoch
+            case let .candidateUnavailable(rootEpoch, _, _):
+                rootEpoch
             case .graph:
                 preconditionFailure("Graph partial reasons are produced by the store query")
             }
@@ -910,6 +1114,8 @@ struct WorkspaceCodemapPresentationCoordinator {
                 .partial(proof: proof, reasons: additional)
             case let .partial(proof, existing):
                 .partial(proof: proof, reasons: existing + additional)
+            case let .provisional(incomplete, pending, existing):
+                .provisional(incomplete: incomplete, pending: pending, partial: existing + additional)
             case .incomplete, .pending, .unavailable, .stale, .busy, .budget:
                 root.coverage
             }
@@ -1202,7 +1408,14 @@ struct WorkspaceCodemapPresentationCoordinator {
         if !renderedEntries.isEmpty { return .partial(issues) }
         if issues.contains(where: { issue in
             if case .pending = issue { return true }
-            if case let .automatic(coverage) = issue, case .pending = coverage { return true }
+            if case let .automatic(coverage) = issue {
+                switch coverage {
+                case .pending, .provisional:
+                    return true
+                case .complete, .partial, .incomplete, .unavailable, .stale, .busy, .budget:
+                    return false
+                }
+            }
             return false
         }) {
             return .pending(issues)
@@ -1255,14 +1468,6 @@ struct WorkspaceCodemapPresentationCoordinator {
         return nil
     }
 
-    private func rootEpochPrecedes(
-        _ lhs: WorkspaceCodemapRootEpoch,
-        _ rhs: WorkspaceCodemapRootEpoch
-    ) -> Bool {
-        if lhs.rootID != rhs.rootID { return lhs.rootID.uuidString < rhs.rootID.uuidString }
-        return lhs.rootLifetimeID.uuidString < rhs.rootLifetimeID.uuidString
-    }
-
     private func renderedEntryPrecedes(
         _ lhs: WorkspaceCodemapOperationRenderedEntry,
         _ rhs: WorkspaceCodemapOperationRenderedEntry
@@ -1273,7 +1478,9 @@ struct WorkspaceCodemapPresentationCoordinator {
         return lhs.fileID.uuidString < rhs.fileID.uuidString
     }
 
-    private func stableIssueKey(_ value: some Any) -> String {
+    private func debugReflectionIssueSortKey(_ value: some Any) -> String {
+        // Broad presentation/structure diagnostics still use a debug fallback; automatic-selection
+        // pending/partial reasons use explicit typed comparators in WorkspaceCodemapAutomaticSelectionModels.
         String(reflecting: value)
     }
 }
@@ -1606,7 +1813,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                 outcome: ProjectionDemandWaitOutcome,
                 sourceTickets: [WorkspaceCodemapArtifactDemandTicket]
             )] = []
-            for rootEpoch in sourceTicketsByRoot.keys.sorted(by: rootEpochPrecedes) {
+            for rootEpoch in sourceTicketsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
                 let sourceTickets = sourceTicketsByRoot[rootEpoch] ?? []
                 let acquisition = await store.acquireCodemapProjectionDemand(
                     sourceTickets: sourceTickets,
@@ -1822,7 +2029,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                 examinedEdgeCount = traversalResult.examinedEdgeCount
                 issues.append(
                     contentsOf: traversalResult.partialReasons
-                        .sorted { stableIssueKey($0) < stableIssueKey($1) }
+                        .sorted { debugReflectionIssueSortKey($0) < debugReflectionIssueSortKey($1) }
                         .map(WorkspaceCodemapStructureIssue.traversalPartial)
                 )
                 guard traversalResult.partialReasons.isEmpty else {
@@ -1977,7 +2184,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                         if !result.partialReasons.isEmpty {
                             issues.append(
                                 contentsOf: result.partialReasons
-                                    .sorted { stableIssueKey($0) < stableIssueKey($1) }
+                                    .sorted { debugReflectionIssueSortKey($0) < debugReflectionIssueSortKey($1) }
                                     .map(WorkspaceCodemapStructureIssue.traversalPartial)
                             )
                             return WorkspaceCodemapStructureAttempt(
@@ -2100,7 +2307,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         }
         var renderedByFileID: [UUID: WorkspaceCodemapOperationRenderedEntry] = [:]
         var bundleReceipts: [WorkspaceCodemapOperationPresentationBundleReceipt] = []
-        for rootEpoch in requestsByRoot.keys.sorted(by: rootEpochPrecedes) {
+        for rootEpoch in requestsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
             try Task.checkCancellation()
             switch await store.freezeCodemapPresentation(requestsByRoot[rootEpoch] ?? []) {
             case let .unavailable(reason):
@@ -2191,7 +2398,7 @@ extension WorkspaceCodemapPresentationCoordinator {
             traversal: traversalReceipt,
             outputFileIDs: outputFileIDs
         )
-        issues.sort { stableIssueKey($0) < stableIssueKey($1) }
+        issues.sort { debugReflectionIssueSortKey($0) < debugReflectionIssueSortKey($1) }
         let budgetHit = traversalBudgetHit || issues.contains(where: {
             switch $0 {
             case .fileLimit, .seedDemandLimit, .tokenLimit, .traversalBudget: true

@@ -322,6 +322,61 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("### Selected File Tree"), text)
     }
 
+    func testWorkspaceContextCodeMapsShowsPendingAndUnmappedWhenZeroFiles() throws {
+        let scope = Self.scope()
+        let dto = ToolResultDTOs.PromptContextDTO(
+            prompt: "",
+            selection: nil,
+            fileBlocks: nil,
+            codeStructure: .init(
+                fileCount: 0,
+                content: "",
+                unmappedPaths: ["Project/README.md"],
+                pendingPaths: ["Project/Sources/Pending.swift"]
+            ),
+            fileTree: nil,
+            tokenStats: nil,
+            userTokenStats: nil,
+            tokenStatsNote: nil,
+            copyPreset: nil,
+            copyPresets: nil,
+            worktreeScope: scope
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatPromptState(value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("### Code Maps"), text)
+        XCTAssertTrue(text.contains("- **Files with codemap**: 0"), text)
+        XCTAssertTrue(text.contains("- **Pending codemaps**: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/Sources/Pending.swift`"), text)
+        XCTAssertTrue(text.contains("- **Unmapped codemap paths**: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/README.md`"), text)
+        XCTAssertFalse(text.contains("/repo/project"), text)
+        XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
+    }
+
+    func testManageSelectionCodeMapsShowsPendingAndUnmappedWhenZeroFiles() throws {
+        let dto = ToolResultDTOs.SelectionReply(
+            files: [],
+            totalTokens: 0,
+            status: "ok",
+            codeStructure: .init(
+                fileCount: 0,
+                content: "",
+                unmappedPaths: ["Project/README.md"],
+                pendingPaths: ["Project/Sources/Pending.swift"]
+            )
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatManageSelection(args: [:], value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("Code Maps: 0 files"), text)
+        XCTAssertTrue(text.contains("Pending codemaps: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/Sources/Pending.swift`"), text)
+        XCTAssertTrue(text.contains("Unmapped codemap paths: 1"), text)
+        XCTAssertTrue(text.contains("  - `Project/README.md`"), text)
+    }
+
     func testAgentRunOutputShowsWorktreeSummaryAndUnavailableState() throws {
         let cases = [
             (

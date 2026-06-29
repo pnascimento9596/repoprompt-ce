@@ -3236,6 +3236,12 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             store.requestCodemapArtifact(forFileID: target.id)
         )
         _ = try await readyResult(settledResult(store: store, ticket: targetTicket))
+        let publicationDrainClock = ContinuousClock()
+        let publicationDrained = await store.waitForCodemapGraphPublication(
+            rootEpoch: sourceTicket.rootEpoch,
+            deadline: publicationDrainClock.now.advanced(by: .seconds(5))
+        )
+        XCTAssertTrue(publicationDrained)
         let sourceQuery = WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
             WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: sourceTicket)
         ])
@@ -4101,6 +4107,71 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             XCTFail("Expected successor ticket to remain current")
         }
         await assertStale(store.codemapArtifactDemandStatus(ticket))
+        _ = await store.cancelCodemapArtifactDemand(successorTicket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testManifestCandidateAfterPathInvalidationUsesSuccessorPathGeneration() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": "struct Feature {}\n"]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(codemapProjectionPreloadLaunchPolicy: .disabled)
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+        let firstTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: file.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: firstTicket))
+
+        try Self.write(
+            "struct Feature { let changed = true }\n",
+            to: root.appendingPathComponent(file.standardizedRelativePath)
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileModified(file.standardizedRelativePath, nil)]
+        )
+        await assertStale(store.codemapArtifactDemandStatus(firstTicket))
+
+        let currentFileValue = await store.file(
+            rootID: loaded.id,
+            relativePath: file.standardizedRelativePath
+        )
+        let currentFile = try XCTUnwrap(currentFileValue)
+        let successorDemand = await store.requestCodemapArtifact(forFileID: currentFile.id)
+        let successorTicket: WorkspaceCodemapArtifactDemandTicket
+        let successorResult: WorkspaceCodemapArtifactDemandResult
+        switch successorDemand {
+        case let .pending(ticket):
+            successorTicket = ticket
+            successorResult = try await settledResult(store: store, ticket: ticket)
+        case let .ready(ready):
+            successorTicket = ready.ticket
+            successorResult = .ready(ready)
+        case let .unavailable(reason):
+            return XCTFail("Expected successor demand after path invalidation, got \(reason).")
+        }
+        XCTAssertGreaterThan(successorTicket.pathGeneration, firstTicket.pathGeneration)
+        XCTAssertEqual(successorTicket.requestGeneration, successorTicket.pathGeneration)
+        let routed = await fixture.registry.makeBindingCatalogClient().resolveManifestBinding(
+            successorTicket.rootEpoch,
+            file.standardizedRelativePath
+        )
+        XCTAssertEqual(routed?.identity.fileID, file.id)
+        XCTAssertEqual(routed?.requestGeneration, successorTicket.requestGeneration)
+        XCTAssertEqual(routed?.pathGeneration, successorTicket.pathGeneration)
+        XCTAssertEqual(routed?.ingressGeneration, successorTicket.ingressGeneration)
+        let successorReady = try readyResult(successorResult)
+        XCTAssertEqual(successorReady.snapshot.requestGeneration, successorTicket.requestGeneration)
+        XCTAssertEqual(fixture.buildCount.value, 2)
         _ = await store.cancelCodemapArtifactDemand(successorTicket)
         await store.unloadRoot(id: loaded.id)
     }
@@ -5060,6 +5131,178 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         XCTAssertEqual(fixture.providerAccessCount.value, providerCount)
         XCTAssertEqual(fixture.buildCount.value, buildCount)
         XCTAssertEqual(fixture.manifestReadCount.value, manifestReadCount)
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testProvisionalAutomaticSelectionPublishesReadyTargetWithIncompleteDiagnostics() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target {}\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            projectionAuthority: .none,
+            syntheticGraphArtifacts: true
+        )
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
+        let sourceTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: source.id))
+        _ = try await readyResult(settledResult(store: store, ticket: sourceTicket))
+        let targetTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: target.id))
+        _ = try await readyResult(settledResult(store: store, ticket: targetTicket))
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [source.id],
+            rootScope: .visibleWorkspace
+        )
+        let sourceIdentity = try XCTUnwrap(identities.first)
+        let rootEpoch = targetTicket.rootEpoch
+        let candidate = try automaticSelectionCandidate(
+            file: target,
+            root: loaded,
+            ticket: targetTicket
+        )
+        let incomplete = WorkspaceCodemapAutomaticSelectionIncompleteReason.graph(
+            .definitionUniverse(
+                rootEpoch: rootEpoch,
+                progress: .notStarted,
+                remainingCount: nil,
+                retry: nil
+            )
+        )
+        let plan = WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan(
+            candidates: [candidate],
+            rootScopeEpochs: [rootEpoch],
+            incompleteReasons: [incomplete]
+        )
+
+        let result = await store.provisionalAutomaticCodemapSelectionResult(
+            sources: [sourceIdentity],
+            plan: plan,
+            readyCandidates: [candidate],
+            pendingReasons: [],
+            partialReasons: [],
+            rootScope: .visibleWorkspace
+        )
+
+        XCTAssertEqual(result.targets.map(\.fileID), [target.id])
+        XCTAssertEqual(result.roots.count, 1)
+        XCTAssertEqual(result.roots.first?.targets.map(\.fileID), [target.id])
+        guard case let .provisional(incompleteReasons, pendingReasons, partialReasons) = result.aggregateCoverage else {
+            return XCTFail("Expected provisional aggregate coverage.")
+        }
+        XCTAssertEqual(incompleteReasons, [incomplete])
+        XCTAssertTrue(pendingReasons.isEmpty)
+        XCTAssertTrue(partialReasons.isEmpty)
+        let receipt = try XCTUnwrap(result.publicationReceipt)
+        XCTAssertTrue(receipt.graphKeys.isEmpty)
+        XCTAssertTrue(receipt.coverageProofs.isEmpty)
+        guard case let .provisionalCandidates(receiptCandidates) = receipt.publicationBasis else {
+            return XCTFail("Expected provisional candidate publication basis.")
+        }
+        XCTAssertEqual(receiptCandidates, [candidate])
+        let publicationDisposition = await store.revalidateAutomaticCodemapSelectionForPublication(
+            receipt,
+            rootScope: .visibleWorkspace
+        )
+        XCTAssertEqual(publicationDisposition, .current(result.targets))
+        await store.unloadRoot(id: loaded.id)
+    }
+
+    func testProvisionalAutomaticSelectionDropsStaleCandidateWithoutReceipt() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target {}\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            projectionAuthority: .none,
+            syntheticGraphArtifacts: true
+        )
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
+        let sourceTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: source.id))
+        _ = try await readyResult(settledResult(store: store, ticket: sourceTicket))
+        let targetTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: target.id))
+        _ = try await readyResult(settledResult(store: store, ticket: targetTicket))
+        let identities = await store.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: [source.id],
+            rootScope: .visibleWorkspace
+        )
+        let sourceIdentity = try XCTUnwrap(identities.first)
+        let rootEpoch = targetTicket.rootEpoch
+        let candidate = try automaticSelectionCandidate(
+            file: target,
+            root: loaded,
+            ticket: targetTicket
+        )
+        let incomplete = WorkspaceCodemapAutomaticSelectionIncompleteReason.graph(
+            .definitionUniverse(
+                rootEpoch: rootEpoch,
+                progress: .notStarted,
+                remainingCount: nil,
+                retry: nil
+            )
+        )
+        let plan = WorkspaceCodemapAutomaticSelectionProvisionalCandidatePlan(
+            candidates: [candidate],
+            rootScopeEpochs: [rootEpoch],
+            incompleteReasons: [incomplete]
+        )
+
+        try Self.write(
+            "struct Target { let changed = true }\n",
+            to: root.appendingPathComponent("Sources/Target.swift")
+        )
+        await store.replayObservedFileSystemDeltas(
+            rootID: loaded.id,
+            deltas: [.fileModified("Sources/Target.swift", nil)]
+        )
+
+        let result = await store.provisionalAutomaticCodemapSelectionResult(
+            sources: [sourceIdentity],
+            plan: plan,
+            readyCandidates: [candidate],
+            pendingReasons: [],
+            partialReasons: [],
+            rootScope: .visibleWorkspace
+        )
+
+        XCTAssertTrue(result.targets.isEmpty)
+        XCTAssertNil(result.publicationReceipt)
+        guard case let .provisional(incompleteReasons, pendingReasons, partialReasons) = result.aggregateCoverage else {
+            return XCTFail("Expected provisional aggregate coverage.")
+        }
+        XCTAssertEqual(incompleteReasons, [incomplete])
+        XCTAssertTrue(pendingReasons.isEmpty)
+        XCTAssertEqual(partialReasons, [
+            .candidateUnavailable(
+                rootEpoch: rootEpoch,
+                fileID: target.id,
+                reason: .staleCurrentness
+            )
+        ])
         await store.unloadRoot(id: loaded.id)
     }
 
@@ -7809,6 +8052,29 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             rootScope: .visibleWorkspace
         )
         XCTAssertEqual(stalePublication, .stale(.publicationReceipt))
+    }
+
+    private func automaticSelectionCandidate(
+        file: WorkspaceFileRecord,
+        root: WorkspaceRootRecord,
+        ticket: WorkspaceCodemapArtifactDemandTicket
+    ) throws -> WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate {
+        let identity = try XCTUnwrap(WorkspaceCodemapArtifactBindingIdentity(
+            rootID: ticket.rootEpoch.rootID,
+            rootLifetimeID: ticket.rootEpoch.rootLifetimeID,
+            fileID: file.id,
+            standardizedRootPath: root.standardizedFullPath,
+            standardizedRelativePath: file.standardizedRelativePath,
+            standardizedFullPath: file.standardizedFullPath
+        ))
+        return WorkspaceCodemapBindingAutomaticSelectionCatalogCandidate(
+            identity: identity,
+            language: .swift,
+            requestGeneration: ticket.requestGeneration,
+            catalogGeneration: ticket.catalogGeneration,
+            pathGeneration: ticket.pathGeneration,
+            ingressGeneration: ticket.ingressGeneration
+        )
     }
 
     private func publishCompleteAutomaticSelectionProjection(
