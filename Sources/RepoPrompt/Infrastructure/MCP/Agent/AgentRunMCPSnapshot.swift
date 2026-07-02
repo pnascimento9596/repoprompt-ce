@@ -427,6 +427,13 @@ struct AgentRunMCPSnapshot: Equatable {
     }
 
     static func expired(sessionID: UUID) -> AgentRunMCPSnapshot {
+        expired(
+            sessionID: sessionID,
+            statusText: "This session control handle is no longer available. Start a new run or use a more recent session ID."
+        )
+    }
+
+    static func expired(sessionID: UUID, statusText: String) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot(
             sessionID: sessionID,
             tabID: nil,
@@ -436,7 +443,7 @@ struct AgentRunMCPSnapshot: Equatable {
             modelRaw: nil,
             reasoningEffortRaw: nil,
             status: .expired,
-            statusText: "This session control handle is no longer available. Start a new run or use a more recent session ID.",
+            statusText: statusText,
             latestAssistantPreview: nil,
             interaction: nil,
             transcriptItemCount: 0,

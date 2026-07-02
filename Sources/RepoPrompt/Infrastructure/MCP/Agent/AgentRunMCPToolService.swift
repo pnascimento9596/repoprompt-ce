@@ -163,6 +163,12 @@ private final class WaitScopeCompletionBox: @unchecked Sendable {
 }
 
 private let agentRunSteeringWakeNote = "Steering interrupted this wait; the agent run has not completed. After responding to the user, call agent_run.wait for this session again to resume waiting."
+private let agentRunExpiredHandleRecoveryNote = [
+    "This run/control/wait handle has expired.",
+    "If the session still exists in the active workspace, you can usually continue it with `agent_run` using `op: \"steer\"`,",
+    "the same `session_id`, and a new `message`.",
+    "Use `op: \"start\"` only when you want a new session."
+].joined(separator: " ")
 
 @MainActor
 struct AgentRunMCPToolService {
@@ -204,6 +210,13 @@ struct AgentRunMCPToolService {
 
     private static func resolvedLifecycleWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
         try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? defaultWaitTimeoutSeconds
+    }
+
+    private nonisolated static func agentRunExpiredSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
+        AgentRunMCPSnapshot.expired(
+            sessionID: sessionID,
+            statusText: agentRunExpiredHandleRecoveryNote
+        )
     }
 
     static func defaultTaskLabelForStart(
@@ -839,7 +852,7 @@ struct AgentRunMCPToolService {
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         if initialSnapshot.status == .expired {
-            throw MCPError.invalidParams("This session control handle is no longer active.")
+            throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         if initialSnapshot.status.isTerminal {
             throw MCPError.invalidParams("The run is not currently active (status: \(initialSnapshot.status.rawValue)) and cannot be cancelled.")
@@ -1089,7 +1102,7 @@ struct AgentRunMCPToolService {
         liveSnapshot _: AgentRunMCPSnapshot? = nil
     ) async throws -> Value {
         guard let initialCursor = agentModeVM.mcpWaitCursor(sessionID: sessionID) else {
-            throw MCPError.invalidParams("This session control handle is no longer active.")
+            throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
@@ -1259,7 +1272,7 @@ struct AgentRunMCPToolService {
     }
 
     private nonisolated static func expiredWaitValue(sessionID: UUID) -> Value {
-        var object = AgentRunMCPSnapshot.expired(sessionID: sessionID).asObject()
+        var object = agentRunExpiredSnapshot(sessionID: sessionID).asObject()
         object["_meta"] = .object(["wait_result": .string("expired")])
         return .object(object)
     }
@@ -1411,7 +1424,7 @@ struct AgentRunMCPToolService {
         }
         guard !cursors.isEmpty else {
             return decoratedMultiWaitValue(
-                snapshot: AgentRunMCPSnapshot.expired(sessionID: sessionIDs[0]),
+                snapshot: Self.agentRunExpiredSnapshot(sessionID: sessionIDs[0]),
                 sessionIDs: sessionIDs,
                 result: "expired",
                 pendingSessionIDs: sessionIDs
@@ -1458,7 +1471,7 @@ struct AgentRunMCPToolService {
             )
         case .expired:
             return decoratedMultiWaitValue(
-                snapshot: AgentRunMCPSnapshot.expired(sessionID: result.sessionID),
+                snapshot: Self.agentRunExpiredSnapshot(sessionID: result.sessionID),
                 sessionIDs: sessionIDs,
                 result: "expired",
                 snapshots: snapshots,
@@ -1560,7 +1573,7 @@ struct AgentRunMCPToolService {
                 if transitionKind == .unrelated {
                     let snapshot = await AgentRunSessionStore.snapshot(
                         for: .init(registration: cursor.registration, epoch: epoch)
-                    ) ?? AgentRunMCPSnapshot.expired(sessionID: sessionID)
+                    ) ?? Self.agentRunExpiredSnapshot(sessionID: sessionID)
                     return WaitAnyResult(sessionID: sessionID, disposition: .superseded(snapshot))
                 }
                 cursor = .init(registration: cursor.registration, epoch: epoch)
@@ -2167,7 +2180,7 @@ struct AgentRunMCPToolService {
             return providedSnapshot
         }
         guard let registration else {
-            return .expired(sessionID: sessionID)
+            return Self.agentRunExpiredSnapshot(sessionID: sessionID)
         }
         if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
             return liveSnapshot
@@ -2175,7 +2188,7 @@ struct AgentRunMCPToolService {
         if let storedSnapshot {
             return storedSnapshot
         }
-        return .expired(sessionID: sessionID)
+        return Self.agentRunExpiredSnapshot(sessionID: sessionID)
     }
 
     private func resolveSessionID(reference: String?, workspace: WorkspaceModel, agentModeVM: AgentModeViewModel) async throws -> UUID? {

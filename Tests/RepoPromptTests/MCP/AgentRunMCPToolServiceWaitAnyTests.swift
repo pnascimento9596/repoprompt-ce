@@ -230,6 +230,15 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         let meta = try XCTUnwrap(object["_meta"]?.objectValue)
         XCTAssertEqual(meta["wait_result"]?.stringValue, "expired")
         XCTAssertNil(meta["wake_reason"])
+
+        let statusText = try XCTUnwrap(object["status_text"]?.stringValue)
+        XCTAssertFalse(statusText.isEmpty)
+        XCTAssertTrue(statusText.contains("run/control/wait handle has expired"))
+        XCTAssertTrue(statusText.contains("`agent_run`"))
+        XCTAssertTrue(statusText.contains("`op: \"steer\"`"))
+        XCTAssertTrue(statusText.contains("`session_id`"))
+        XCTAssertTrue(statusText.contains("`message`"))
+        XCTAssertFalse(statusText.contains("Start a new run or use a more recent session ID"))
     }
 
     func testWaitAnyCutoffExcludesSteeringProducedAfterSiblingCancellation() async {
