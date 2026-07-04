@@ -310,6 +310,26 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let dto = try listReply(result)
         let session = try XCTUnwrap(dto.sessions.first)
         XCTAssertEqual(session.filesTouched, ["lib/utils.swift", "src/main.swift"]) // sorted
+        XCTAssertEqual(session.filesTouchedCount, 2)
+        XCTAssertFalse(session.filesTouchedTruncated)
+    }
+
+    func testListSessions_capsFilesTouchedAndReportsCount() async throws {
+        let paths = (0 ..< 25).map { String(format: "Sources/File%02d.swift", $0) }
+        let record = makeRecord(name: "S1", keyPaths: Set(paths))
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        )
+        let dto = try listReply(result)
+        let session = try XCTUnwrap(dto.sessions.first)
+        XCTAssertEqual(session.filesTouched.count, 20)
+        XCTAssertEqual(session.filesTouchedCount, 25)
+        XCTAssertTrue(session.filesTouchedTruncated)
+        XCTAssertEqual(session.filesTouched.first, "Sources/File00.swift")
+        XCTAssertEqual(session.filesTouched.last, "Sources/File19.swift")
     }
 
     func testListSessions_lastRunState() async throws {
@@ -1136,7 +1156,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time"],
             scanner: mockScanner
         )
-        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'group_by'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'group_by'. Valid values: day, week, month, session, workspace")
     }
 
     func testTime_invalidGroupBy_returnsError() async throws {

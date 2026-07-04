@@ -981,8 +981,13 @@ extension ToolOutputFormatter {
                 let duration = session["active_duration_seconds"]?.intValue ?? 0
                 let turns = session["turn_count"]?.intValue ?? 0
                 let files = session["files_touched"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                let filesTouchedCount = session["files_touched_count"]?.intValue ?? files.count
+                let filesTouchedTruncated = session["files_touched_truncated"]?.boolValue == true
                 var suffix = "\(duration)s, \(turns) turn\(turns == 1 ? "" : "s")"
-                if !files.isEmpty { suffix += ", files: \(files.prefix(3).joined(separator: ", "))" }
+                if !files.isEmpty {
+                    suffix += ", files: \(files.prefix(3).joined(separator: ", "))"
+                    if filesTouchedTruncated { suffix += " (+\(max(0, filesTouchedCount - files.count)) more)" }
+                }
                 lines.append("- `\(session["session_id"]?.stringValue ?? "")` **\(name)** (\(workspace)) — \(suffix)")
             }
             if sessions.count > 20 { lines.append("- … and \(sessions.count - 20) more session\(sessions.count - 20 == 1 ? "" : "s")") }

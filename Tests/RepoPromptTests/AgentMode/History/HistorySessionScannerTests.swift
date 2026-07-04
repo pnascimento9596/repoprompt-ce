@@ -186,6 +186,30 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertEqual(filtered[0].sessionID, r1.id)
     }
 
+    func testSessionsMatchingFilters_byWorkspaceStorageDirectoryName() async throws {
+        let wsUUID = UUID()
+        let ws1 = try createWorkspaceDir(name: "RepoPromptCE", uuid: wsUUID)
+        let ws2 = try createWorkspaceDir(name: "OtherProject", uuid: UUID())
+        let r1 = makeMinimalRecord(name: "Session1")
+        let r2 = makeMinimalRecord(name: "Session2")
+        try createAgentSessionsIndex(in: ws1, records: [r1])
+        try createAgentSessionsIndex(in: ws2, records: [r2])
+
+        let scanResults = try await scanner.scanAllWorkspaces()
+        let filtered = scanner.sessionsMatchingFilters(
+            scanResults,
+            workspace: "Workspace-RepoPromptCE-",
+            agentKind: nil,
+            model: nil,
+            filePath: nil,
+            from: nil,
+            to: nil
+        )
+
+        XCTAssertEqual(filtered.count, 1)
+        XCTAssertEqual(filtered[0].sessionID, r1.id)
+    }
+
     func testSessionsMatchingFilters_byWorkspaceUUID() async throws {
         let wsUUID = UUID()
         let ws1 = try createWorkspaceDir(name: "ProjectA", uuid: wsUUID)

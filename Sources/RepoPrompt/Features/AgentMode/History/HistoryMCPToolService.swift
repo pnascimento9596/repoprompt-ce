@@ -11,6 +11,7 @@ import MCP
 enum HistoryMCPToolService {
     /// UserDefaults key shared with GlobalSettingsStore.setHistoryIdleThresholdMinutes.
     static let idleThresholdSettingsKey = "history.idle_threshold_minutes"
+    private static let maxFilesTouchedPerListedSession = 20
 
     // MARK: - Public Entry Point
 
@@ -106,6 +107,8 @@ enum HistoryMCPToolService {
 
             let sessions: [HistoryListSessionsReply.SessionDTO] = sliced.map { session in
                 let r = session.record
+                let filesTouched = Array(r.keyPaths).sorted()
+                let cappedFilesTouched = Array(filesTouched.prefix(maxFilesTouchedPerListedSession))
                 return HistoryListSessionsReply.SessionDTO(
                     sessionID: r.id.uuidString,
                     sessionName: r.name,
@@ -115,7 +118,9 @@ enum HistoryMCPToolService {
                     activeDurationSeconds: r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
                     turnCount: r.itemCount,
                     toolCallCount: r.toolCallCount,
-                    filesTouched: Array(r.keyPaths).sorted(),
+                    filesTouched: cappedFilesTouched,
+                    filesTouchedCount: filesTouched.count,
+                    filesTouchedTruncated: filesTouched.count > cappedFilesTouched.count,
                     hadErrors: r.hasUnknownConversationContent,
                     agentKind: r.agentKindRaw,
                     agentModel: r.agentModelRaw,
@@ -334,7 +339,7 @@ enum HistoryMCPToolService {
         scanner: HistorySessionScanning
     ) async throws -> HistoryToolReply {
         guard let groupBy = args["group_by"]?.stringValue, !groupBy.isEmpty else {
-            return .error(HistoryErrorReply(error: "Missing or empty required parameter 'group_by'"))
+            return .error(HistoryErrorReply(error: "Missing or empty required parameter 'group_by'. Valid values: day, week, month, session, workspace"))
         }
 
         let validGroupBys: Set = ["day", "week", "month", "session", "workspace"]

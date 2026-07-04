@@ -8,6 +8,8 @@ import Foundation
 // one typed value across all three ops plus the error case, which the provider then
 // encodes via `Value(dto)` like every other window-tool provider.
 //
+// `list_sessions.files_touched` is capped to keep raw MCP payloads predictable;
+// use `files_touched_count` and `files_touched_truncated` to detect omitted paths.
 // Optional response fields (`agent_kind`, `agent_model`, `last_run_state` on list;
 // `turn_request_text` on search; `details` on time groups) are plain `Optional`
 // properties, so they are omitted from the encoded JSON when absent — no per-field
@@ -34,6 +36,8 @@ struct HistoryListSessionsReply: Codable, Equatable {
         let turnCount: Int
         let toolCallCount: Int
         let filesTouched: [String]
+        let filesTouchedCount: Int
+        let filesTouchedTruncated: Bool
         let hadErrors: Bool
         let agentKind: String?
         let agentModel: String?
@@ -49,6 +53,8 @@ struct HistoryListSessionsReply: Codable, Equatable {
             case turnCount = "turn_count"
             case toolCallCount = "tool_call_count"
             case filesTouched = "files_touched"
+            case filesTouchedCount = "files_touched_count"
+            case filesTouchedTruncated = "files_touched_truncated"
             case hadErrors = "had_errors"
             case agentKind = "agent_kind"
             case agentModel = "agent_model"
@@ -65,6 +71,8 @@ struct HistoryListSessionsReply: Codable, Equatable {
             turnCount: Int,
             toolCallCount: Int,
             filesTouched: [String],
+            filesTouchedCount: Int? = nil,
+            filesTouchedTruncated: Bool? = nil,
             hadErrors: Bool,
             agentKind: String? = nil,
             agentModel: String? = nil,
@@ -79,6 +87,8 @@ struct HistoryListSessionsReply: Codable, Equatable {
             self.turnCount = turnCount
             self.toolCallCount = toolCallCount
             self.filesTouched = filesTouched
+            self.filesTouchedCount = filesTouchedCount ?? filesTouched.count
+            self.filesTouchedTruncated = filesTouchedTruncated ?? false
             self.hadErrors = hadErrors
             self.agentKind = agentKind
             self.agentModel = agentModel

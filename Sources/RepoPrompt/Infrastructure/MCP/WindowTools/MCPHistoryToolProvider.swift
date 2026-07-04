@@ -36,9 +36,9 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
             - `search`: Full-text search across session transcripts and summaries. Matches against both live activity text and compacted turn summaries. Returns snippets with ~200 chars of context around each match.
             - `time`: Aggregate time-in-session analytics. Groups by day, week, month, session, or workspace. Active duration uses the settings-backed default idle threshold (currently 10 minutes) unless `idle_threshold_minutes` is provided.
 
-            **Cross-workspace**: All ops scan every workspace directory by default. Use `workspace` to limit to a single workspace.
+            **Scope**: Window routing does not imply workspace scope. By default, history scans all saved workspaces. Use `workspace` to filter by saved workspace name, workspace UUID, or the `Workspace-...` storage directory name. Workspaces with stale metadata indexes are skipped and reported in `skipped_workspaces` rather than rebuilt inline.
 
-            **Truncation**: `list_sessions` and `search` enforce result limits. Transcript-backed scans are bounded by `max_sessions_scanned` (default 200) and report `scan_truncated` when capped.
+            **Truncation**: `truncated` means returned results were capped by `limit`; `scan_truncated` means work was capped by `max_sessions_scanned` (default 200, hard cap 1000).
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(
@@ -54,20 +54,20 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                         description: "Operation.",
                         enum: ["list_sessions", "search", "time"]
                     ),
-                    "workspace": .string(description: "Limit to workspace name or UUID."),
+                    "workspace": .string(description: "Limit to saved workspace name, UUID, or Workspace-* storage directory name. Stale-index workspaces are reported in skipped_workspaces, not searched."),
                     "agent_kind": .string(description: "[list_sessions] Agent kind filter (e.g. claudeCodeGLM, codexExec, acp)."),
                     "model": .string(description: "[list_sessions] Model substring match."),
                     "touched_file": .string(description: "[list_sessions] Filter sessions that edited or read this file path."),
                     "date_from": .string(description: "ISO 8601 lower date bound (e.g. 2026-01-01T00:00:00Z)."),
                     "date_to": .string(description: "ISO 8601 upper date bound."),
                     "sort": .string(
-                        description: "[list_sessions] Sort order: last_activity (default), duration, turn_count.",
+                        description: "[list_sessions] Sort order: last_activity (default), duration, turn_count. duration may hydrate bounded sessions and can be slower on large histories.",
                         enum: ["last_activity", "duration", "turn_count"]
                     ),
                     "limit": .integer(description: "Max returned results. list_sessions default 30, search default 20, max 100."),
                     "idle_threshold_minutes": .integer(description: "[list_sessions, time] Idle gap threshold in minutes for active duration. Omitted uses the app setting/default (currently 10). Range 0...1440."),
-                    "max_sessions_scanned": .integer(description: "[list_sessions, search, time] Max sessions to hydrate/scan before reporting scan_truncated. Default 200, hard cap 1000."),
-                    "include_turn_request_text": .boolean(description: "[search] Include clipped matched-turn user request text. Default false to keep output compact."),
+                    "max_sessions_scanned": .integer(description: "[list_sessions, search, time] Max sessions to hydrate/scan before reporting scan_truncated. Default 200, hard cap 1000. scan_truncated means more sessions may exist beyond the cap."),
+                    "include_turn_request_text": .boolean(description: "[search] Verbose opt-in: include clipped matched-turn user request text. Default false to keep output compact."),
                     "query": .string(description: "[search] Search term (required for search). Case-insensitive substring match."),
                     "session_id": .string(description: "[search, time] Limit to a specific session UUID."),
                     "source": .string(
@@ -78,7 +78,7 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                         description: "[time] Grouping dimension (required for time).",
                         enum: ["day", "week", "month", "session", "workspace"]
                     ),
-                    "include_details": .boolean(description: "[time] Include per-session breakdowns in each group. Default false.")
+                    "include_details": .boolean(description: "[time] Verbose opt-in: include per-session breakdowns in each group. Default false.")
                 ],
                 required: ["op"]
             )

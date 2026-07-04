@@ -725,6 +725,34 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("## History Sessions ❌"))
     }
 
+    func testHistoryFormatterShowsFilesTouchedTruncation() throws {
+        struct HistorySession: Encodable {
+            let session_id = "s1"
+            let session_name = "Big Session"
+            let workspace_name = "Repo"
+            let active_duration_seconds = 12
+            let turn_count = 3
+            let files_touched = ["A.swift", "B.swift", "C.swift"]
+            let files_touched_count = 5
+            let files_touched_truncated = true
+        }
+
+        struct HistoryList: Encodable {
+            let total_sessions = 1
+            let truncated = false
+            let sessions_scanned = 1
+            let scan_truncated = false
+            let skipped_workspaces: [String] = []
+            let sessions = [HistorySession()]
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("list_sessions")],
+            value: Self.value(HistoryList())
+        ))
+        XCTAssertTrue(text.contains("files: A.swift, B.swift, C.swift (+2 more)"))
+    }
+
     func testHistoryFormatterSummarizesSkippedWorkspaces() throws {
         struct HistoryList: Encodable {
             let total_sessions = 1
