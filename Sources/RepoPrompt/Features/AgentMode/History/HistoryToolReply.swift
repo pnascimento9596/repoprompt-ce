@@ -88,11 +88,17 @@ struct HistoryListSessionsReply: Codable, Equatable {
 
     let totalSessions: Int
     let truncated: Bool
+    let sessionsScanned: Int
+    let scanTruncated: Bool
+    let skippedWorkspaces: [String]
     let sessions: [SessionDTO]
 
     private enum CodingKeys: String, CodingKey {
         case totalSessions = "total_sessions"
         case truncated
+        case sessionsScanned = "sessions_scanned"
+        case scanTruncated = "scan_truncated"
+        case skippedWorkspaces = "skipped_workspaces"
         case sessions
     }
 }
@@ -153,12 +159,16 @@ struct HistorySearchReply: Codable, Equatable {
     /// match `limit`). Surface so callers know the scan — not just the results — was
     /// bounded.
     let scanTruncated: Bool
+    let sessionsScanned: Int
+    let skippedWorkspaces: [String]
     let results: [MatchDTO]
 
     private enum CodingKeys: String, CodingKey {
         case totalMatches = "total_matches"
         case truncated
         case scanTruncated = "scan_truncated"
+        case sessionsScanned = "sessions_scanned"
+        case skippedWorkspaces = "skipped_workspaces"
         case results
     }
 }
@@ -217,12 +227,18 @@ struct HistoryTimeReply: Codable, Equatable {
     let totalSessions: Int
     let totalActiveDurationSeconds: Int
     let truncated: Bool
+    let sessionsScanned: Int
+    let scanTruncated: Bool
+    let skippedWorkspaces: [String]
     let groups: [GroupDTO]
 
     private enum CodingKeys: String, CodingKey {
         case totalSessions = "total_sessions"
         case totalActiveDurationSeconds = "total_active_duration_seconds"
         case truncated
+        case sessionsScanned = "sessions_scanned"
+        case scanTruncated = "scan_truncated"
+        case skippedWorkspaces = "skipped_workspaces"
         case groups
     }
 }

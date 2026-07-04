@@ -47,8 +47,8 @@ This spec proposes a new MCP tool group — **`history`** — that queries past 
 - Single MCP tool named `history` with `op` dispatch: `list_sessions` | `search` | `time`. Follows the established convention used by `prompt`, `git`, `manage_worktree`, `agent_manage`.
 - Registered as a window-scoped MCP tool (in `MCPWindowToolGroup.history`) that queries across all workspaces. Follows the `agent_manage.list_sessions` precedent — window tool registration with cross-workspace behavior.
 - Parameter naming follows existing RP-CE conventions (descriptive snake_case: `date_from`, `agent_kind`, `touched_file`, `session_id`).
-- Active duration is derived at query time from stored, threshold-independent interval primitives (the union of merged turn-active intervals and the positive gaps between those intervals). The idle threshold is an integer in the inclusive range 0–1440 minutes, defaulting to 30 (`defaultIdleThresholdMinutes`); an omitted or null value uses the default, while an out-of-range or non-integer value is a validation error (not clamped). A gap strictly greater than the threshold is idle and excluded; a gap less than or equal is active. A threshold of 0 means every positive gap is idle, so `active_duration_seconds` equals the merged-interval duration. The same threshold applies to every active-duration field an operation returns (`total_active_duration_seconds`, per-group, and per-detail). The gap between merged active intervals is an approximation of idle time — it conflates user think-time, agent pauses, and time away from the app; it is not strictly "time waiting for user input."
-- **Date bounds**: `date_from`/`date_to` accept ISO 8601 datetimes (exact instant) or date-only values (`YYYY-MM-DD`). For date-only values, `date_from` resolves to start-of-day (`00:00:00 UTC`) and `date_to` resolves to end-of-day (`23:59:59 UTC`), so both bounds are inclusive of the named day. An unparseable date string is ignored (treated as no bound) rather than erroring.
+- Active duration is derived at query time from stored, threshold-independent interval primitives (the union of merged turn-active intervals and the positive gaps between those intervals). The idle threshold is an integer in the inclusive range 0–1440 minutes. An omitted or null value uses the settings-backed app default (`history.idle_threshold_minutes`, currently 10 minutes when unset), while an out-of-range or non-integer value is a validation error (not clamped). A gap strictly greater than the threshold is idle and excluded; a gap less than or equal is active. A threshold of 0 means every positive gap is idle, so `active_duration_seconds` equals the merged-interval duration. The same threshold applies to every active-duration field an operation returns (`total_active_duration_seconds`, per-group, and per-detail). The gap between merged active intervals is an approximation of idle time — it conflates user think-time, agent pauses, and time away from the app; it is not strictly "time waiting for user input."
+- **Date bounds**: `date_from`/`date_to` accept ISO 8601 datetimes (exact instant) or date-only values (`YYYY-MM-DD`). For date-only values, `date_from` resolves to start-of-day (`00:00:00 UTC`) and `date_to` resolves to end-of-day (`23:59:59 UTC`), so both bounds are inclusive of the named day. An unparseable date string returns the history tool's normal `{"error": ...}` DTO. Calendar `time` grouping (`day`/`week`/`month`) applies bounds per turn after transcript loading, not only at session selection.
 - **Validation**: enum parameters are strict — invalid `sort` (`list_sessions`) and invalid `source` (`search`) return a validation error rather than silently falling back. `group_by` (`time`) and `op` are likewise validated. `search` `query` is trimmed; a whitespace-only query is rejected as empty.
 - Secret sanitization in search snippets deferred to v2 (`MCPResponseSanitizationPolicy` does not exist). Search snippets may expose tool args containing secrets. The risk is bounded (session data is local, only the machine's user sees MCP responses).
 ## Scenarios
@@ -70,13 +70,13 @@ This spec proposes a new MCP tool group — **`history`** — that queries past 
 
 ### Scenario: Time aggregation with idle gap exclusion
 - **Given** a session with turns spanning 10:00–11:00, then a 2-hour gap, then turns from 13:00–13:30
-- **When** `history.time(group_by: "session")` at the default 30-minute threshold
+- **When** `history.time(group_by: "session")` at the settings-backed default idle threshold (currently 10 minutes)
 - **Then** `active_duration_seconds` is 5400 (90 minutes), not 12600 (3.5 hours)
 
 ### Scenario: Custom idle threshold changes what counts as active
 - **Given** a session with turns spanning 10:00–11:00, then a 15-minute gap, then turns from 11:15–11:45
 - **When** `history.time(group_by: "session", idle_threshold_minutes: 10)`
-- **Then** the 15-minute gap counts as idle, so `active_duration_seconds` is 5400 (the 60- and 30-minute blocks only); at the default 30-minute threshold the same session reports 6300 (the gap merged in as active)
+- **Then** the 15-minute gap counts as idle, so `active_duration_seconds` is 5400 (the 60- and 30-minute blocks only); at the settings-backed default idle threshold (currently 10 minutes) the same session reports 6300 (the gap merged in as active)
 
 ### Scenario: Gap equal to the idle threshold counts as active
 - **Given** a session with merged active intervals 10:00–11:00 and 11:10–11:30 (a 10-minute gap)
@@ -86,7 +86,7 @@ This spec proposes a new MCP tool group — **`history`** — that queries past 
 ### Scenario: list_sessions applies the custom idle threshold
 - **Given** a session with merged active intervals 10:00–11:00 and 11:15–11:45 (a 15-minute gap)
 - **When** `history.list_sessions(idle_threshold_minutes: 10)`
-- **Then** that session's `active_duration_seconds` is 5400; at the default 30-minute threshold it would be 6300
+- **Then** that session's `active_duration_seconds` is 5400; at the settings-backed default idle threshold (currently 10 minutes) it would be 6300
 
 ### Scenario: Zero-turn session contributes zero duration
 - **Given** a session with no turn-active intervals that otherwise matches the query filters
@@ -141,9 +141,10 @@ Session inventory with content-aware filters.
 | `date_to` | `string?` | ISO 8601 upper bound |
 | `sort` | `string?` | `"last_activity"` (default) \| `"duration"` \| `"turn_count"` |
 | `limit` | `int?` | Max results (default: 30, max: 100) |
-| `idle_threshold_minutes` | `int?` | Gaps longer than this count as idle when computing `active_duration_seconds` (default: 30, range: 0–1440) |
+| `idle_threshold_minutes` | `int?` | Gaps longer than this count as idle when computing `active_duration_seconds` (settings-backed default, currently 10; range: 0–1440) |
+| `max_sessions_scanned` | `int?` | Bound on sessions hydrated for stub-derived fields / touched-file matching (default: 200, hard cap: 1000) |
 
-**Returns:** `total_sessions`, `truncated`, and array of `sessions` with: `session_id`, `session_name`, `workspace_name`, `agent_kind`*, `agent_model`*, `first_activity_at`, `last_activity_at`, `active_duration_seconds`, `turn_count`, `tool_call_count`, `files_touched`, `had_errors`, `last_run_state`*.
+**Returns:** `total_sessions`, `truncated`, `sessions_scanned`, `scan_truncated`, `skipped_workspaces`, and array of `sessions` with: `session_id`, `session_name`, `workspace_name`, `agent_kind`*, `agent_model`*, `first_activity_at`, `last_activity_at`, `active_duration_seconds`, `turn_count`, `tool_call_count`, `files_touched`, `had_errors`, `last_run_state`*.
 
 - `first_activity_at`: earliest indexed transcript turn/activity timestamp, with session activity date as a fallback for legacy indexes.
 - `last_activity_at`: latest indexed transcript turn/activity timestamp, with `savedAt` as a fallback for legacy indexes.
@@ -166,10 +167,12 @@ Full-text search across session transcripts and summaries.
 | `date_from` | `string?` | ISO 8601 lower bound |
 | `date_to` | `string?` | ISO 8601 upper bound |
 | `limit` | `int?` | Max results (default: 20, max: 100) |
+| `max_sessions_scanned` | `int?` | Bound on transcript sessions scanned (default: 200, hard cap: 1000) |
+| `include_turn_request_text` | `bool?` | Include clipped matched-turn user request text (default: false) |
 
-**Returns:** `total_matches`, `truncated`, and array of `results` with: `session_id`, `session_name`, `workspace_name`, `turn_index`, `turn_request_text`*, `role`, `timestamp`, `snippet` (~200 chars), `source`.
+**Returns:** `total_matches`, `truncated`, `scan_truncated`, `sessions_scanned`, `skipped_workspaces`, and array of `results` with: `session_id`, `session_name`, `workspace_name`, `turn_index`, `turn_request_text`*, `role`, `timestamp`, `snippet` (~200 chars), `source`.
 
-- `turn_request_text`*: emitted only when the matched turn has a user request; absent for turns without one.
+- `turn_request_text`*: emitted only when `include_turn_request_text: true` and the matched turn has a user request; clipped for compactness.
 
 **Matching:** Case-insensitive substring match against activity `text` fields and summary text fields. For summary search: `conclusionText` (full, non-truncated) is preferred when available (full/condensed retention tiers); `compactConclusionText` (≤220 chars) serves as the fallback for summary/archived tiers where `conclusionText` is nil. Also searches `middleSummaryText` and `requestText`. Multi-word queries match the literal string, not individual words. Snippets include ~200 characters of context around the match.
 
@@ -189,11 +192,12 @@ Aggregate time-in-session analytics.
 | `date_from` | `string?` | ISO 8601 lower bound |
 | `date_to` | `string?` | ISO 8601 upper bound |
 | `include_details` | `bool?` | Include per-session breakdowns (default: false) |
-| `idle_threshold_minutes` | `int?` | Gaps longer than this count as idle (default: 30, range: 0–1440) |
+| `idle_threshold_minutes` | `int?` | Gaps longer than this count as idle (settings-backed default, currently 10; range: 0–1440) |
+| `max_sessions_scanned` | `int?` | Bound on transcript/hydration sessions scanned (default: 200, hard cap: 1000) |
 
-**Returns:** `total_sessions`, `total_active_duration_seconds`, `truncated`, and array of `groups` keyed by the `group_by` value. Each group has `sessions`, `active_duration_seconds`, `turn_count`, `tool_call_count`, and optional `details` array with per-session breakdowns.
+**Returns:** `total_sessions`, `total_active_duration_seconds`, `truncated`, `sessions_scanned`, `scan_truncated`, `skipped_workspaces`, and array of `groups` keyed by the `group_by` value. Each group has `sessions`, `active_duration_seconds`, `turn_count`, `tool_call_count`, and optional `details` array with per-session breakdowns.
 
-**Duration:** Computed at query time from stored interval primitives: turn-active intervals (`completedAt ?? lastActivityAt ?? startedAt` per turn, merged to remove overlap) plus the positive gaps between them. `idle_threshold_minutes` (default 30) splits gaps — gaps greater than the threshold are idle and excluded; gaps less than or equal are active and included. `active_duration_seconds` / `total_active_duration_seconds` reflect the requested threshold.
+**Duration:** Computed at query time from stored interval primitives: turn-active intervals (`completedAt ?? lastActivityAt ?? startedAt` per turn, merged to remove overlap) plus the positive gaps between them. `idle_threshold_minutes` (settings-backed default, currently 10) splits gaps — gaps greater than the threshold are idle and excluded; gaps less than or equal are active and included. `active_duration_seconds` / `total_active_duration_seconds` reflect the requested threshold.
 
 ## Implementation Notes
 

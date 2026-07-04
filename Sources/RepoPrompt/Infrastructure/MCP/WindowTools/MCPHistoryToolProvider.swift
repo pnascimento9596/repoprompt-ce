@@ -34,20 +34,20 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
 
             - `list_sessions`: Session inventory with content-aware filters (workspace, agent kind, model, files touched, date range). Returns session metadata including duration, turn count, and files touched.
             - `search`: Full-text search across session transcripts and summaries. Matches against both live activity text and compacted turn summaries. Returns snippets with ~200 chars of context around each match.
-            - `time`: Aggregate time-in-session analytics. Groups by day, week, month, session, or workspace. Active duration excludes idle gaps > 30 minutes between consecutive turns.
+            - `time`: Aggregate time-in-session analytics. Groups by day, week, month, session, or workspace. Active duration uses the settings-backed default idle threshold (currently 10 minutes) unless `idle_threshold_minutes` is provided.
 
             **Cross-workspace**: All ops scan every workspace directory by default. Use `workspace` to limit to a single workspace.
 
-            **Truncation**: All ops enforce a `limit` (list_sessions default 30, search default 20) and report `truncated: true` when results exceed it.
+            **Truncation**: `list_sessions` and `search` enforce result limits. Transcript-backed scans are bounded by `max_sessions_scanned` (default 200) and report `scan_truncated` when capped.
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **list_sessions**: workspace?, agent_kind?, model?, touched_file?, date_from?, date_to?, sort?, limit?
-                **search**: query (required), workspace?, session_id?, source?, date_from?, date_to?, limit?
-                **time**: group_by (required), workspace?, session_id?, date_from?, date_to?, include_details?
+                **list_sessions**: workspace?, agent_kind?, model?, touched_file?, date_from?, date_to?, sort?, limit?, idle_threshold_minutes?, max_sessions_scanned?
+                **search**: query (required), workspace?, session_id?, source?, date_from?, date_to?, limit?, max_sessions_scanned?, include_turn_request_text?
+                **time**: group_by (required), workspace?, session_id?, date_from?, date_to?, include_details?, idle_threshold_minutes?, max_sessions_scanned?
                 """,
                 properties: [
                     "op": .string(
@@ -64,7 +64,10 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                         description: "[list_sessions] Sort order: last_activity (default), duration, turn_count.",
                         enum: ["last_activity", "duration", "turn_count"]
                     ),
-                    "limit": .integer(description: "Max results. list_sessions default 30, search default 20, max 100."),
+                    "limit": .integer(description: "Max returned results. list_sessions default 30, search default 20, max 100."),
+                    "idle_threshold_minutes": .integer(description: "[list_sessions, time] Idle gap threshold in minutes for active duration. Omitted uses the app setting/default (currently 10). Range 0...1440."),
+                    "max_sessions_scanned": .integer(description: "[list_sessions, search, time] Max sessions to hydrate/scan before reporting scan_truncated. Default 200, hard cap 1000."),
+                    "include_turn_request_text": .boolean(description: "[search] Include clipped matched-turn user request text. Default false to keep output compact."),
                     "query": .string(description: "[search] Search term (required for search). Case-insensitive substring match."),
                     "session_id": .string(description: "[search, time] Limit to a specific session UUID."),
                     "source": .string(

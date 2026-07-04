@@ -51,8 +51,14 @@ enum HistoryMCPToolService {
         let agentKindFilter = args["agent_kind"]?.stringValue
         let modelFilter = args["model"]?.stringValue
         let filePathFilter = args["touched_file"]?.stringValue
-        let dateFrom = parseDateBound(args["date_from"]?.stringValue, isUpperBound: false)
-        let dateTo = parseDateBound(args["date_to"]?.stringValue, isUpperBound: true)
+        let dateFrom: Date?
+        let dateTo: Date?
+        do {
+            dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
+            dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
+        } catch let error as HistoryValidationError {
+            return .error(HistoryErrorReply(error: error.message))
+        }
         let sortRaw = args["sort"]?.stringValue ?? "last_activity"
         guard ["last_activity", "duration", "turn_count"].contains(sortRaw) else {
             return .error(HistoryErrorReply(error: "Invalid 'sort' value '\(sortRaw)'. Valid values: last_activity, duration, turn_count"))
@@ -61,22 +67,41 @@ enum HistoryMCPToolService {
 
         do {
             let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
+            let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
             let scanResults = try await scanner.scanAllWorkspaces()
+            let skippedWorkspaces = scanDiagnostics(from: scanResults)
             let filtered = scanner.sessionsMatchingFilters(
                 scanResults,
                 workspace: workspaceFilter,
                 agentKind: agentKindFilter,
                 model: modelFilter,
-                filePath: filePathFilter,
+                filePath: nil,
                 from: dateFrom,
                 to: dateTo
             )
 
-            // Enrich stub-built records (rebuilt without a transcript) on demand before sorting,
-            // so duration/keyPath fields are correct without taxing the shared index rebuild.
-            let enriched = await Self.enrichingStubBuiltSessions(filtered, scanner: scanner)
-            let sorted = sortFilteredSessions(enriched, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
-            let truncated = sorted.count > limit
+            // Keep metadata filtering/sorting cheap, then hydrate only bounded candidates.
+            // When touched_file is present, stub-rebuilt records may have empty keyPaths, so
+            // the file filter is applied after bounded on-demand enrichment.
+            var sorted = sortFilteredSessions(filtered, by: sortRaw == "duration" ? "last_activity" : sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+            let candidates = Array(sorted.prefix(maxSessionsScanned))
+            let sessionsScanned = candidates.count
+            let scanTruncated = sorted.count > candidates.count
+            var hydrated = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
+            if sortRaw == "duration" {
+                hydrated = sortFilteredSessions(hydrated, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+            }
+            let totalSessions: Int
+            if let filePathFilter {
+                hydrated = hydrated.filter { session in
+                    session.record.keyPaths.contains { $0.localizedCaseInsensitiveContains(filePathFilter) }
+                }
+                totalSessions = hydrated.count
+            } else {
+                totalSessions = filtered.count
+            }
+            sorted = hydrated
+            let truncated = scanTruncated || sorted.count > limit
             let sliced = Array(sorted.prefix(limit))
 
             let sessions: [HistoryListSessionsReply.SessionDTO] = sliced.map { session in
@@ -99,8 +124,11 @@ enum HistoryMCPToolService {
             }
 
             return .listSessions(HistoryListSessionsReply(
-                totalSessions: sorted.count,
+                totalSessions: totalSessions,
                 truncated: truncated,
+                sessionsScanned: sessionsScanned,
+                scanTruncated: scanTruncated,
+                skippedWorkspaces: skippedWorkspaces,
                 sessions: sessions
             ))
         } catch let error as HistoryValidationError {
@@ -114,7 +142,8 @@ enum HistoryMCPToolService {
     /// scan. `limit` caps matches, not work; without this, a broad query forces a full
     /// `AgentSession` decode across every filtered session. When the cap is hit,
     /// `scan_truncated` is surfaced in the reply.
-    private static let maxSessionsScanned = 200
+    private static let defaultMaxSessionsScanned = 200
+    private static let absoluteMaxSessionsScanned = 1000
 
     private static func executeSearch(
         args: [String: Value],
@@ -133,11 +162,25 @@ enum HistoryMCPToolService {
         guard ["activities", "summaries", "all"].contains(sourceFilter) else {
             return .error(HistoryErrorReply(error: "Invalid 'source' value '\(sourceFilter)'. Valid values: activities, summaries, all"))
         }
-        let dateFrom = parseDateBound(args["date_from"]?.stringValue, isUpperBound: false)
-        let dateTo = parseDateBound(args["date_to"]?.stringValue, isUpperBound: true)
+        let dateFrom: Date?
+        let dateTo: Date?
+        do {
+            dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
+            dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
+        } catch let error as HistoryValidationError {
+            return .error(HistoryErrorReply(error: error.message))
+        }
         let limit = clampLimit(args["limit"]?.intValue, default: 20, max: 100)
+        let includeTurnRequestText = args["include_turn_request_text"]?.boolValue ?? false
+        let maxSessionsScanned: Int
+        do {
+            maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
+        } catch let error as HistoryValidationError {
+            return .error(HistoryErrorReply(error: error.message))
+        }
 
         let scanResults = try await scanner.scanAllWorkspaces()
+        let skippedWorkspaces = scanDiagnostics(from: scanResults)
 
         let filtered: [HistoryFilteredSessionRecord]
         do {
@@ -154,7 +197,8 @@ enum HistoryMCPToolService {
         }
 
         let queryLower = query.lowercased()
-        var allMatches: [HistorySearchMatch] = []
+        var retainedMatches: [HistorySearchMatch] = []
+        var totalMatches = 0
         var sessionsScanned = 0
         var scanTruncated = false
 
@@ -242,21 +286,22 @@ enum HistoryMCPToolService {
                 if turnMatches.count > 1 {
                     let activityMatch = turnMatches.first { $0.source == "activity" }
                     if let activityMatch {
-                        allMatches.append(activityMatch)
+                        appendSearchMatch(activityMatch, totalMatches: &totalMatches, retainedMatches: &retainedMatches, limit: limit)
                     } else {
-                        allMatches.append(turnMatches[0])
+                        appendSearchMatch(turnMatches[0], totalMatches: &totalMatches, retainedMatches: &retainedMatches, limit: limit)
                     }
                 } else if let only = turnMatches.first {
-                    allMatches.append(only)
+                    appendSearchMatch(only, totalMatches: &totalMatches, retainedMatches: &retainedMatches, limit: limit)
                 }
             }
         }
 
-        // Sort matches by timestamp descending.
-        allMatches.sort { $0.timestamp > $1.timestamp }
+        // Sort retained matches by timestamp descending. We intentionally retain only a
+        // bounded result window while still counting every match in scanned sessions.
+        retainedMatches.sort { $0.timestamp > $1.timestamp }
 
-        let truncated = allMatches.count > limit
-        let sliced = Array(allMatches.prefix(limit))
+        let truncated = totalMatches > retainedMatches.count || scanTruncated
+        let sliced = Array(retainedMatches.prefix(limit))
 
         let results: [HistorySearchReply.MatchDTO] = sliced.map { match in
             HistorySearchReply.MatchDTO(
@@ -268,14 +313,16 @@ enum HistoryMCPToolService {
                 timestamp: iso8601DateTime.string(from: match.timestamp),
                 snippet: match.snippet,
                 source: match.source,
-                turnRequestText: match.turnRequestText
+                turnRequestText: includeTurnRequestText ? clippedTurnRequestText(match.turnRequestText) : nil
             )
         }
 
         return .search(HistorySearchReply(
-            totalMatches: allMatches.count,
+            totalMatches: totalMatches,
             truncated: truncated,
             scanTruncated: scanTruncated,
+            sessionsScanned: sessionsScanned,
+            skippedWorkspaces: skippedWorkspaces,
             results: results
         ))
     }
@@ -297,11 +344,24 @@ enum HistoryMCPToolService {
 
         let workspaceFilter = args["workspace"]?.stringValue
         let sessionIDFilter = args["session_id"]?.stringValue
-        let dateFrom = parseDateBound(args["date_from"]?.stringValue, isUpperBound: false)
-        let dateTo = parseDateBound(args["date_to"]?.stringValue, isUpperBound: true)
+        let dateFrom: Date?
+        let dateTo: Date?
+        do {
+            dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
+            dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
+        } catch let error as HistoryValidationError {
+            return .error(HistoryErrorReply(error: error.message))
+        }
         let includeDetails = args["include_details"]?.boolValue ?? false
+        let maxSessionsScanned: Int
+        do {
+            maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
+        } catch let error as HistoryValidationError {
+            return .error(HistoryErrorReply(error: error.message))
+        }
 
         let scanResults = try await scanner.scanAllWorkspaces()
+        let skippedWorkspaces = scanDiagnostics(from: scanResults)
 
         do {
             let filtered = try resolveScopedSessions(
@@ -324,13 +384,19 @@ enum HistoryMCPToolService {
                     groupBy: groupBy,
                     idleThresholdMinutes: idleThresholdMinutes,
                     includeDetails: includeDetails,
+                    dateFrom: dateFrom,
+                    dateTo: dateTo,
+                    maxSessionsScanned: maxSessionsScanned,
+                    skippedWorkspaces: skippedWorkspaces,
                     scanner: scanner
                 )
             }
 
-            // Non-calendar grouping reads each record's stored active duration; enrich stub-built
-            // records on demand first so durations are correct without taxing the shared rebuild.
-            let enriched = await Self.enrichingStubBuiltSessions(filtered, scanner: scanner)
+            // Non-calendar grouping reads stored duration; hydrate only a bounded candidate set.
+            let candidates = Array(sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes).prefix(maxSessionsScanned))
+            let sessionsScanned = candidates.count
+            let scanTruncated = filtered.count > candidates.count
+            let enriched = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
             let totalSessions = enriched.count
             let totalDuration = enriched.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
 
@@ -339,7 +405,10 @@ enum HistoryMCPToolService {
             return .time(HistoryTimeReply(
                 totalSessions: totalSessions,
                 totalActiveDurationSeconds: totalDuration,
-                truncated: false, // time has no limit parameter; no truncation in v1
+                truncated: scanTruncated,
+                sessionsScanned: sessionsScanned,
+                scanTruncated: scanTruncated,
+                skippedWorkspaces: skippedWorkspaces,
                 groups: groups
             ))
         } catch let error as HistoryValidationError {
@@ -435,6 +504,10 @@ enum HistoryMCPToolService {
         groupBy: String,
         idleThresholdMinutes: Int,
         includeDetails: Bool,
+        dateFrom: Date?,
+        dateTo: Date?,
+        maxSessionsScanned: Int,
+        skippedWorkspaces: [String],
         scanner: HistorySessionScanning
     ) async throws -> HistoryToolReply {
         let calendar = Calendar.current
@@ -451,7 +524,8 @@ enum HistoryMCPToolService {
         var detailDuration: [String: [UUID: Int]] = [:]
         var detailTurns: [String: [UUID: Int]] = [:]
 
-        for session in sessions {
+        let orderedSessions = sortFilteredSessions(sessions, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes)
+        for session in orderedSessions {
             if sessionsScanned >= maxSessionsScanned {
                 scanTruncated = true
                 break
@@ -473,6 +547,8 @@ enum HistoryMCPToolService {
 
             for turn in transcript.turns {
                 let start = turn.startedAt
+                if let dateFrom, start < dateFrom { continue }
+                if let dateTo, start > dateTo { continue }
                 let end = turn.completedAt ?? turn.lastActivityAt ?? start
                 let dayStart = calendar.startOfDay(for: start)
 
@@ -554,6 +630,9 @@ enum HistoryMCPToolService {
             totalSessions: sessions.count,
             totalActiveDurationSeconds: totalDuration,
             truncated: scanTruncated,
+            sessionsScanned: sessionsScanned,
+            scanTruncated: scanTruncated,
+            skippedWorkspaces: skippedWorkspaces,
             groups: groupDTOs
         ))
     }
@@ -730,6 +809,48 @@ enum HistoryMCPToolService {
         return isUpperBound ? midnight.addingTimeInterval(86399) : midnight
     }
 
+    static func parseValidatedDateBound(_ value: String?, parameterName: String, isUpperBound: Bool) throws -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        guard let parsed = parseDateBound(value, isUpperBound: isUpperBound) else {
+            throw HistoryValidationError(message: "Invalid '\(parameterName)' value '\(value)': expected ISO 8601 date or datetime")
+        }
+        return parsed
+    }
+
+    private static func appendSearchMatch(
+        _ match: HistorySearchMatch,
+        totalMatches: inout Int,
+        retainedMatches: inout [HistorySearchMatch],
+        limit: Int
+    ) {
+        totalMatches += 1
+        retainedMatches.append(match)
+        retainedMatches.sort { $0.timestamp > $1.timestamp }
+        if retainedMatches.count > limit {
+            retainedMatches.removeLast(retainedMatches.count - limit)
+        }
+    }
+
+    private static func clippedTurnRequestText(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let maxLength = 240
+        guard text.count > maxLength else { return text }
+        return String(text.prefix(maxLength - 1)) + "…"
+    }
+
+    private static func scanDiagnostics(from scanResults: [HistoryWorkspaceScanResult]) -> [String] {
+        let diagnostics = scanResults.compactMap { result -> String? in
+            if result.indexReadFailed {
+                return "\(result.workspaceName): unreadable index"
+            }
+            if let schemaVersion = result.indexSchemaVersion {
+                return "\(result.workspaceName): stale index schema v\(schemaVersion)"
+            }
+            return nil
+        }
+        return Array(diagnostics.prefix(10))
+    }
+
     static func clampLimit(_ value: Int?, default defaultValue: Int, max maxValue: Int) -> Int {
         guard let intValue = value else { return defaultValue }
         return max(1, min(intValue, maxValue))
@@ -749,6 +870,17 @@ enum HistoryMCPToolService {
             throw HistoryValidationError(message: "idle_threshold_minutes must be between 0 and 1440")
         }
         return intValue
+    }
+
+    static func resolveMaxSessionsScanned(_ value: Value?) throws -> Int {
+        guard let value else { return defaultMaxSessionsScanned }
+        guard let intValue = value.intValue else {
+            throw HistoryValidationError(message: "max_sessions_scanned must be an integer")
+        }
+        guard intValue > 0 else {
+            throw HistoryValidationError(message: "max_sessions_scanned must be greater than 0")
+        }
+        return min(intValue, absoluteMaxSessionsScanned)
     }
 
     // MARK: - Shared Formatters

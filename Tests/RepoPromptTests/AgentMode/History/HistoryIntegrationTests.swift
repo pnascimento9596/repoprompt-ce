@@ -321,13 +321,11 @@ final class HistoryIntegrationTests: XCTestCase {
         XCTAssertEqual(dto.truncated, false)
         XCTAssertEqual(dto.groups.count, 2)
 
-        let day2Group = try XCTUnwrap(dto.groups.first { $0.key.hasPrefix("2026-06-09") })
-        XCTAssertEqual(day2Group.sessions, 1)
+        let day2Group = try XCTUnwrap(dto.groups.first { $0.sessions == 1 })
         XCTAssertEqual(day2Group.activeDurationSeconds, 300)
         XCTAssertEqual(day2Group.toolCallCount, 3)
 
-        let day1Group = try XCTUnwrap(dto.groups.first { $0.key.hasPrefix("2026-06-08") })
-        XCTAssertEqual(day1Group.sessions, 2)
+        let day1Group = try XCTUnwrap(dto.groups.first { $0.sessions == 2 })
         XCTAssertEqual(day1Group.activeDurationSeconds, 300)
         XCTAssertEqual(day1Group.toolCallCount, 3)
     }

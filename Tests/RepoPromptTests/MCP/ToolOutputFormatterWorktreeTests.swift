@@ -705,6 +705,33 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
+    func testHistoryFormatterUsesCompactMarkdownInsteadOfGenericJSON() throws {
+        struct HistorySession: Encodable {
+            let session_id = "ABC"
+            let session_name = "History Session"
+            let workspace_name = "Workspace"
+            let active_duration_seconds = 42
+            let turn_count = 2
+            let files_touched = ["Sources/App.swift"]
+        }
+        struct HistoryList: Encodable {
+            let total_sessions = 1
+            let truncated = false
+            let sessions_scanned = 1
+            let scan_truncated = false
+            let skipped_workspaces: [String] = []
+            let sessions = [HistorySession()]
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("list_sessions")],
+            value: Self.value(HistoryList())
+        ))
+        XCTAssertTrue(text.contains("## History Sessions"))
+        XCTAssertTrue(text.contains("History Session"))
+        XCTAssertFalse(text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"))
+    }
+
     private static func value(_ value: some Encodable) throws -> Value {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]

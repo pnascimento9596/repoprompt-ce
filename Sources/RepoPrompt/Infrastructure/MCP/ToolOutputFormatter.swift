@@ -946,9 +946,83 @@ extension ToolOutputFormatter {
             return formatAgentRun(args: args, value: result)
         case "agent_manage":
             return formatAgentManage(args: args, value: result)
+        case "history":
+            return formatHistory(args: args, value: result)
         default:
             return formatGeneric(value: result)
         }
+    }
+
+    // MARK: - History
+
+    static func formatHistory(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
+        guard let object = value.objectValue else { return formatGeneric(value: value) }
+        if let error = nonEmpty(object["error"]?.stringValue) {
+            return [.text("## History ❌\n- **Error**: \(error)")]
+        }
+
+        let op = args["op"]?.stringValue ?? "history"
+        var lines: [String] = []
+        switch op {
+        case "list_sessions":
+            let total = object["total_sessions"]?.intValue ?? 0
+            let sessions = object["sessions"]?.arrayValue ?? []
+            lines.append("## History Sessions \(statusIcon(success: total > 0))")
+            lines.append("- **Total sessions**: \(total) • **Returned**: \(sessions.count)")
+            appendHistoryScanMetadata(object, to: &lines)
+            for sessionValue in sessions.prefix(20) {
+                guard let session = sessionValue.objectValue else { continue }
+                let name = nonEmpty(session["session_name"]?.stringValue) ?? "(untitled)"
+                let workspace = nonEmpty(session["workspace_name"]?.stringValue) ?? "unknown workspace"
+                let duration = session["active_duration_seconds"]?.intValue ?? 0
+                let turns = session["turn_count"]?.intValue ?? 0
+                let files = session["files_touched"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                var suffix = "\(duration)s, \(turns) turn\(turns == 1 ? "" : "s")"
+                if !files.isEmpty { suffix += ", files: \(files.prefix(3).joined(separator: ", "))" }
+                lines.append("- `\(session["session_id"]?.stringValue ?? "")` **\(name)** (\(workspace)) — \(suffix)")
+            }
+            if sessions.count > 20 { lines.append("- … and \(sessions.count - 20) more session\(sessions.count - 20 == 1 ? "" : "s")") }
+        case "search":
+            let total = object["total_matches"]?.intValue ?? 0
+            let results = object["results"]?.arrayValue ?? []
+            lines.append("## History Search \(statusIcon(success: total > 0))")
+            lines.append("- **Total matches**: \(total) • **Returned**: \(results.count)")
+            appendHistoryScanMetadata(object, to: &lines)
+            for resultValue in results.prefix(20) {
+                guard let result = resultValue.objectValue else { continue }
+                let session = nonEmpty(result["session_name"]?.stringValue) ?? "(untitled)"
+                let source = nonEmpty(result["source"]?.stringValue) ?? "match"
+                let snippet = nonEmpty(result["snippet"]?.stringValue) ?? ""
+                lines.append("- **\(session)** turn \(result["turn_index"]?.intValue ?? 0) [\(source)] — \(snippet)")
+            }
+            if results.count > 20 { lines.append("- … and \(results.count - 20) more result\(results.count - 20 == 1 ? "" : "s")") }
+        case "time":
+            let totalSessions = object["total_sessions"]?.intValue ?? 0
+            let totalDuration = object["total_active_duration_seconds"]?.intValue ?? 0
+            let groups = object["groups"]?.arrayValue ?? []
+            lines.append("## History Time \(statusIcon(success: totalSessions > 0))")
+            lines.append("- **Total sessions**: \(totalSessions) • **Active duration**: \(totalDuration)s • **Groups**: \(groups.count)")
+            appendHistoryScanMetadata(object, to: &lines)
+            for groupValue in groups.prefix(20) {
+                guard let group = groupValue.objectValue else { continue }
+                let key = group["key"]?.stringValue ?? ""
+                let sessions = group["sessions"]?.intValue ?? 0
+                let duration = group["active_duration_seconds"]?.intValue ?? 0
+                let turns = group["turn_count"]?.intValue ?? 0
+                lines.append("- `\(key)` — \(duration)s, \(sessions) session\(sessions == 1 ? "" : "s"), \(turns) turn\(turns == 1 ? "" : "s")")
+            }
+            if groups.count > 20 { lines.append("- … and \(groups.count - 20) more group\(groups.count - 20 == 1 ? "" : "s")") }
+        default:
+            return formatGeneric(value: value)
+        }
+        return [.text(lines.joined(separator: "\n"))]
+    }
+
+    private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
+        if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
+        if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
+        let skipped = object["skipped_workspaces"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        if !skipped.isEmpty { lines.append("- **Skipped workspaces**: \(skipped.joined(separator: "; "))") }
     }
 
     // MARK: - App Settings

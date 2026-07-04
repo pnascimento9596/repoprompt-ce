@@ -203,6 +203,36 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.groups[0].activeDurationSeconds, 100)
     }
 
+    func testListSessions_touchedFileMatchesStubBuiltRecordAfterHydration() async throws {
+        let stub = makeRecord(name: "StubWithFile")
+        mockScanner.scanResults = [makeScanResult(records: [stub])]
+        let turn = AgentTranscriptTurn(
+            summary: AgentTranscriptTurnSummary(
+                requestText: nil,
+                conclusionText: nil,
+                compactConclusionText: nil,
+                middleSummaryText: nil,
+                toolCount: 1,
+                notableToolNames: [],
+                keyPaths: ["Sources/App.swift"],
+                compactedActivityCount: 0,
+                hadWarning: false,
+                hadError: false
+            ),
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 10)
+        )
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "touched_file": "App.swift"],
+            scanner: mockScanner
+        )
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.map(\.sessionName), ["StubWithFile"])
+        XCTAssertEqual(dto.sessions.first?.filesTouched, ["Sources/App.swift"])
+    }
+
     /// Fully-indexed records (saved/loaded through the app) already carry v5 fields, so list_sessions
     /// must NOT load their transcripts — on-demand enrichment is only for stub-built records. Guards
     /// the steady-state perf property: normal queries over indexed sessions do no transcript I/O.
@@ -221,6 +251,19 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.sessions.count, 3)
         XCTAssertEqual(dto.sessions[0].activeDurationSeconds, 250)
         XCTAssertEqual(loads, 0, "indexed records must not trigger transcript loads")
+    }
+
+    func testListSessions_surfacesSkippedWorkspaceDiagnostics() async throws {
+        let record = makeRecord(name: "OK", keyPaths: ["ok.swift"])
+        mockScanner.scanResults = [
+            makeScanResult(workspaceName: "OKWorkspace", records: [record]),
+            makeScanResult(workspaceName: "Unreadable", indexReadFailed: true),
+            makeScanResult(workspaceName: "Stale", indexSchemaVersion: 4)
+        ]
+
+        let result = try await HistoryMCPToolService.execute(args: ["op": "list_sessions"], scanner: mockScanner)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.skippedWorkspaces, ["Unreadable: unreadable index", "Stale: stale index schema v4"])
     }
 
     func testListSessions_invalidSort_returnsError() async throws {
@@ -333,7 +376,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
     }
 
     func testListSessions_passesMetadataFiltersToScanner() async throws {
-        let record = makeRecord(name: "S1")
+        let record = makeRecord(name: "S1", keyPaths: ["Sources/App.swift"])
         mockScanner.scanResults = [makeScanResult(records: [record])]
 
         let result = try await HistoryMCPToolService.execute(
@@ -355,7 +398,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(request.workspace, "FilterWorkspace")
         XCTAssertEqual(request.agentKind, "claude")
         XCTAssertEqual(request.model, "sonnet")
-        XCTAssertEqual(request.filePath, "Sources/App.swift")
+        XCTAssertNil(request.filePath, "touched_file is applied after bounded hydration so stub-built records with empty keyPaths are not missed")
         XCTAssertEqual(request.from, HistoryMCPToolService.parseDateBound("2026-06-10T12:00:00Z", isUpperBound: false))
         XCTAssertEqual(request.to, HistoryMCPToolService.parseDateBound("2026-06-11T12:00:00Z", isUpperBound: true))
     }
@@ -677,6 +720,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.totalMatches, 30)
         XCTAssertEqual(dto.truncated, true)
         XCTAssertEqual(dto.results.count, 10)
+        XCTAssertEqual(dto.results.first?.turnIndex, 29, "bounded retention should keep the newest match")
+        XCTAssertEqual(dto.results.last?.turnIndex, 20, "bounded retention should evict older matches first")
     }
 
     func testSearch_scanCapBoundsTranscriptsScanned() async throws {
@@ -863,7 +908,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
 
         let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "rate limiting bug"],
+            args: ["op": "search", "query": "rate limiting bug", "include_turn_request_text": true],
             scanner: mockScanner
         )
         let dto = try searchReply(result)
@@ -871,12 +916,12 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.results[0].turnRequestText, "Find all rate limiting bugs")
     }
 
-    func testSearch_turnRequestTextNilWhenNoRequest() async throws {
+    func testSearch_turnRequestTextOmittedByDefault() async throws {
         let record = makeRecord(name: "S1")
         let scanResult = makeScanResult(records: [record])
         mockScanner.scanResults = [scanResult]
 
-        // Turn without a request — turn_request_text should be nil.
+        // Even with a request, turn_request_text is opt-in to keep default output compact.
         let activity = AgentTranscriptActivity(
             id: UUID(),
             timestamp: Date(timeIntervalSince1970: 1000),
@@ -888,8 +933,18 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             isSubstantiveAssistant: true,
             sealsAssistantBoundary: false
         )
+        let request = AgentTranscriptRequestAnchor(
+            from: AgentChatItem(
+                id: UUID(),
+                timestamp: Date(timeIntervalSince1970: 999),
+                kind: .user,
+                text: "Explain dragonfruit",
+                sequenceIndex: 0
+            )
+        )
         let turn = AgentTranscriptTurn(
             id: UUID(),
+            request: request,
             responseSpans: [
                 AgentTranscriptProviderResponseSpan(
                     id: UUID(),
@@ -907,7 +962,6 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         )
         let dto = try searchReply(result)
         XCTAssertEqual(dto.results.count, 1)
-        // turn_request_text is nil for turns without a user request.
         XCTAssertEqual(dto.results[0].turnRequestText, nil)
     }
 
@@ -1514,6 +1568,48 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     // MARK: - Per-Day Attribution
 
+    func testMalformedDateFiltersReturnToolErrorDTO() async throws {
+        let list = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "date_from": "not-a-date"],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(try errorReply(list), "Invalid 'date_from' value 'not-a-date': expected ISO 8601 date or datetime")
+
+        let search = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "x", "date_to": "bad"],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(try errorReply(search), "Invalid 'date_to' value 'bad': expected ISO 8601 date or datetime")
+
+        let time = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "date_from": "bad"],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(try errorReply(time), "Invalid 'date_from' value 'bad': expected ISO 8601 date or datetime")
+    }
+
+    func testTime_calendarGroupingAppliesDateBoundsPerTurn() async throws {
+        let day1 = Self.utcMidnight("2026-06-12T10:00:00Z")
+        let day2 = Self.utcMidnight("2026-06-13T10:00:00Z")
+        let record = makeRecord(name: "MultiDay", firstActivityAt: day1, lastActivityAt: day2.addingTimeInterval(60))
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in
+            AgentTranscript(turns: [
+                AgentTranscriptTurn(startedAt: day1, completedAt: day1.addingTimeInterval(60)),
+                AgentTranscriptTurn(startedAt: day2, completedAt: day2.addingTimeInterval(120))
+            ])
+        }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "date_from": "2026-06-13", "date_to": "2026-06-13"],
+            scanner: mockScanner
+        )
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.groups.count, 1)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 120)
+        XCTAssertEqual(dto.groups.first?.turnCount, 1)
+    }
+
     func testTime_groupByDay_attributedPerDay_noDoubleCounting() async throws {
         // A session with turns on TWO different days. time group_by:day must produce
         // TWO groups with per-day durations — no double counting. The overnight gap
@@ -1621,15 +1717,17 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     private func makeScanResult(
         workspaceName: String = "TestWorkspace",
-        records: [AgentSessionMetadataRecord] = []
+        records: [AgentSessionMetadataRecord] = [],
+        indexReadFailed: Bool = false,
+        indexSchemaVersion: Int? = nil
     ) -> HistoryWorkspaceScanResult {
         HistoryWorkspaceScanResult(
             workspaceDir: URL(fileURLWithPath: "/tmp/Workspaces/Workspace-\(workspaceName)-\(UUID().uuidString)"),
             workspaceName: workspaceName,
             workspaceID: UUID(),
             records: records,
-            indexReadFailed: false,
-            indexSchemaVersion: nil
+            indexReadFailed: indexReadFailed,
+            indexSchemaVersion: indexSchemaVersion
         )
     }
 }
