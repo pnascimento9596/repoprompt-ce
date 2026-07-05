@@ -5382,6 +5382,15 @@ enum AgentTranscriptProjectionBuilder {
         let collapseDigest: String
     }
 
+    private struct AppendedProjectionState {
+        let workingBlocks: [AgentTranscriptRenderBlock]
+        let archivedBlocks: [AgentTranscriptRenderBlock]
+        let workingRows: [AgentChatItem]
+        let archivedRows: [AgentChatItem]
+        let rowAnchorIndex: [UUID: AgentTranscriptAnchor]
+        let anchorBlockIndex: [AgentTranscriptAnchor: String]
+    }
+
     /// Refreshes completed full-turn grouped-history summary caches.
     /// Also intentionally tightens `frozenDetailedToolTailLimit` when an eligible completed
     /// full turn emits grouped history under the current newest-first allocation. Callers
@@ -5586,9 +5595,7 @@ enum AgentTranscriptProjectionBuilder {
                 continue
             }
 
-            let workingBlockStart = workingBlocks.count
-            let archivedBlockStart = archivedBlocks.count
-            appendProjectionState(
+            let appendedState = appendProjectionState(
                 for: turn,
                 detailedToolTailLimit: detailedToolTailLimits[turn.id] ?? 0,
                 context: context,
@@ -5600,17 +5607,15 @@ enum AgentTranscriptProjectionBuilder {
                 anchorBlockIndex: &anchorBlockIndex
             )
             if turn.isCompleted, turn.id != protectedTurnID {
-                let newWorkingBlocks = Array(workingBlocks.dropFirst(workingBlockStart))
-                let newArchivedBlocks = Array(archivedBlocks.dropFirst(archivedBlockStart))
                 updatedTurnCaches[turn.id] = projectionCache(
                     for: turn,
                     token: validationToken(for: turn),
-                    workingBlocks: newWorkingBlocks,
-                    archivedBlocks: newArchivedBlocks,
-                    workingRows: projectionRows(for: newWorkingBlocks),
-                    archivedRows: projectionRows(for: newArchivedBlocks),
-                    rowAnchorIndex: rowAnchorIndex,
-                    anchorBlockIndex: anchorBlockIndex
+                    workingBlocks: appendedState.workingBlocks,
+                    archivedBlocks: appendedState.archivedBlocks,
+                    workingRows: appendedState.workingRows,
+                    archivedRows: appendedState.archivedRows,
+                    rowAnchorIndex: appendedState.rowAnchorIndex,
+                    anchorBlockIndex: appendedState.anchorBlockIndex
                 )
             } else if !turn.isCompleted {
                 updatedTurnCaches.removeValue(forKey: turn.id)
@@ -5862,7 +5867,7 @@ enum AgentTranscriptProjectionBuilder {
         archivedRows: inout [AgentChatItem],
         rowAnchorIndex: inout [UUID: AgentTranscriptAnchor],
         anchorBlockIndex: inout [AgentTranscriptAnchor: String]
-    ) {
+    ) -> AppendedProjectionState {
         let archived = turn.retentionTier == .archived
         let blocks = blocksForTurn(
             turn,
@@ -5871,18 +5876,41 @@ enum AgentTranscriptProjectionBuilder {
             context: context,
             protectDetachedFocus: false
         )
+        var appendedWorkingBlocks: [AgentTranscriptRenderBlock] = []
+        var appendedArchivedBlocks: [AgentTranscriptRenderBlock] = []
+        var appendedWorkingRows: [AgentChatItem] = []
+        var appendedArchivedRows: [AgentChatItem] = []
         for block in blocks {
             let projectedRows = projectionRows(for: block)
             if archived {
                 archivedBlocks.append(block)
                 archivedRows.append(contentsOf: projectedRows)
+                appendedArchivedBlocks.append(block)
+                appendedArchivedRows.append(contentsOf: projectedRows)
             } else {
                 workingBlocks.append(block)
                 workingRows.append(contentsOf: projectedRows)
+                appendedWorkingBlocks.append(block)
+                appendedWorkingRows.append(contentsOf: projectedRows)
             }
         }
-        registerAnchors(for: turn, blocks: blocks, into: &rowAnchorIndex)
-        registerBlockAnchors(for: turn, blocks: blocks, into: &anchorBlockIndex)
+
+        var appendedRowAnchorIndex: [UUID: AgentTranscriptAnchor] = [:]
+        registerAnchors(for: turn, blocks: blocks, into: &appendedRowAnchorIndex)
+        rowAnchorIndex.merge(appendedRowAnchorIndex) { _, new in new }
+
+        var appendedAnchorBlockIndex: [AgentTranscriptAnchor: String] = [:]
+        registerBlockAnchors(for: turn, blocks: blocks, into: &appendedAnchorBlockIndex)
+        anchorBlockIndex.merge(appendedAnchorBlockIndex) { _, new in new }
+
+        return AppendedProjectionState(
+            workingBlocks: appendedWorkingBlocks,
+            archivedBlocks: appendedArchivedBlocks,
+            workingRows: appendedWorkingRows,
+            archivedRows: appendedArchivedRows,
+            rowAnchorIndex: appendedRowAnchorIndex,
+            anchorBlockIndex: appendedAnchorBlockIndex
+        )
     }
 
     static func validationToken(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnProjectionCache.ValidationToken {
