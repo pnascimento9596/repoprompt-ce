@@ -13,6 +13,98 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertTrue(failure.errorMessage.contains("canonical checkout"), failure.errorMessage)
     }
 
+    func testMutationScopeFailureClassifiesFailClosedAndMissingWorktreeScopes() async {
+        let store = WorkspaceFileContextStore()
+
+        let failClosed = await MCPMutationRetryableFailure.mutationScopeFailure(
+            for: AgentWorkspaceLookupContextResolver.failClosedLookupContext,
+            store: store
+        )
+        XCTAssertEqual(failClosed?.errorCode, "worktree_scope_unavailable")
+        XCTAssertEqual(failClosed?.retryable, true)
+
+        let missingPhysicalRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-worktree-\(UUID().uuidString)")
+            .path
+        let missingScope = WorkspaceLookupContext(
+            rootScope: .sessionBoundWorkspace(
+                canonicalRootPaths: [FileManager.default.temporaryDirectory.path],
+                physicalRootPaths: [missingPhysicalRoot]
+            ),
+            bindingProjection: nil
+        )
+
+        // The unavailable-scope contract is store visibility, not raw disk existence:
+        // an unregistered physical worktree root must fail closed before mutation.
+        let missing = await MCPMutationRetryableFailure.mutationScopeFailure(
+            for: missingScope,
+            store: store
+        )
+        XCTAssertEqual(missing?.errorCode, "worktree_scope_unavailable")
+        XCTAssertEqual(missing?.retryable, true)
+        XCTAssertTrue(missing?.errorMessage.contains("physical") ?? false, missing?.errorMessage ?? "nil")
+    }
+
+    func testApplyEditsProviderStopsOnMutationScopeFailureBeforeTranslationOrFreshness() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPApplyEditsToolProvider.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func executeApplyEdits(args: [String: Value]) async throws -> EditSummary {",
+            to: "    private static func resolveApplyEditsAgentModeTabID("
+        ))
+
+        try Self.assertOrdered([
+            "let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)",
+            "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
+            "return Self.retryableFailureSummary(request: request, failure: failure)",
+            "let effectivePath = lookupContext.translateInputPath(request.path)",
+            "awaitAppliedIngressForExplicitRequest("
+        ], in: body)
+    }
+
+    func testFileActionsProviderStopsOnMutationScopeFailureBeforeTranslationOrFreshness() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func performFileAction(\n",
+            to: "    /// Creates a **new** file"
+        ))
+
+        try Self.assertOrdered([
+            "let lookupContext = await resolveFileToolLookupContext(from: metadata)",
+            "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
+            "throw failure",
+            "let effectivePath = lookupContext.translateInputPath(path)",
+            "awaitAppliedIngressForExplicitRequest("
+        ], in: body)
+    }
+
+    func testFileActionsToolConvertsRetryableMutationFailureToStructuredReply() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "    private func fileActionsTool() -> Tool {",
+            to: "    private func getCodeStructureTool() -> Tool"
+        ))
+
+        try Self.assertOrdered([
+            "let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)",
+            "catch let failure as MCPMutationRetryableFailure",
+            "ToolResultDTOs.FileActionReply.retryableFailure(",
+            "failure: failure"
+        ], in: body)
+    }
+
+    func testAgentModeUnresolvedFileToolContextFailsClosedInsteadOfVisibleWorkspaceFallback() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "        guard let resolved else {",
+            to: "        if resolved.usesActiveTabCompatibility,"
+        ))
+
+        XCTAssertTrue(body.contains("if purpose == .agentModeRun"), body)
+        XCTAssertTrue(body.contains("return AgentWorkspaceLookupContextResolver.failClosedLookupContext"), body)
+        XCTAssertTrue(body.contains("return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)"), body)
+        XCTAssertFalse(body.contains("return .visibleWorkspace"), body)
+    }
+
     func testFileActionRetryableFailureDTOAndFormatterExposeCode() throws {
         let failure = MCPMutationRetryableFailure.worktreeScopeUnavailable(missingPhysicalRootPaths: [])
         let dto = ToolResultDTOs.FileActionReply.retryableFailure(
@@ -107,6 +199,28 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertFalse(text.contains("### Error"), text)
     }
 
+    private static func source(_ relativePath: String) throws -> String {
+        try String(contentsOf: RepoRoot.url().appendingPathComponent(relativePath), encoding: .utf8)
+    }
+
+    private static func assertOrdered(
+        _ needles: [String],
+        in source: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        var lowerBound = source.startIndex
+        for needle in needles {
+            let range = try XCTUnwrap(
+                source.range(of: needle, range: lowerBound ..< source.endIndex),
+                "Missing ordered source fragment: \(needle)",
+                file: file,
+                line: line
+            )
+            lowerBound = range.upperBound
+        }
+    }
+
     private static func onlyText(_ content: [MCP.Tool.Content]) throws -> String {
         guard content.count == 1 else {
             XCTFail("Expected one content block, got \(content.count)")
@@ -117,5 +231,16 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
             return ""
         }
         return text
+    }
+}
+
+private extension String {
+    func slice(from startMarker: String, to endMarker: String) -> String? {
+        guard let startRange = range(of: startMarker),
+              let endRange = range(of: endMarker, range: startRange.upperBound ..< endIndex)
+        else {
+            return nil
+        }
+        return String(self[startRange.lowerBound ..< endRange.lowerBound])
     }
 }
