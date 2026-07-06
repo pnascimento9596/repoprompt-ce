@@ -1954,6 +1954,53 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(reply.totalActiveDurationSeconds, 4800)
     }
 
+    func testTime_groupBySession_recomputesStaleRecordFromLiveTranscript() async throws {
+        // A full record carries STALE duration primitives (its transcript grew
+        // post-save). `time group_by:session` must detect the staleness (session file
+        // changed vs the observed signature) and recompute from the live transcript —
+        // so its total agrees with group_by:day (which reloads transcripts for per-day
+        // attribution). Regression for the calendar-vs-session total mismatch.
+        let base = Date(timeIntervalSince1970: 1000)
+        let transcript = AgentTranscript(turns: [
+            AgentTranscriptTurn(startedAt: base, completedAt: base.addingTimeInterval(100)),
+            AgentTranscriptTurn(startedAt: base.addingTimeInterval(200), completedAt: base.addingTimeInterval(400))
+        ])
+        // Stale stored primitives: claim 100s covered, no gaps (live is 300s + a 100s active gap).
+        let record = makeRecord(name: "Stale", activeDurationSeconds: 100, gapSeconds: [])
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in transcript }
+        mockScanner.transcriptStalenessProvider = { _ in true } // session file changed
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 30],
+            scanner: mockScanner
+        )
+        guard case let .time(reply) = result else {
+            return XCTFail("Expected .time reply, got \(result)")
+        }
+        // Live: covered 300s + active gap 100s (≤30min) = 400s. NOT the stale 100.
+        XCTAssertEqual(reply.totalActiveDurationSeconds, 400, "time must recompute stale records from the live transcript")
+    }
+
+    func testTime_groupBySession_emptyLiveTranscriptZerosDuration() async throws {
+        // P1: a stale record whose live transcript is empty (deleted/sanitized turns)
+        // must contribute ZERO, not fall back to its stale stored primitives — matching
+        // the calendar path (which would also compute zero from the empty transcript).
+        let record = makeRecord(name: "StaleNonEmpty", activeDurationSeconds: 100, gapSeconds: [10])
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in .empty } // live transcript is empty
+        mockScanner.transcriptStalenessProvider = { _ in true }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session"],
+            scanner: mockScanner
+        )
+        guard case let .time(reply) = result else {
+            return XCTFail("Expected .time reply, got \(result)")
+        }
+        XCTAssertEqual(reply.totalActiveDurationSeconds, 0, "An empty live transcript must contribute zero, not the stale stored primitives")
+    }
+
     func testTime_groupByDayHonorsLimit() async throws {
         let day1 = Date(timeIntervalSince1970: 1_700_000_000)
         let day2 = day1.addingTimeInterval(86400)
@@ -2075,6 +2122,8 @@ private final class MockHistoryScanner: HistorySessionScanning {
     /// Optional fresh-scan results for `scanAllWorkspacesRefreshing()`; defaults to
     /// `scanResults` so tests that don't exercise the cache-bypass path are unaffected.
     var refreshingScanResults: [HistoryWorkspaceScanResult]?
+    /// Per-session override for `transcriptDerivedFieldsAreStale`; nil → not stale.
+    var transcriptStalenessProvider: ((UUID) -> Bool)?
     var filterRequests: [FilterRequest] = []
     var transcriptProvider: ((UUID) throws -> AgentTranscript)?
 
@@ -2120,5 +2169,13 @@ private final class MockHistoryScanner: HistorySessionScanning {
             return .empty
         }
         return try provider(sessionID)
+    }
+
+    func transcriptDerivedFieldsAreStale(
+        for record: AgentSessionMetadataRecord,
+        sessionID: UUID,
+        workspaceDir: URL
+    ) async -> Bool {
+        transcriptStalenessProvider?(sessionID) ?? false
     }
 }

@@ -89,6 +89,9 @@ enum HistoryMCPToolService {
         let candidates = Array(sorted.prefix(maxSessionsScanned))
         let sessionsScanned = candidates.count
         let scanTruncated = sorted.count > candidates.count
+        // list_sessions uses index-inventory durations (recomputeStale off): cheap, but
+        // can lag `time` for sessions whose transcript grew post-save; `time` is the
+        // live-transcript-authoritative duration.
         var hydrated = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
         if sortRaw == "duration" {
             hydrated = sortFilteredSessions(hydrated, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
@@ -489,7 +492,9 @@ enum HistoryMCPToolService {
         let candidates = Array(sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes).prefix(maxSessionsScanned))
         let sessionsScanned = candidates.count
         let scanTruncated = filtered.count > candidates.count
-        let enriched = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
+        // `recomputeStale` so group_by:session/workspace totals come from the live
+        // transcript (matching the calendar path) instead of stale persisted primitives.
+        let enriched = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner, recomputeStale: true)
         // Report the full filtered count, matching the calendar path and list_sessions;
         // `sessionsScanned`/`scanTruncated` convey the bounded-scan semantic separately.
         let totalSessions = filtered.count
@@ -524,29 +529,50 @@ enum HistoryMCPToolService {
     /// `.enrichingTranscriptDerivedFields(from:)`.
     private static func enrichingStubBuiltSessions(
         _ sessions: [HistoryFilteredSessionRecord],
-        scanner: HistorySessionScanning
+        scanner: HistorySessionScanning,
+        recomputeStale: Bool = false
     ) async -> [HistoryFilteredSessionRecord] {
         var enriched: [HistoryFilteredSessionRecord] = []
         enriched.reserveCapacity(sessions.count)
         for session in sessions {
-            if !session.record.lacksTranscriptDerivedFields {
-                enriched.append(session)
-                continue
-            }
-            guard let transcript = try? await scanner.loadTranscriptForSearch(
-                sessionID: session.record.id,
-                workspaceDir: session.workspaceDir
-            ) else {
-                enriched.append(session)
-                continue
-            }
-            enriched.append(
-                HistoryFilteredSessionRecord(
-                    record: session.record.enrichingTranscriptDerivedFields(from: transcript.turns),
-                    workspaceName: session.workspaceName,
+            // Skip records that already carry transcript-derived fields. With
+            // `recomputeStale` (used by `time`), also recompute when the session file
+            // changed since the stored observed signature — so `time` totals aren't
+            // read from stale persisted primitives and agree with the calendar path.
+            // Listings leave `recomputeStale` off: their per-session duration is an
+            // index-inventory value (cheap), not the live-transcript-authoritative one.
+            let isStub = session.record.lacksTranscriptDerivedFields
+            var isStale = false
+            if recomputeStale {
+                isStale = await scanner.transcriptDerivedFieldsAreStale(
+                    for: session.record,
+                    sessionID: session.record.id,
                     workspaceDir: session.workspaceDir
                 )
-            )
+            }
+            if !isStub, !isStale {
+                enriched.append(session)
+                continue
+            }
+            do {
+                // Use the live transcript even when it has no turns — an empty
+                // transcript means zero duration, matching the calendar path. Fall back
+                // to the stored record only on an actual load failure (missing/corrupt
+                // file), not on a successfully-loaded empty transcript.
+                let transcript = try await scanner.loadTranscriptForSearch(
+                    sessionID: session.record.id,
+                    workspaceDir: session.workspaceDir
+                )
+                enriched.append(
+                    HistoryFilteredSessionRecord(
+                        record: session.record.enrichingTranscriptDerivedFields(from: transcript.turns),
+                        workspaceName: session.workspaceName,
+                        workspaceDir: session.workspaceDir
+                    )
+                )
+            } catch {
+                enriched.append(session)
+            }
         }
         return enriched
     }

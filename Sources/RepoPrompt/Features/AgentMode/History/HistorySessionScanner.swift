@@ -36,6 +36,15 @@ protocol HistorySessionScanning: Sendable {
         sessionID: UUID,
         workspaceDir: URL
     ) async throws -> AgentTranscript
+
+    /// Whether the session file for `record` has changed since its stored observed
+    /// signature was recorded — i.e., persisted transcript-derived fields may be
+    /// stale and should be recomputed from the live transcript.
+    func transcriptDerivedFieldsAreStale(
+        for record: AgentSessionMetadataRecord,
+        sessionID: UUID,
+        workspaceDir: URL
+    ) async -> Bool
 }
 
 // MARK: - Scan Results
@@ -314,7 +323,13 @@ actor HistorySessionScanner: HistorySessionScanning {
             if let signature {
                 transcriptCache[cacheKey] = TranscriptCacheEntry(signature: signature, transcript: transcript)
                 if transcriptCache.count > Self.transcriptCacheLimit {
-                    transcriptCache.removeAll()
+                    // Evict the surplus rather than clearing all, so a scan larger than
+                    // the limit reuses most of the previous decode instead of re-decoding
+                    // everything on each call.
+                    let surplus = transcriptCache.count - Self.transcriptCacheLimit
+                    for key in Array(transcriptCache.keys.prefix(surplus)) {
+                        transcriptCache.removeValue(forKey: key)
+                    }
                 }
             }
             return transcript
@@ -325,6 +340,25 @@ actor HistorySessionScanner: HistorySessionScanning {
                 underlying: String(describing: error)
             )
         }
+    }
+
+    func transcriptDerivedFieldsAreStale(
+        for record: AgentSessionMetadataRecord,
+        sessionID: UUID,
+        workspaceDir: URL
+    ) async -> Bool {
+        // Re-enrich when there's no observed signature to compare against, or when the
+        // session file's size/mtime changed since observation. A missing/unreadable
+        // file is also treated as stale so the load path can surface the failure.
+        guard let observedSize = record.observedFileSize,
+              let observedMod = record.observedFileModificationDate
+        else { return true }
+        let sessionFile = workspaceDir
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+            .appendingPathComponent("AgentSession-\(sessionID.uuidString).json")
+        guard let current = fileSignature(for: sessionFile) else { return true }
+        return current.fileSize != observedSize
+            || current.modificationTime != observedMod.timeIntervalSinceReferenceDate
     }
 
     // MARK: - Private Helpers
