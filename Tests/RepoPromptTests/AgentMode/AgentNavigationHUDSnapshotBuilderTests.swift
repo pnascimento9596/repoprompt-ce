@@ -106,9 +106,9 @@ final class AgentNavigationHUDSnapshotBuilderTests: XCTestCase {
     }
 
     func testSearchTokensSplitWhitespaceAndPreserveQuotedPhrases() {
-        XCTAssertEqual(AgentNavigationHUDViewModel.searchTokens(in: "sidebar running"), ["sidebar", "running"])
-        XCTAssertEqual(AgentNavigationHUDViewModel.searchTokens(in: "workspace \"review branch\""), ["workspace", "review branch"])
-        XCTAssertEqual(AgentNavigationHUDViewModel.searchTokens(in: "  \"unterminated phrase  "), ["unterminated phrase"])
+        XCTAssertEqual(AgentSessionSearchQuery.tokenize("sidebar running"), ["sidebar", "running"])
+        XCTAssertEqual(AgentSessionSearchQuery.tokenize("workspace \"review branch\""), ["workspace", "review branch"])
+        XCTAssertEqual(AgentSessionSearchQuery.tokenize("  \"unterminated phrase  "), ["unterminated phrase"])
     }
 
     func testSharedSearchMatcherMatchesMetadataAndQuotedPhrases() {

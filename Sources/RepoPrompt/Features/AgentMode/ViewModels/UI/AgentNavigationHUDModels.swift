@@ -214,7 +214,7 @@ enum AgentNavigationHUDSnapshotBuilder {
                 fields: row.searchFields.fields + AgentSessionSearchFields(
                     title: nil,
                     primary: [workspaceTitle, windowTitle],
-                    status: [attentionState.flatMap(searchLabel(for:)), runState.flatMap(searchLabel(for:)), mergeLabel == nil ? nil : "merge"],
+                    status: [attentionState?.searchLabel, runState?.searchLabel, mergeLabel == nil ? nil : "merge"],
                     worktree: [mergeLabel],
                     secondary: [row.depth > 0 ? "sub-agent" : nil, row.hasThreadChildren ? "subagents" : nil],
                     identifier: [workspaceID.uuidString]
@@ -277,18 +277,16 @@ enum AgentNavigationHUDSnapshotBuilder {
         else { return [] }
 
         let agentModeVM = windowState.agentModeViewModel
-        let sortedTabs = agentModeVM.sortedArchivedSessionTabs(workspace.stashedTabs)
-        return sortedTabs.compactMap { stashed in
-            guard agentModeVM.shouldShowArchivedSession(for: stashed) else { return nil }
-            let entry = agentModeVM.archivedSessionIndexEntry(for: stashed)
-            let dateInfo = agentModeVM.archivedSessionDateInfo(for: stashed)
+        return agentModeVM.archivedHUDSessionDescriptors(workspace.stashedTabs).map { descriptor in
+            let stashed = descriptor.stashedTab
+            let entry = descriptor.entry
             let title = AgentSessionRestoreSupport.normalizedSessionTitle(entry?.name ?? stashed.tab.name)
             let runState = entry.flatMap { AgentSessionRunState(rawValue: $0.lastRunStateRaw ?? "") }
             let searchFields = AgentSessionSearchFields(
-                fields: agentModeVM.archivedSessionSearchFields(for: stashed).fields + AgentSessionSearchFields(
+                fields: descriptor.searchFields.fields + AgentSessionSearchFields(
                     title: nil,
                     primary: [workspace.name, windowState.displayedWindowTitle],
-                    status: ["archived", runState.flatMap(searchLabel(for:))],
+                    status: ["archived", runState?.searchLabel],
                     secondary: ["stashed", "restorable"],
                     identifier: [workspace.id.uuidString]
                 ).fields
@@ -309,30 +307,17 @@ enum AgentNavigationHUDSnapshotBuilder {
                 runState: runState,
                 attentionState: nil,
                 attentionMarkedAt: nil,
-                activityDate: dateInfo.activityDate ?? stashed.stashedAt,
+                activityDate: descriptor.dateInfo.activityDate ?? stashed.stashedAt,
                 worktree: nil,
                 worktreeLabel: entry?.worktreeBindingSummaries.first?.visualLabel
                     ?? entry?.worktreeBindingSummaries.first?.worktreeName
                     ?? entry?.worktreeBindingSummaries.first?.branch,
                 mergeAttention: nil,
-                mergeLabel: entry?.activeWorktreeMergeSummaries.sorted(by: { $0.updatedAt > $1.updatedAt }).first?.targetLabel,
+                mergeLabel: entry?.activeWorktreeMergeSummaries.max(by: { $0.updatedAt < $1.updatedAt })?.targetLabel,
                 isMCPControlled: entry?.isMCPOriginated == true,
                 isArchived: true,
                 searchFields: searchFields
             )
-        }
-    }
-
-    private static func searchLabel(for state: AgentSessionRunState) -> String? {
-        switch state {
-        case .idle: "Idle"
-        case .running: "Running"
-        case .waitingForUser: "Needs input"
-        case .waitingForQuestion: "Question"
-        case .waitingForApproval: "Approval"
-        case .completed: "Done"
-        case .cancelled: "Cancelled"
-        case .failed: "Failed"
         }
     }
 

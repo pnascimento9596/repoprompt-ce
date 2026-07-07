@@ -231,10 +231,6 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         .map(\.2)
     }
 
-    nonisolated static func searchTokens(in query: String) -> [String] {
-        AgentSessionSearchQuery.tokenize(query)
-    }
-
     private static func message(for result: AgentSessionRouteResult) -> String {
         switch result {
         case .routed:

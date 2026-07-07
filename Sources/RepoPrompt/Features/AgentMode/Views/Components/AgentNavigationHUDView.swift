@@ -359,10 +359,6 @@ private extension View {
                     viewModel.toggleSubagents()
                     return .handled
                 }
-                if let index = hudSelectionIndex(for: press.key) {
-                    onNumberSelection(index)
-                    return .handled
-                }
             }
             switch press.key {
             case .escape:
@@ -383,18 +379,8 @@ private extension View {
     }
 
     private func hudSelectionIndex(for key: KeyEquivalent) -> Int? {
-        switch key {
-        case "1": 0
-        case "2": 1
-        case "3": 2
-        case "4": 3
-        case "5": 4
-        case "6": 5
-        case "7": 6
-        case "8": 7
-        case "9": 8
-        default: nil
-        }
+        guard let digit = key.character.wholeNumberValue, (1 ... 9).contains(digit) else { return nil }
+        return digit - 1
     }
 }
 

@@ -47,11 +47,9 @@ final class GlobalKeyboardShortcutsCoordinator {
         return win
     }
 
-    /// HUD shortcuts are also exposed as menu commands. On the first keypress after
-    /// activation, the Carbon shortcut can fire before our SwiftUI focus flag has
-    /// updated; if it consumes ⌘K while `isCurrentlyFocused` is still false, the
-    /// menu fallback never opens the HUD. Match the menu-command fallback here so
-    /// the first press still routes to the front/latest RepoPrompt window.
+    /// On the first HUD shortcut after app activation, the Carbon handler can fire
+    /// before our SwiftUI focus flag has updated. Route to the front/latest
+    /// RepoPrompt window so the first press still opens the HUD.
     private func guardedHUDWindowState() -> WindowState? {
         guard NSApplication.shared.isActive else { return nil }
         return focusedOrLatestWindowState()

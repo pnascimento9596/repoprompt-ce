@@ -27,6 +27,13 @@ extension AgentModeViewModel {
         let dateInfoByStashedTabID: [UUID: SidebarSessionDateInfo]
     }
 
+    struct ArchivedHUDSessionDescriptor {
+        let stashedTab: StashedTab
+        let entry: AgentSessionIndexEntry?
+        let dateInfo: SidebarSessionDateInfo
+        let searchFields: AgentSessionSearchFields
+    }
+
     private struct ArchivedSidebarSessionLookup {
         let entriesByExplicitSessionID: [UUID: AgentSessionIndexEntry]
         let entriesByTabID: [UUID: [AgentSessionIndexEntry]]
@@ -116,18 +123,6 @@ extension AgentModeViewModel {
         shouldShowArchivedSession(for: stashedTab, lookup: archivedSidebarSessionLookup())
     }
 
-    func archivedSessionIndexEntry(for stashedTab: StashedTab) -> AgentSessionIndexEntry? {
-        archivedSidebarEntry(for: stashedTab, lookup: archivedSidebarSessionLookup())
-    }
-
-    func archivedSessionSearchFields(for stashedTab: StashedTab) -> AgentSessionSearchFields {
-        let lookup = archivedSidebarSessionLookup()
-        return archivedSidebarSearchFields(
-            for: stashedTab,
-            entry: archivedSidebarEntry(for: stashedTab, lookup: lookup)
-        )
-    }
-
     private func shouldShowArchivedSession(
         for stashedTab: StashedTab,
         lookup: ArchivedSidebarSessionLookup
@@ -146,6 +141,31 @@ extension AgentModeViewModel {
 
     func archivedSessionDateInfo(for stashedTab: StashedTab) -> SidebarSessionDateInfo {
         archivedSessionDateInfo(for: stashedTab, lookup: archivedSidebarSessionLookup())
+    }
+
+    func archivedHUDSessionDescriptors(_ stashedTabs: [StashedTab]) -> [ArchivedHUDSessionDescriptor] {
+        let lookup = archivedSidebarSessionLookup()
+        let filteredTabs = filteredArchivedSessionTabs(
+            stashedTabs,
+            searchText: nil,
+            lookup: lookup
+        )
+        let dateInfoByID = archivedSessionDateInfoByID(for: filteredTabs, lookup: lookup)
+        let sortedTabs = sortedFilteredArchivedSessionTabs(
+            filteredTabs,
+            diagnosticInputStashedCount: stashedTabs.count,
+            diagnosticSearchActive: false,
+            dateInfoByID: dateInfoByID
+        )
+        return sortedTabs.map { stashedTab in
+            let entry = archivedSidebarEntry(for: stashedTab, lookup: lookup)
+            return ArchivedHUDSessionDescriptor(
+                stashedTab: stashedTab,
+                entry: entry,
+                dateInfo: dateInfoByID[stashedTab.id] ?? archivedSessionDateInfo(for: stashedTab, lookup: lookup),
+                searchFields: archivedSidebarSearchFields(for: stashedTab, entry: entry)
+            )
+        }
     }
 
     private func archivedSessionDateInfo(

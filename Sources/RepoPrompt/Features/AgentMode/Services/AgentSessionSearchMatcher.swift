@@ -134,6 +134,21 @@ struct AgentSessionSearchScore: Comparable, Equatable {
     }
 }
 
+extension AgentSessionRunState {
+    var searchLabel: String {
+        switch self {
+        case .idle: "Idle"
+        case .running: "Running"
+        case .waitingForUser: "Needs input"
+        case .waitingForQuestion: "Question"
+        case .waitingForApproval: "Approval"
+        case .completed: "Done"
+        case .cancelled: "Cancelled"
+        case .failed: "Failed"
+        }
+    }
+}
+
 enum AgentSessionSearchMatcher {
     static func score(query: AgentSessionSearchQuery, fields: AgentSessionSearchFields) -> AgentSessionSearchScore? {
         guard !query.isEmpty else { return AgentSessionSearchScore(value: 0) }

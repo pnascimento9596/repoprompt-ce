@@ -431,7 +431,7 @@ struct AgentModeSidebarSessionBuilder {
         return AgentSessionSearchFields(
             title: title,
             status: [
-                runState.flatMap(searchLabel(for:)),
+                runState?.searchLabel,
                 entry?.lastRunStateRaw,
                 isMCPControlled ? "MCP" : nil,
                 mergeAttention == nil ? nil : "merge"
@@ -487,19 +487,6 @@ struct AgentModeSidebarSessionBuilder {
                 entry?.id.uuidString
             ]
         )
-    }
-
-    private static func searchLabel(for state: AgentSessionRunState) -> String? {
-        switch state {
-        case .idle: "Idle"
-        case .running: "Running"
-        case .waitingForUser: "Needs input"
-        case .waitingForQuestion: "Question"
-        case .waitingForApproval: "Approval"
-        case .completed: "Done"
-        case .cancelled: "Cancelled"
-        case .failed: "Failed"
-        }
     }
 
     private func sidebarRowPrecedes(
