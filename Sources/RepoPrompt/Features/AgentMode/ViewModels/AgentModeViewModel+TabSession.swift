@@ -1560,6 +1560,7 @@ extension AgentModeViewModel {
             reconcileIncrementalEphemeralPayload(previousItem: nil, updatedItem: newItem)
             appendToolCorrelationIndexes(for: newItem, at: appendedIndex)
             finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind))
+            AgentRunSentryTelemetry.recordItemAppended(session: self, item: newItem)
             if newItem.kind == .user {
                 hasSentFirstMessage = true
                 lastUserMessageAt = newItem.timestamp
@@ -1588,6 +1589,11 @@ extension AgentModeViewModel {
             finishIncrementalSourceItemsMutation(
                 .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
             )
+            AgentRunSentryTelemetry.recordItemReplaced(
+                session: self,
+                previousItem: previousItem,
+                updatedItem: updatedItem
+            )
             lastActivityAt = Date()
             isDirty = true
         }
@@ -1612,6 +1618,11 @@ extension AgentModeViewModel {
             reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
             updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
             finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+            AgentRunSentryTelemetry.recordItemReplaced(
+                session: self,
+                previousItem: previousItem,
+                updatedItem: updatedItem
+            )
             lastActivityAt = Date()
             isDirty = true
         }
