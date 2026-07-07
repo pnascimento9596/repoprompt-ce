@@ -63,6 +63,10 @@ protocol SettingsManaging {
 }
 
 extension GlobalSettingsStore: SettingsManaging {
+    var globalSettingsStore: GlobalSettingsStore {
+        self
+    }
+
     func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool?) {
         updateCopySettings(settings, commit: commit ?? true)
     }

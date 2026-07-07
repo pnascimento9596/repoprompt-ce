@@ -804,7 +804,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let persisted = try String(contentsOf: fileURL, encoding: .utf8)
         XCTAssertTrue(persisted.contains(#""schemaVersion" : 4"#))
         XCTAssertTrue(persisted.contains(#""schemaLineage" : "repoprompt-ce.global-settings""#))
-        XCTAssertFalse(persisted.contains("agentModelsSettingsByWorkspaceID"))
+        XCTAssertTrue(persisted.contains("agentModelsSettingsByWorkspaceID"))
 
         let backupDir = fileURL.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
         let backups = try FileManager.default.contentsOfDirectory(atPath: backupDir.path)
@@ -1560,11 +1560,11 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             "Recommendation satisfaction must read the injected manager profile, not the engine store."
         )
 
-        viewModel.setOracleModel(raw: AIModel.codexCliGpt55CodexHigh.rawValue)
+        viewModel.setOracleModel(raw: AIModel.codexCliGpt56SolHigh.rawValue)
 
         XCTAssertEqual(
             managerStore.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
-            AIModel.codexCliGpt55CodexHigh.rawValue
+            AIModel.codexCliGpt56SolHigh.rawValue
         )
         XCTAssertEqual(
             engineStore.workspaceAgentModelsProfile(for: workspaceID),
@@ -1719,6 +1719,7 @@ private final class CountingGlobalSettingsFileStore: GlobalSettingsFileStoring {
     let fileURL: URL
     var document: GlobalSettingsDocument
     var saveCount = 0
+    var blockReason: GlobalSettingsPersistenceBlockReason? { nil }
 
     init(document: GlobalSettingsDocument) {
         fileURL = FileManager.default.temporaryDirectory
@@ -1739,6 +1740,14 @@ private final class CountingGlobalSettingsFileStore: GlobalSettingsFileStoring {
         var saved = document
         saved.schemaVersion = max(saved.schemaVersion, GlobalSettingsDocument.currentSchemaVersion)
         self.document = saved
+    }
+
+    func performUserInitiatedRecovery(replacementDocument _: GlobalSettingsDocument) -> Bool {
+        false
+    }
+
+    func performUserInitiatedCompatibleImport() -> Bool {
+        false
     }
 }
 
