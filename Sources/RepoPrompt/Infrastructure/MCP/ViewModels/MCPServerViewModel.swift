@@ -215,6 +215,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------
+
     // MARK: Configuration constants
 
     /// -----------------------------------------------------------------
@@ -273,6 +274,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     // ---------------------------------------------------------------------
+
     // MARK: External dependencies (weak/unowned to avoid retain cycles)
 
     // ---------------------------------------------------------------------
@@ -399,6 +401,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     // ---------------------------------------------------------------------
+
     // MARK: Networking delegation
 
     // ---------------------------------------------------------------------
@@ -2394,6 +2397,7 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     // ---------------------------------------------------------------------
+
     // MARK: Initialisation
 
     /// ---------------------------------------------------------------------
@@ -2577,6 +2581,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------
+
     // MARK: Public control API
 
     /// -----------------------------------------------------------------
@@ -2828,6 +2833,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // =====================================================================
+
     // MARK: TOOL capability
 
     // =====================================================================
@@ -2864,6 +2870,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // ────────────────────────────────────────────────────────────────
+
     //  MARK: - Shared wrappers for every MCP tool        🆕 NEW
 
     // ────────────────────────────────────────────────────────────────
@@ -3036,6 +3043,7 @@ final class MCPServerViewModel: ObservableObject {
                     correlation: lifecycleCorrelation,
                     EditFlowPerf.Dimensions(toolName: name)
                 )
+                MCPToolSentryTelemetry.recordStarted(toolName: name)
                 do {
                     let result = try await EditFlowPerf.measure(
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
@@ -3048,16 +3056,23 @@ final class MCPServerViewModel: ObservableObject {
                         correlation: lifecycleCorrelation,
                         EditFlowPerf.Dimensions(toolName: name, outcome: "success")
                     )
+                    MCPToolSentryTelemetry.recordCompleted(toolName: name)
                     return result
                 } catch {
+                    let wasCancelled = error is CancellationError || MCPToolExecutionCancelledError.matches(error)
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,
                         correlation: lifecycleCorrelation,
                         EditFlowPerf.Dimensions(
                             toolName: name,
-                            outcome: error is CancellationError ? "cancelled" : "error"
+                            outcome: wasCancelled ? "cancelled" : "error"
                         )
                     )
+                    if wasCancelled {
+                        MCPToolSentryTelemetry.recordCancelled(toolName: name)
+                    } else {
+                        MCPToolSentryTelemetry.recordFailed(toolName: name)
+                    }
                     throw error
                 }
             }
@@ -3178,6 +3193,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     // -----------------------------------------------------------------
+
     // MARK: Window tool catalog access
 
     /// -----------------------------------------------------------------
