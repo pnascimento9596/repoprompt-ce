@@ -575,9 +575,13 @@ class LifecycleQueueTests(LifecycleTestCase):
                 }}
             )
             ticket = payload["ticket"]
+            job = state.jobs[ticket]
+            job.state = "running"
+            job.started_at = conductor.now()
+            for lane in job.lanes:
+                state.active_lanes[lane] = ticket
             os.close(0)
             state._run_job(ticket)
-            job = state.jobs[ticket]
             log = job.log_path.read_text(encoding="utf-8")
             if job.state != "completed" or "STDIN_DEVNULL_OK" not in log:
                 print(f"job_state={{job.state}} exit={{job.exit_code}}")
