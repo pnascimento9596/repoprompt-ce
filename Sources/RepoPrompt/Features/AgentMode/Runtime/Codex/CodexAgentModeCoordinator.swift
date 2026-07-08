@@ -4264,7 +4264,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)
         session.waitingPrompt = nil
         clearCodexNativeToolLiveness(session)
-        setRunningStatus("Connecting…", source: .transport, session: session, urgent: true)
+        setRunningStatus("Initializing…", source: .transport, session: session, urgent: true)
         session.runState = .running
         let sendStartedAt = Date()
         session.codexLastEventAt = sendStartedAt
