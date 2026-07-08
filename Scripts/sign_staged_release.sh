@@ -67,8 +67,9 @@ plutil -lint "$app_entitlements"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace RepoPromptSigningMode -string developer-id "$APP_BUNDLE/Contents/Info.plist"
 
-# Official telemetry is gated on the protected DSN. Keep unsigned staging and
-# local release-candidate artifacts inert, and never echo or manifest the value.
+# Telemetry is gated on DSN presence: only the official Developer ID publish job receives the
+# protected SENTRY_DSN secret, and only here is it baked into the signed bundle. The value is never
+# echoed or written to the artifact manifest.
 if [[ -n "${SENTRY_DSN:-}" ]]; then
     plutil -replace RepoPromptSentryDSN -string "$SENTRY_DSN" "$APP_BUNDLE/Contents/Info.plist"
 fi
