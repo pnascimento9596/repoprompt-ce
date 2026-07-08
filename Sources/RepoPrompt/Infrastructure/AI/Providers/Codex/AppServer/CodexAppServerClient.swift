@@ -722,11 +722,25 @@ actor CodexAppServerClient {
     }
 
     func request(method: String, params: [String: Any]?, timeout: TimeInterval? = nil) async throws -> [String: Any] {
+        try await request(
+            method: method,
+            params: params,
+            timeout: timeout,
+            useDefaultTimeout: true
+        )
+    }
+
+    func request(
+        method: String,
+        params: [String: Any]?,
+        timeout: TimeInterval?,
+        useDefaultTimeout: Bool
+    ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard process != nil else { throw ClientError.processNotRunning }
         let requestID = makeRequestID()
         let generation = transportGeneration
-        let deadline = timeout ?? config.requestTimeout
+        let deadline = timeout ?? (useDefaultTimeout ? config.requestTimeout : nil)
         var payload: [String: Any] = [
             "method": method,
             "id": Int(requestID) ?? requestID
