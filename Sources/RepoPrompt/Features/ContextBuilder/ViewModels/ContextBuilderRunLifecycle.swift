@@ -54,9 +54,7 @@ enum ContextBuilderResponseDeliveryDrainResolver {
         isAuthoritativePeerEOFDetached: @MainActor () -> Bool,
         awaitTeardownPublication: @MainActor () async -> MCPServerViewModel.ContextBuilderTeardownPublicationOutcome
     ) async -> ContextBuilderResponseDeliveryDrainOutcome {
-        if initiallyDetached { return .peerEOFDetached }
-        if await awaitDrain() { return .drained }
-        if isAuthoritativePeerEOFDetached() { return .peerEOFDetached }
+        if !initiallyDetached, await awaitDrain() { return .drained }
 
         let publication = await awaitTeardownPublication()
         guard publication == .peerEOFDetached,

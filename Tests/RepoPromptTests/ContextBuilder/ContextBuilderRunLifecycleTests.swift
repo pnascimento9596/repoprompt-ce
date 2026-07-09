@@ -288,6 +288,41 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertTrue(didAwaitNegativeTeardownResolution)
         XCTAssertEqual(liveDrainFailure, .failed)
         XCTAssertFalse(liveDrainFailure.succeeded)
+
+        var didAttemptInitialDrain = false
+        let initiallyDetachedPeerEOF = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                didAttemptInitialDrain = true
+                return false
+            },
+            isAuthoritativePeerEOFDetached: { true },
+            awaitTeardownPublication: { .peerEOFDetached }
+        )
+        XCTAssertFalse(didAttemptInitialDrain)
+        XCTAssertEqual(initiallyDetachedPeerEOF, .peerEOFDetached)
+        XCTAssertTrue(initiallyDetachedPeerEOF.succeeded)
+
+        let initiallyDetachedFailure = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: true,
+            awaitDrain: {
+                XCTFail("Already-detached contexts must resolve from the teardown publication")
+                return true
+            },
+            isAuthoritativePeerEOFDetached: { true },
+            awaitTeardownPublication: { .detachedWithoutOrderlyPeerEOF(reason: "read_error") }
+        )
+        XCTAssertEqual(initiallyDetachedFailure, .failed)
+        XCTAssertFalse(initiallyDetachedFailure.succeeded)
+
+        let failureDetachedDuringDrain = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: false,
+            awaitDrain: { false },
+            isAuthoritativePeerEOFDetached: { true },
+            awaitTeardownPublication: { .detachedWithoutOrderlyPeerEOF(reason: "write_hangup") }
+        )
+        XCTAssertEqual(failureDetachedDuringDrain, .failed)
+        XCTAssertFalse(failureDetachedDuringDrain.succeeded)
     }
 
     func testRealConnectionCleanupCannotEraseContextBeforeCommit() async throws {
@@ -553,6 +588,107 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             let transitioningConnectionTerminationCount = await transitioningConnection.terminationCount()
             XCTAssertEqual(transitioningConnectionTerminationCount, 0)
+
+            // Non-orderly transport failures still detach the final context so a later
+            // safe path can inspect/discard it, but they must not satisfy response drain
+            // or commit partial context through the successful finalization path.
+            let failureConnectionID = UUID()
+            let failureRunID = UUID()
+            let failurePrompt = "must not auto-commit after read error"
+            try window.mcpServer.bindTabForConnection(
+                connectionID: failureConnectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID,
+                runID: failureRunID
+            )
+            var failureContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[failureConnectionID])
+            failureContext.promptText = failurePrompt
+            window.mcpServer.tabContextByConnectionID[failureConnectionID] = failureContext
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: failureConnectionID,
+                connection: ContextBuilderCleanupTestConnection(),
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                connectionID: failureConnectionID,
+                runID: failureRunID,
+                purpose: .discoverRun,
+                windowID: window.windowID
+            )
+
+            let failureWaitStarted = LifecycleTestGate()
+            var failureDrainOutcome: ContextBuilderResponseDeliveryDrainOutcome = .drained
+            var failureCommitCount = 0
+            var failureTerminationCount = 0
+            let failureFinalization = Task { @MainActor in
+                await ContextBuilderChildConnectionFinalizer.finalize(
+                    connectionIDs: [failureConnectionID],
+                    awaitResponseDeliveryDrain: { drainedID in
+                        failureDrainOutcome = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+                            initiallyDetached: false,
+                            awaitDrain: {
+                                XCTAssertEqual(drainedID, failureConnectionID)
+                                return false
+                            },
+                            isAuthoritativePeerEOFDetached: {
+                                window.mcpServer.isDetachedContextBuilderConnection(
+                                    connectionID: drainedID,
+                                    runID: failureRunID
+                                )
+                            },
+                            awaitTeardownPublication: {
+                                await failureWaitStarted.arrive()
+                                return await window.mcpServer.contextBuilderTeardownPublicationCoordinator.wait(
+                                    runID: failureRunID,
+                                    connectionID: drainedID,
+                                    timeoutSeconds: 1
+                                )
+                            }
+                        )
+                        return failureDrainOutcome.succeeded
+                    },
+                    commitContext: { _ in
+                        failureCommitCount += 1
+                        return true
+                    },
+                    beforeTerminationRequest: {},
+                    requestTermination: { _ in
+                        failureTerminationCount += 1
+                        return Task {}
+                    },
+                    beforeTerminationJoin: {},
+                    cleanupMapping: { _ in }
+                )
+            }
+
+            await failureWaitStarted.waitUntilArrived()
+            await ServerNetworkManager.shared.removeConnection(
+                failureConnectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.readError.rawValue,
+                    initiator: .peer
+                )
+            )
+            let didFinalizeFailure = await failureFinalization.value
+            XCTAssertFalse(didFinalizeFailure)
+            XCTAssertEqual(failureDrainOutcome, .failed)
+            XCTAssertEqual(failureCommitCount, 0)
+            XCTAssertEqual(failureTerminationCount, 0)
+            XCTAssertTrue(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: failureConnectionID,
+                    runID: failureRunID
+                )
+            )
+            XCTAssertEqual(
+                window.mcpServer.contextBuilderFinalContextConnectionID(runID: failureRunID),
+                failureConnectionID
+            )
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
+            window.mcpServer.discardDetachedContextBuilderTabContext(runID: failureRunID)
 
             // The negative twin uses the same production peer-EOF teardown, then models
             // explicit cancellation before commit. Detached ownership is discarded and

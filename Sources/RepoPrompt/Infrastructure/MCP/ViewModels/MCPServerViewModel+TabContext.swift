@@ -45,6 +45,7 @@ extension MCPServerViewModel {
 
     enum ContextBuilderTeardownPublicationOutcome: Equatable {
         case peerEOFDetached
+        case detachedWithoutOrderlyPeerEOF(reason: String)
         case resolvedWithoutPeerEOFDetachment(reason: String)
         case timedOut
         case cancelled
@@ -53,6 +54,8 @@ extension MCPServerViewModel {
             switch self {
             case .peerEOFDetached:
                 "peer_eof_detached"
+            case let .detachedWithoutOrderlyPeerEOF(reason):
+                "detached_without_orderly_peer_eof:\(reason)"
             case let .resolvedWithoutPeerEOFDetachment(reason):
                 "resolved_without_detachment:\(reason)"
             case .timedOut:

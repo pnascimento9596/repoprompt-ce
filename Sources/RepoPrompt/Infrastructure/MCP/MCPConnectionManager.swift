@@ -5910,15 +5910,22 @@ actor ServerNetworkManager {
             )
         }
         if let contextBuilderRunID {
+            let isOrderlyPeerEOF = closeContext.reason == MCPTransportTerminalCause.peerEOF.rawValue
+                && closeContext.initiator == .peer
             for state in targets {
                 let wasDetached = state.mcpServer.isDetachedContextBuilderConnection(
                     connectionID: connectionID,
                     runID: contextBuilderRunID
                 )
-                state.mcpServer.contextBuilderTeardownPublicationCoordinator.publish(
-                    wasDetached
+                let outcome: MCPServerViewModel.ContextBuilderTeardownPublicationOutcome = if wasDetached {
+                    isOrderlyPeerEOF
                         ? .peerEOFDetached
-                        : .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason),
+                        : .detachedWithoutOrderlyPeerEOF(reason: closeContext.reason)
+                } else {
+                    .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason)
+                }
+                state.mcpServer.contextBuilderTeardownPublicationCoordinator.publish(
+                    outcome,
                     runID: contextBuilderRunID,
                     connectionID: connectionID
                 )
