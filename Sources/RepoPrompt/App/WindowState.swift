@@ -433,6 +433,7 @@ class WindowState: ObservableObject {
                       notifiedWindowID == windowID
                 else { return }
                 requestWindowTitleUpdate(reason: .activeComposeTabChanged)
+                refreshAgentTitlebarChatOptionsVisibility()
             }
             .store(in: &cancellables)
 
@@ -446,6 +447,20 @@ class WindowState: ObservableObject {
                       tabID == promptManager.activeComposeTabID
                 else { return }
                 requestWindowTitleUpdate(reason: .agentSessionNameChanged)
+                refreshAgentTitlebarChatOptionsVisibility()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentSessionBindingDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+                      notifiedWindowID == windowID,
+                      let tabID = notification.userInfo?["tabID"] as? UUID,
+                      tabID == promptManager.activeComposeTabID
+                else { return }
+                refreshAgentTitlebarChatOptionsVisibility()
             }
             .store(in: &cancellables)
     }
@@ -735,6 +750,144 @@ class WindowState: ObservableObject {
         agentNewSessionAction = nil
     }
 
+    private func currentAgentTitlebarChatOptionsTabID() -> UUID? {
+        guard let tabID = agentModeViewModel.currentTabID,
+              agentModeViewModel.hasLinkedAgentSession(for: tabID)
+        else {
+            return nil
+        }
+        return tabID
+    }
+
+    private func hasAgentTitlebarChatOptions() -> Bool {
+        currentAgentTitlebarChatOptionsTabID() != nil
+    }
+
+    private func agentTitlebarChatOptionsTabExists(_ tabID: UUID) -> Bool {
+        promptManager.currentComposeTabs.contains(where: { $0.id == tabID })
+            && agentModeViewModel.hasLinkedAgentSession(for: tabID)
+    }
+
+    private func agentTitlebarChatTitle(for tabID: UUID) -> String {
+        promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.name
+            ?? workspaceManager.composeTabName(with: tabID)
+            ?? "Chat"
+    }
+
+    private func agentTitlebarChatMenuSnapshot() -> AgentModeTitlebarChatMenuSnapshot? {
+        guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return nil }
+        let tab = promptManager.currentComposeTabs.first(where: { $0.id == tabID })
+        return AgentModeTitlebarChatMenuSnapshot(
+            isPinned: tab?.isPinned ?? false
+        )
+    }
+
+    private func makeAgentTitlebarChatMenuActions() -> AgentModeTitlebarChatMenuActions {
+        AgentModeTitlebarChatMenuActions(
+            togglePin: { [weak self] in
+                self?.toggleCurrentAgentChatPinFromTitlebar()
+            },
+            rename: { [weak self] in
+                self?.renameCurrentAgentChatFromTitlebar()
+            },
+            stash: { [weak self] in
+                self?.stashCurrentAgentChatFromTitlebar()
+            },
+            delete: { [weak self] in
+                self?.confirmDeleteCurrentAgentChatFromTitlebar()
+            }
+        )
+    }
+
+    private func refreshAgentTitlebarChatOptionsVisibility() {
+        agentTitlebarAccessory?.refreshChatOptionsVisibility()
+    }
+
+    private func toggleCurrentAgentChatPinFromTitlebar() {
+        guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return }
+        promptManager.toggleComposeTabPinned(tabID)
+        refreshAgentTitlebarChatOptionsVisibility()
+    }
+
+    private func stashCurrentAgentChatFromTitlebar() {
+        guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  agentTitlebarChatOptionsTabExists(tabID)
+            else { return }
+            await promptManager.stashTab(tabID)
+            refreshAgentTitlebarChatOptionsVisibility()
+        }
+    }
+
+    private func renameCurrentAgentChatFromTitlebar() {
+        guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return }
+        let currentName = agentTitlebarChatTitle(for: tabID)
+        let alert = NSAlert()
+        alert.messageText = "Rename chat"
+        alert.informativeText = "Choose a new name for this chat."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSTextField(string: currentName)
+        input.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        input.selectText(nil)
+        alert.accessoryView = input
+
+        let applyRename: (NSApplication.ModalResponse) -> Void = { [weak self, weak input] response in
+            guard response == .alertFirstButtonReturn,
+                  let self,
+                  let input,
+                  agentTitlebarChatOptionsTabExists(tabID)
+            else { return }
+            let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !newName.isEmpty, newName != currentName else { return }
+            agentModeViewModel.renameSession(tabID: tabID, to: newName)
+            refreshAgentTitlebarChatOptionsVisibility()
+        }
+
+        if let window = nsWindow {
+            alert.beginSheetModal(for: window, completionHandler: applyRename)
+        } else {
+            applyRename(alert.runModal())
+        }
+    }
+
+    private func confirmDeleteCurrentAgentChatFromTitlebar() {
+        guard let tabID = currentAgentTitlebarChatOptionsTabID() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete chat?"
+        alert.informativeText = "This permanently deletes this chat."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+
+        let applyDelete: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            #if DEBUG
+                agentModeViewModel.debugBeginSidebarDeleteRequest(
+                    tabID: tabID,
+                    source: "WindowState.titlebarDelete",
+                    reason: "titlebar_delete_confirmation"
+                )
+            #endif
+            Task { @MainActor [weak self] in
+                guard let self,
+                      agentTitlebarChatOptionsTabExists(tabID)
+                else { return }
+                await promptManager.closeComposeTab(tabID)
+                refreshAgentTitlebarChatOptionsVisibility()
+            }
+        }
+
+        if let window = nsWindow {
+            alert.beginSheetModal(for: window, completionHandler: applyDelete)
+        } else {
+            applyDelete(alert.runModal())
+        }
+    }
+
     /// Shows or hides the Agent mode titlebar accessory ("New Session" button near traffic lights).
     /// - Parameters:
     ///   - visible: Whether to show the accessory
@@ -762,13 +915,24 @@ class WindowState: ObservableObject {
             return
         }
 
+        let menuActions = makeAgentTitlebarChatMenuActions()
         if let existing = agentTitlebarAccessory {
-            existing.update(onNewSession: action)
+            existing.update(
+                onNewSession: action,
+                hasChatOptions: { [weak self] in self?.hasAgentTitlebarChatOptions() ?? false },
+                chatMenuSnapshot: { [weak self] in self?.agentTitlebarChatMenuSnapshot() },
+                chatMenuActions: menuActions
+            )
             if !window.titlebarAccessoryViewControllers.contains(where: { $0 === existing }) {
                 window.addTitlebarAccessoryViewController(existing)
             }
         } else {
-            let accessory = AgentModeTitlebarAccessoryViewController(onNewSession: action)
+            let accessory = AgentModeTitlebarAccessoryViewController(
+                onNewSession: action,
+                hasChatOptions: { [weak self] in self?.hasAgentTitlebarChatOptions() ?? false },
+                chatMenuSnapshot: { [weak self] in self?.agentTitlebarChatMenuSnapshot() },
+                chatMenuActions: menuActions
+            )
             window.addTitlebarAccessoryViewController(accessory)
             agentTitlebarAccessory = accessory
         }
