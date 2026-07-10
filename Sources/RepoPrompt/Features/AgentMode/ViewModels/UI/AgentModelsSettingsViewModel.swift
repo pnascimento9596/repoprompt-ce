@@ -8,7 +8,7 @@
 //
 //  SEARCH-HELPER: Agent Models, Oracle Model, Built-in Chat Model,
 //  Context Builder Agent, Agent Role Defaults, Apply Recommended Setup,
-//  Planning Model, sync toggle, Context Builder drift
+//  Planning Model, sync toggle
 //
 //  Related:
 //  - Page:          /RepoPrompt/Views/Settings/AgentModelsSettingsView.swift
@@ -23,29 +23,9 @@ import SwiftUI
 
 @MainActor
 final class AgentModelsSettingsViewModel: ObservableObject {
-    // MARK: - Types
-
-    /// Drift between the Context Builder configuration persisted globally
-    /// (used by MCP runs) and the legacy workspace-scoped fields (used by UI
-    /// runs today for backwards compatibility).
-    ///
-    /// The Agent Models page surfaces this as a small resolver when the two
-    /// disagree so a user doesn't have one value silently winning. Extension
-    /// B Phase 3 is expected to collapse Context Builder to a single picker;
-    /// until then, the resolver keeps the storage in sync.
-    struct ContextBuilderDrift: Equatable {
-        let globalAgentRaw: String?
-        let globalModelRaw: String?
-        let workspaceAgentRaw: String?
-        let workspaceModelRaw: String?
-        let globalDescription: String
-        let workspaceDescription: String
-    }
-
     // MARK: - Dependencies
 
     let promptVM: PromptViewModel
-    let contextBuilderVM: ContextBuilderAgentViewModel
     let apiSettingsVM: APISettingsViewModel
     let settingsStore: GlobalSettingsStore
     private let notificationCenter: NotificationCenter
@@ -54,7 +34,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     // MARK: - Published state
 
     @Published private(set) var recommendations: RecommendationSet = .init()
-    @Published private(set) var contextBuilderDrift: ContextBuilderDrift? = nil
     @Published private(set) var isApplyingAll: Bool = false
     @Published var syncChatWithOracle: Bool {
         didSet {
@@ -94,7 +73,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     init(
         promptVM: PromptViewModel,
-        contextBuilderVM: ContextBuilderAgentViewModel,
         apiSettingsVM: APISettingsViewModel,
         settingsStore: GlobalSettingsStore? = nil,
         defaults: UserDefaults = .standard,
@@ -102,7 +80,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         self.promptVM = promptVM
-        self.contextBuilderVM = contextBuilderVM
         self.apiSettingsVM = apiSettingsVM
         self.settingsStore = settingsStore
         _ = defaults // Retained for initializer compatibility while storage lives in GlobalSettingsStore.
@@ -171,21 +148,19 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var hasUnsatisfiedRecommendations: Bool {
-        recommendations.hasUnsatisfied || contextBuilderDrift != nil
+        recommendations.hasUnsatisfied
     }
 
     // MARK: - Refresh
 
-    /// Recompute the recommendation set and drift state.
+    /// Recompute the recommendation set.
     func refresh() {
         guard let workspaceID = promptVM.currentWorkspaceID else {
             recommendations = RecommendationSet()
-            contextBuilderDrift = nil
             return
         }
         let raw = engine.computeRecommendations(for: workspaceID)
         recommendations = engine.applyMutedFlags(raw, workspaceID: workspaceID)
-        contextBuilderDrift = computeContextBuilderDrift(workspaceID: workspaceID)
     }
 
     // MARK: - Destinations
@@ -244,9 +219,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func applyContextBuilderRecommendation() {
         guard let rec = recommendations.contextBuilder,
               let workspaceID = promptVM.currentWorkspaceID else { return }
-        engine.applyContextBuilderRecommendation(rec, workspaceID: workspaceID)
-        // Drift is automatically resolved by applyContextBuilderRecommendation
-        // because it writes both the global selection and the legacy workspace fields.
+        engine.applyContextBuilderRecommendation(rec)
         notificationCenter.post(
             name: .recommendationsDidApply,
             object: nil,
@@ -289,51 +262,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             workspaceID: workspaceID,
             includePresetExposure: includePresetExposure
         )
-        // Resolve any CB drift by snapping the workspace legacy fields to the
-        // freshly applied global selection.
-        snapWorkspaceLegacyContextBuilderToGlobal(workspaceID: workspaceID)
         refresh()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.isApplyingAll = false
         }
-    }
-
-    // MARK: - Context Builder Drift
-
-    /// Resolve drift by snapping the workspace legacy fields to match the global
-    /// Context Builder selection. MCP already uses global; UI runs will, too.
-    func resolveContextBuilderDriftUsingGlobal() {
-        guard let drift = contextBuilderDrift,
-              let workspaceID = promptVM.currentWorkspaceID else { return }
-        var settings = settingsStore.chatSettings(for: workspaceID)
-        settings.contextBuilderAgentRaw = drift.globalAgentRaw
-        settings.contextBuilderAgentModelRaw = drift.globalModelRaw
-        settings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(settings, commit: true)
-        promptVM.commitContextBuilderSettings()
-        refresh()
-    }
-
-    /// Resolve drift by promoting the workspace legacy Context Builder selection
-    /// to the global selection so MCP and UI runs agree.
-    func resolveContextBuilderDriftUsingWorkspace() {
-        guard let drift = contextBuilderDrift,
-              let agentRaw = drift.workspaceAgentRaw,
-              let workspaceID = promptVM.currentWorkspaceID else { return }
-        let modelRaw = drift.workspaceModelRaw ?? drift.globalModelRaw ?? ""
-        settingsStore.setGlobalContextBuilderAgentSelection(
-            agentRaw: agentRaw,
-            modelRaw: modelRaw,
-            markUserDefined: true
-        )
-        // Also mirror workspace-scoped fields so they're marked as user-defined.
-        var settings = settingsStore.chatSettings(for: workspaceID)
-        settings.contextBuilderAgentRaw = agentRaw
-        settings.contextBuilderAgentModelRaw = modelRaw
-        settings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(settings, commit: true)
-        promptVM.commitContextBuilderSettings()
-        refresh()
     }
 
     // MARK: - Context Builder Menu
@@ -418,67 +350,5 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             userInfo: userInfo
         )
         refresh()
-    }
-
-    private func computeContextBuilderDrift(workspaceID: UUID) -> ContextBuilderDrift? {
-        let (globalAgentRaw, globalModelRaw) = settingsStore.globalContextBuilderAgentSelection()
-        let settings = settingsStore.chatSettings(for: workspaceID)
-        let workspaceAgentRaw = settings.contextBuilderAgentRaw
-        let workspaceModelRaw = settings.contextBuilderAgentModelRaw
-
-        // Drift is only meaningful when both scopes hold a value — otherwise
-        // the workspace is simply delegating to the global default.
-        guard let workspaceAgentRaw,
-              let globalAgentRaw
-        else {
-            return nil
-        }
-        let modelsDiffer: Bool = {
-            let g = globalModelRaw ?? ""
-            let w = workspaceModelRaw ?? ""
-            return g.caseInsensitiveCompare(w) != .orderedSame
-        }()
-        let agentsDiffer = workspaceAgentRaw.caseInsensitiveCompare(globalAgentRaw) != .orderedSame
-        guard agentsDiffer || modelsDiffer else { return nil }
-
-        return ContextBuilderDrift(
-            globalAgentRaw: globalAgentRaw,
-            globalModelRaw: globalModelRaw,
-            workspaceAgentRaw: workspaceAgentRaw,
-            workspaceModelRaw: workspaceModelRaw,
-            globalDescription: describeSelection(agentRaw: globalAgentRaw, modelRaw: globalModelRaw),
-            workspaceDescription: describeSelection(agentRaw: workspaceAgentRaw, modelRaw: workspaceModelRaw)
-        )
-    }
-
-    private func snapWorkspaceLegacyContextBuilderToGlobal(workspaceID: UUID) {
-        let (globalAgentRaw, globalModelRaw) = settingsStore.globalContextBuilderAgentSelection()
-        guard let globalAgentRaw else { return }
-        var settings = settingsStore.chatSettings(for: workspaceID)
-        let needsUpdate =
-            settings.contextBuilderAgentRaw != globalAgentRaw ||
-            settings.contextBuilderAgentModelRaw != globalModelRaw
-        guard needsUpdate else { return }
-        settings.contextBuilderAgentRaw = globalAgentRaw
-        settings.contextBuilderAgentModelRaw = globalModelRaw
-        settings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(settings, commit: true)
-    }
-
-    private func describeSelection(agentRaw: String?, modelRaw: String?) -> String {
-        guard let agentRaw, let agent = AgentProviderKind(rawValue: agentRaw) else {
-            return "Not configured"
-        }
-        let modelDisplay: String = {
-            guard let raw = modelRaw, !raw.isEmpty else {
-                return AgentModel.defaultModel.displayName
-            }
-            return AgentModelCatalog.displayName(
-                for: raw,
-                agentKind: agent,
-                availability: availability
-            )
-        }()
-        return "\(agent.displayName) · \(modelDisplay)"
     }
 }

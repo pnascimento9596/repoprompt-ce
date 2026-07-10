@@ -110,7 +110,7 @@ struct ChatGlobalSettings: Codable {
     var lastNonManualChatPresetID: UUID? = nil
     var lastNonManualChatPresetName: String? = nil
 
-    // MARK: - Legacy Context Builder Agent & Model (workspace-scoped)
+    // MARK: - Legacy Context Builder Agent & Model (decode compatibility only)
 
     var lastUsedDiscoverAgentRaw: String? = nil
     /// Maps agent rawValue to last-used model rawValue for that agent
@@ -135,11 +135,11 @@ struct ChatGlobalSettings: Codable {
 
     var contextBuilderModelRaw: String? = nil
 
-    // MARK: - Context Builder Agent (workspace-scoped)
+    // MARK: - Legacy Context Builder Agent (decode compatibility only)
 
-    /// Preferred agent for context-builder / discover workflows (claudeCode, codexExec, openCode)
+    /// Former workspace-scoped agent selection. Runtime selection is global.
     var contextBuilderAgentRaw: String? = nil
-    /// Preferred model for context-builder agent (per agent's supported list)
+    /// Former workspace-scoped model selection. Runtime selection is global.
     var contextBuilderAgentModelRaw: String? = nil
 
     // MARK: - Recommendation Wizard (workspace-scoped)
@@ -158,11 +158,9 @@ struct ChatGlobalSettings: Codable {
 
     // MARK: - Recommendation Bootstrap Tracking (workspace-scoped)
 
-    /// True when the user explicitly changed Context Builder agent/model defaults.
-    /// nil => legacy workspace (treat as user-defined to avoid auto changes)
+    /// Legacy workspace bootstrap marker retained for decoding compatibility.
     var didUserSetDiscoverAgentDefaults: Bool? = nil
-    /// True when the user explicitly changed context-builder agent/model defaults.
-    /// nil => legacy workspace (treat as user-defined to avoid auto changes)
+    /// Legacy workspace bootstrap marker retained for decoding compatibility.
     var didUserSetContextBuilderDefaults: Bool? = nil
     /// Set when we auto-apply recommendations on workspace creation (for idempotency).
     var didAutoApplyRecommendationsAt: Date? = nil
@@ -230,7 +228,7 @@ struct GlobalDefaults: Codable, Equatable {
     var discoverModelsByAgent: [String: String]?
     var discoveryTokenBudget: Int?
     var discoveryEnhancementMode: String?
-    /// Legacy preferred context-builder agent (seeds new workspaces).
+    /// Former preferred context-builder agent retained for decoding compatibility.
     var contextBuilderAgentRaw: String?
     /// Schema version for recommendations (used to clear mutes on new best practices)
     var recommendationSchemaVersion: Int?
@@ -378,8 +376,7 @@ class GlobalSettingsStore: ObservableObject {
             return (existing, false)
         }
         // Create default settings for new workspace
-        var newSettings = ChatGlobalSettings(workspaceID: workspaceID)
-        seedChatSettingsDefaults(&newSettings)
+        let newSettings = ChatGlobalSettings(workspaceID: workspaceID)
         chatSettings[workspaceID] = newSettings
         save()
         return (newSettings, true)
@@ -1589,18 +1586,6 @@ class GlobalSettingsStore: ObservableObject {
 
     // MARK: - Helper Methods
 
-    /// Update global Context Builder agent defaults to seed new workspaces.
-    /// Kept for compatibility with legacy persisted fields; prefer `setGlobalContextBuilderAgentSelection`.
-    func updateGlobalContextBuilderAgentDefaults(agentRaw: String?, modelRaw: String?) {
-        // Redirect to the new API if we have valid values
-        if let agent = agentRaw, let model = modelRaw {
-            setGlobalContextBuilderAgentSelection(agentRaw: agent, modelRaw: model, markUserDefined: true)
-        } else if let agent = agentRaw {
-            globalDefaults.discoverAgentRaw = agent
-            save()
-        }
-    }
-
     // MARK: - Global MCP Agent Role Defaults (Single Source of Truth)
 
     /// Returns global MCP Agent Mode role-default overrides.
@@ -1697,32 +1682,6 @@ class GlobalSettingsStore: ObservableObject {
         return false
     }
 
-    /// Seed new workspace chat settings with defaults.
-    /// Called when creating brand new ChatGlobalSettings for a workspace.
-    /// NOTE: Context Builder agent/model are now GLOBAL (not per-workspace), so we don't seed those here.
-    /// The workspace lastUsedDiscover* fields are legacy and kept only for backwards compatibility.
-    private func seedChatSettingsDefaults(_ settings: inout ChatGlobalSettings) {
-        // Legacy: seed workspace discover settings from global for backwards compatibility
-        // These are no longer the source of truth - global settings are.
-        if settings.lastUsedDiscoverAgentRaw == nil {
-            settings.lastUsedDiscoverAgentRaw = globalDefaults.discoverAgentRaw ?? "claudeCode"
-        }
-        if settings.lastUsedDiscoverModelsByAgent == nil {
-            settings.lastUsedDiscoverModelsByAgent = globalDefaults.discoverModelsByAgent ?? [:]
-        }
-
-        // Seed context-builder agent from global defaults (legacy feature)
-        if settings.contextBuilderAgentRaw == nil {
-            settings.contextBuilderAgentRaw = globalDefaults.contextBuilderAgentRaw ?? "claudeCode"
-        }
-
-        // Mark as seeded (not user-defined) for recommendation auto-apply
-        // These are explicitly false (not nil) to indicate this is a new workspace
-        settings.didUserSetDiscoverAgentDefaults = false
-        settings.didUserSetContextBuilderDefaults = false
-        settings.didAutoApplyRecommendationsAt = nil
-    }
-
     // MARK: - Persistence
 
     private func load() {
@@ -1736,8 +1695,12 @@ class GlobalSettingsStore: ObservableObject {
         }
         let document = loadedExistingDocument ?? fileStore.loadOrCreateDefault()
         copySettings = document.copySettings
-        chatSettings = document.chatSettings
-        globalDefaults = document.globalDefaults
+        let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
+            chatSettings: document.chatSettings,
+            globalDefaults: document.globalDefaults
+        )
+        chatSettings = migratedContextBuilderState.chatSettings
+        globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
         if !existingFileWasCorrupt {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
@@ -1787,8 +1750,12 @@ class GlobalSettingsStore: ObservableObject {
             let document = try fileStore.load()
             objectWillChange.send()
             copySettings = document.copySettings
-            chatSettings = document.chatSettings
-            globalDefaults = document.globalDefaults
+            let migratedContextBuilderState = Self.migratingLegacyContextBuilderState(
+                chatSettings: document.chatSettings,
+                globalDefaults: document.globalDefaults
+            )
+            chatSettings = migratedContextBuilderState.chatSettings
+            globalDefaults = migratedContextBuilderState.globalDefaults
             scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
@@ -1807,6 +1774,106 @@ class GlobalSettingsStore: ObservableObject {
         fileSystemSettings.globalIgnoreDefaults = IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
         scalarPreferences.fileSystem = fileSystemSettings
         save()
+    }
+
+    private static func migratingLegacyContextBuilderState(
+        chatSettings: [UUID: ChatGlobalSettings],
+        globalDefaults: GlobalDefaults
+    ) -> (chatSettings: [UUID: ChatGlobalSettings], globalDefaults: GlobalDefaults) {
+        var migratedGlobalDefaults = globalDefaults
+        if migratedGlobalDefaults.discoverAgentRaw == nil,
+           let legacySelection = legacyContextBuilderSelection(
+               chatSettings: chatSettings,
+               globalDefaults: globalDefaults
+           )
+        {
+            migratedGlobalDefaults.discoverAgentRaw = legacySelection.agentRaw
+            if migratedGlobalDefaults.discoverModelsByAgent?[legacySelection.agentRaw] == nil,
+               let modelRaw = legacySelection.modelRaw
+            {
+                if migratedGlobalDefaults.discoverModelsByAgent == nil {
+                    migratedGlobalDefaults.discoverModelsByAgent = [:]
+                }
+                migratedGlobalDefaults.discoverModelsByAgent?[legacySelection.agentRaw] = modelRaw
+            }
+            migratedGlobalDefaults.didUserSetDiscoverAgentDefaults = true
+        }
+        migratedGlobalDefaults.contextBuilderAgentRaw = nil
+
+        return (
+            removingLegacyWorkspaceContextBuilderState(from: chatSettings),
+            migratedGlobalDefaults
+        )
+    }
+
+    private static func legacyContextBuilderSelection(
+        chatSettings: [UUID: ChatGlobalSettings],
+        globalDefaults: GlobalDefaults
+    ) -> (agentRaw: String, modelRaw: String?)? {
+        let orderedSettings = chatSettings
+            .sorted { $0.key.uuidString < $1.key.uuidString }
+            .map(\.value)
+
+        if let agentRaw = validLegacyAgentRaw(globalDefaults.contextBuilderAgentRaw) {
+            let modelRaw = orderedSettings.lazy
+                .compactMap { legacyModelRaw(for: agentRaw, in: $0) }
+                .first
+            return (agentRaw, modelRaw)
+        }
+
+        for settings in orderedSettings {
+            if settings.didUserSetContextBuilderDefaults != false,
+               let agentRaw = validLegacyAgentRaw(settings.contextBuilderAgentRaw)
+            {
+                return (agentRaw, legacyModelRaw(for: agentRaw, in: settings))
+            }
+            if settings.didUserSetDiscoverAgentDefaults != false,
+               let agentRaw = validLegacyAgentRaw(settings.lastUsedDiscoverAgentRaw)
+            {
+                return (agentRaw, legacyModelRaw(for: agentRaw, in: settings))
+            }
+        }
+        return nil
+    }
+
+    private static func validLegacyAgentRaw(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return AgentProviderKind(rawValue: trimmed)?.rawValue
+    }
+
+    private static func legacyModelRaw(
+        for agentRaw: String,
+        in settings: ChatGlobalSettings
+    ) -> String? {
+        if validLegacyAgentRaw(settings.contextBuilderAgentRaw) == agentRaw,
+           let modelRaw = nonEmptyTrimmed(settings.contextBuilderAgentModelRaw)
+        {
+            return modelRaw
+        }
+        return nonEmptyTrimmed(settings.lastUsedDiscoverModelsByAgent?[agentRaw])
+    }
+
+    private static func nonEmptyTrimmed(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func removingLegacyWorkspaceContextBuilderState(
+        from settingsByWorkspaceID: [UUID: ChatGlobalSettings]
+    ) -> [UUID: ChatGlobalSettings] {
+        settingsByWorkspaceID.mapValues { settings in
+            var settings = settings
+            settings.lastUsedDiscoverAgentRaw = nil
+            settings.lastUsedDiscoverModelsByAgent = nil
+            settings.contextBuilderAgentRaw = nil
+            settings.contextBuilderAgentModelRaw = nil
+            settings.didUserSetDiscoverAgentDefaults = nil
+            settings.didUserSetContextBuilderDefaults = nil
+            settings.didAutoApplyRecommendationsAt = nil
+            return settings
+        }
     }
 
     private func resolvedSyncChatModelWithOracleFromCurrentPreferences() -> Bool {

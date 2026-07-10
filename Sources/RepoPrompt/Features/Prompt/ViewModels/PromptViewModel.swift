@@ -520,7 +520,8 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    /// Force-commit context builder settings to the global store so other components (like recommendation engine) see them.
+    /// Persist the visible Context Builder selection even when the user re-selects
+    /// the same runtime fallback and the property observers therefore do not fire.
     func commitContextBuilderSettings() {
         settingsManager.setGlobalContextBuilderAgentSelection(
             agentRaw: contextBuilderAgent.rawValue,

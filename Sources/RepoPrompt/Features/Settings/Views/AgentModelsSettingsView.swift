@@ -25,7 +25,6 @@ import SwiftUI
 /// inline with row-level and bulk Apply controls.
 struct AgentModelsSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
-    @ObservedObject var contextBuilderVM: ContextBuilderAgentViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
     let windowID: Int
     let workspaceName: String?
@@ -37,7 +36,6 @@ struct AgentModelsSettingsView: View {
 
     init(
         promptVM: PromptViewModel,
-        contextBuilderVM: ContextBuilderAgentViewModel,
         apiSettingsVM: APISettingsViewModel,
         windowID: Int,
         workspaceName: String? = nil,
@@ -45,14 +43,12 @@ struct AgentModelsSettingsView: View {
         viewModel: AgentModelsSettingsViewModel? = nil
     ) {
         self.promptVM = promptVM
-        self.contextBuilderVM = contextBuilderVM
         self.apiSettingsVM = apiSettingsVM
         self.windowID = windowID
         self.workspaceName = workspaceName
         self.onNavigate = onNavigate
         _viewModel = StateObject(wrappedValue: viewModel ?? AgentModelsSettingsViewModel(
             promptVM: promptVM,
-            contextBuilderVM: contextBuilderVM,
             apiSettingsVM: apiSettingsVM
         ))
     }
@@ -195,12 +191,6 @@ struct AgentModelsSettingsView: View {
                 let differingCount = roleDefaultDiffCount(for: agentDefaults)
                 previewLine(icon: "person.3", text: "Role defaults: \(differingCount) of \(agentDefaults.recommendedRoleDefaults.count) differ")
             }
-            if viewModel.contextBuilderDrift != nil {
-                previewLine(
-                    icon: "exclamationmark.triangle",
-                    text: "Context Builder values differ between Global and this workspace."
-                )
-            }
         }
     }
 
@@ -336,49 +326,7 @@ struct AgentModelsSettingsView: View {
                     }
                 }
             }
-
-            if let drift = viewModel.contextBuilderDrift {
-                contextBuilderDriftResolver(drift: drift)
-            }
         }
-    }
-
-    private func contextBuilderDriftResolver(
-        drift: AgentModelsSettingsViewModel.ContextBuilderDrift
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Context Builder values differ")
-                        .font(.caption.bold())
-                        .foregroundColor(.orange)
-                    Text("MCP runs use \(drift.globalDescription). UI runs in this workspace use \(drift.workspaceDescription).")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                Button("Use MCP for both") {
-                    viewModel.resolveContextBuilderDriftUsingGlobal()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button("Use UI for both") {
-                    viewModel.resolveContextBuilderDriftUsingWorkspace()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        }
-        .padding(8)
-        .background(Color.orange.opacity(0.08))
-        .cornerRadius(6)
     }
 
     // MARK: - Role Defaults

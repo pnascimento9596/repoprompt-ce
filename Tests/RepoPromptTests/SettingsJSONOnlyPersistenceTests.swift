@@ -29,6 +29,121 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(store.skipSymlinks())
     }
 
+    func testNewWorkspaceDoesNotSeedLegacyContextBuilderSelection() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let store = try makeStore(at: temp.appendingPathComponent("Settings/globalSettings.json"))
+        store.setGlobalContextBuilderAgentSelection(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt55CodexLow.rawValue,
+            markUserDefined: true
+        )
+
+        let result = store.chatSettingsResult(for: UUID())
+
+        XCTAssertTrue(result.isNew)
+        XCTAssertNil(result.settings.lastUsedDiscoverAgentRaw)
+        XCTAssertNil(result.settings.lastUsedDiscoverModelsByAgent)
+        XCTAssertNil(result.settings.contextBuilderAgentRaw)
+        XCTAssertNil(result.settings.contextBuilderAgentModelRaw)
+        XCTAssertNil(result.settings.didUserSetDiscoverAgentDefaults)
+        XCTAssertNil(result.settings.didUserSetContextBuilderDefaults)
+        XCTAssertNil(result.settings.didAutoApplyRecommendationsAt)
+    }
+
+    func testLegacyWorkspaceContextBuilderSelectionDecodesWithoutBeingReemittedOrOverridingGlobalSelection() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+
+        let workspaceID = UUID()
+        var legacySettings = ChatGlobalSettings(
+            workspaceID: workspaceID,
+            lastUsedDiscoverAgentRaw: AgentProviderKind.claudeCode.rawValue,
+            lastUsedDiscoverModelsByAgent: [
+                AgentProviderKind.claudeCode.rawValue: AgentModel.claudeSonnet.rawValue
+            ],
+            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+            contextBuilderAgentModelRaw: AgentModel.claudeSonnet.rawValue
+        )
+        legacySettings.didUserSetDiscoverAgentDefaults = true
+        legacySettings.didUserSetContextBuilderDefaults = true
+        legacySettings.didAutoApplyRecommendationsAt = Date(timeIntervalSince1970: 1)
+        try fileStore.save(GlobalSettingsDocument(
+            chatSettings: [workspaceID: legacySettings],
+            globalDefaults: GlobalDefaults(
+                discoverAgentRaw: AgentProviderKind.codexExec.rawValue,
+                discoverModelsByAgent: [
+                    AgentProviderKind.codexExec.rawValue: AgentModel.gpt55CodexLow.rawValue
+                ],
+                contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+                didUserSetDiscoverAgentDefaults: true
+            )
+        ))
+
+        let reloaded = try makeStore(at: fileURL)
+        let decodedLegacySettings = reloaded.chatSettings(for: workspaceID)
+        let globalSelection = reloaded.persistedGlobalContextBuilderAgentSelection()
+
+        XCTAssertNil(decodedLegacySettings.lastUsedDiscoverAgentRaw)
+        XCTAssertNil(decodedLegacySettings.lastUsedDiscoverModelsByAgent)
+        XCTAssertNil(decodedLegacySettings.contextBuilderAgentRaw)
+        XCTAssertNil(decodedLegacySettings.contextBuilderAgentModelRaw)
+        XCTAssertNil(decodedLegacySettings.didUserSetDiscoverAgentDefaults)
+        XCTAssertNil(decodedLegacySettings.didUserSetContextBuilderDefaults)
+        XCTAssertNil(decodedLegacySettings.didAutoApplyRecommendationsAt)
+        XCTAssertEqual(globalSelection.agentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(globalSelection.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+
+        reloaded.setGlobalRecommendationProviderFilter([.codex])
+        let rewritten = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertFalse(rewritten.contains("lastUsedDiscoverAgentRaw"))
+        XCTAssertFalse(rewritten.contains("lastUsedDiscoverModelsByAgent"))
+        XCTAssertFalse(rewritten.contains("contextBuilderAgentRaw"))
+        XCTAssertFalse(rewritten.contains("contextBuilderAgentModelRaw"))
+        XCTAssertFalse(rewritten.contains("didUserSetContextBuilderDefaults"))
+        XCTAssertFalse(rewritten.contains("didAutoApplyRecommendationsAt"))
+    }
+
+    func testLegacyOnlyWorkspaceContextBuilderSelectionMigratesBeforeFieldsAreStripped() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+
+        let workspaceID = UUID()
+        let legacySettings = ChatGlobalSettings(
+            workspaceID: workspaceID,
+            contextBuilderAgentRaw: AgentProviderKind.codexExec.rawValue,
+            contextBuilderAgentModelRaw: AgentModel.gpt55CodexLow.rawValue
+        )
+        try fileStore.save(GlobalSettingsDocument(
+            chatSettings: [workspaceID: legacySettings],
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
+        ))
+
+        let reloaded = try makeStore(at: fileURL)
+        let migratedSelection = reloaded.persistedGlobalContextBuilderAgentSelection()
+        let strippedWorkspaceSettings = reloaded.chatSettings(for: workspaceID)
+
+        XCTAssertEqual(migratedSelection.agentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(migratedSelection.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertNil(strippedWorkspaceSettings.contextBuilderAgentRaw)
+        XCTAssertNil(strippedWorkspaceSettings.contextBuilderAgentModelRaw)
+
+        reloaded.setGlobalRecommendationProviderFilter([.codex])
+        let persisted = try fileStore.load()
+        XCTAssertEqual(persisted.globalDefaults.discoverAgentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(
+            persisted.globalDefaults.discoverModelsByAgent?[AgentProviderKind.codexExec.rawValue],
+            AgentModel.gpt55CodexLow.rawValue
+        )
+        XCTAssertNil(persisted.globalDefaults.contextBuilderAgentRaw)
+        XCTAssertNil(persisted.chatSettings[workspaceID]?.contextBuilderAgentRaw)
+        XCTAssertNil(persisted.chatSettings[workspaceID]?.contextBuilderAgentModelRaw)
+    }
+
     func testTelemetrySettingsDefaultPersistAndMirrorMasterOptOut() throws {
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }

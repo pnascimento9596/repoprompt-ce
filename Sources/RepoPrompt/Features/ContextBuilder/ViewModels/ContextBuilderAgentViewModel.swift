@@ -219,7 +219,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         /// Used to suppress automatic follow-up generation even if the run exits as completed.
         var didUserCancelActiveContextBuilderRun: Bool = false
         @Published var runHistory: [AgentRun]
-        /// Agent/model selection moved to workspace-scoped settings (not tab-specific)
+        /// Agent/model selection is global and shared across workspaces and tabs.
         @Published var contextBuilderInstructions: String
         /// Selected context builder prompt IDs for this tab
         @Published var selectedContextBuilderPromptIDs: Set<UUID> = []
@@ -1327,7 +1327,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         autoGeneratePlan = session.autoGeneratePlan
         // Per-tab selected follow-up type
         selectedFollowUpType = session.selectedFollowUpType
-        // Agent/model/tokenBudget/enhancementMode are workspace-scoped, not tab-scoped
+        // Agent/model are global; token budget and enhancement mode are workspace-scoped.
         contextBuilderInstructions = session.contextBuilderInstructions
         selectedContextBuilderPromptIDs = session.selectedContextBuilderPromptIDs
         isRestoringState = false
@@ -1497,8 +1497,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    /// Load agent/model defaults from workspace settings.
-    /// Used during workspace switch to initialize defaults before tab-specific settings are loaded.
     /// Apply global Context Builder agent/model selection.
     /// Used during workspace switch to initialize agent/model from global settings.
     private func applyGlobalAgentModel() {
@@ -1638,8 +1636,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
               let manager = workspaceManager,
               var tab = manager.composeTab(with: session.tabID) else { return }
 
-        // Persist tab-specific settings only (not agent/model which are workspace-scoped)
-        // Agent/model and token settings are intentionally not persisted per tab.
+        // Persist tab-specific settings only. Agent/model are global, while token settings
+        // are workspace-scoped; neither belongs in the tab configuration.
         tab.contextBuilder = ContextBuilderTabConfig(
             instructions: session.contextBuilderInstructions,
             autoGeneratePlan: session.autoGeneratePlan,

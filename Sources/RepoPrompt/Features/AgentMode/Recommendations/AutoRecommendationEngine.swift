@@ -618,9 +618,8 @@ final class AutoRecommendationEngine {
     }
 
     /// Apply context builder recommendation.
-    /// Configures the Context Builder agent/model globally, and also backfills legacy
-    /// workspace-scoped context-builder fields for compatibility with older consumers.
-    func applyContextBuilderRecommendation(_ rec: ContextBuilderRecommendation, workspaceID: UUID) {
+    /// Configures the global Context Builder agent/model selection.
+    func applyContextBuilderRecommendation(_ rec: ContextBuilderRecommendation) {
         let resolvedModelRaw = resolveContextBuilderRecommendedModelRaw(rec)
 
         // Set GLOBAL Context Builder agent and model (single source of truth)
@@ -629,13 +628,6 @@ final class AutoRecommendationEngine {
             modelRaw: resolvedModelRaw,
             markUserDefined: true // Recommendations count as user-defined to prevent re-apply
         )
-        // Backfill legacy workspace-scoped context-builder settings so PromptViewModel and
-        // MCP callers that still read these fields remain in sync with recommendations.
-        var workspaceSettings = settingsStore.chatSettings(for: workspaceID)
-        workspaceSettings.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
-        workspaceSettings.contextBuilderAgentModelRaw = rec.recommendedModel.rawValue
-        workspaceSettings.didUserSetContextBuilderDefaults = true
-        settingsStore.updateChatSettings(workspaceSettings, commit: true)
         // Note: Notification is posted by the caller (wizard) after all recommendations are applied
     }
 
@@ -657,7 +649,7 @@ final class AutoRecommendationEngine {
             applyChatModelRecommendation(chat, backend: chat.defaultBackend, workspaceID: workspaceID)
         }
         if let cb = rec.contextBuilder {
-            applyContextBuilderRecommendation(cb, workspaceID: workspaceID)
+            applyContextBuilderRecommendation(cb)
         }
         if let agentDefaults = rec.mcpAgentDefaults {
             applyMCPAgentDefaultsRecommendation(agentDefaults, workspaceID: workspaceID)
@@ -710,7 +702,7 @@ final class AutoRecommendationEngine {
         if let cbRec = recs.contextBuilder,
            !cbRec.alreadySatisfied
         {
-            applyContextBuilderRecommendation(cbRec, workspaceID: workspaceID)
+            applyContextBuilderRecommendation(cbRec)
             didApply = true
         }
 

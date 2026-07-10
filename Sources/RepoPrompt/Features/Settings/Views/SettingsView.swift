@@ -404,7 +404,6 @@ struct SettingsView: View {
         case .agentModels:
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
-                contextBuilderVM: windowState.contextBuilderAgentViewModel,
                 apiSettingsVM: apiSettingsViewModel,
                 windowID: windowState.windowID,
                 workspaceName: windowState.workspaceManager.activeWorkspace?.name,
