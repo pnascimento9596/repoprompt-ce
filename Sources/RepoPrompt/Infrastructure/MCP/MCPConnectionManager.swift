@@ -150,6 +150,16 @@ private actor MCPConnectionStopRace {
     }
 }
 
+struct MCPResponseDeliverySnapshot: Equatable {
+    let pendingRequestCount: Int
+    let waiterCount: Int
+    let isTerminal: Bool
+
+    var acceptedRequestsFullyResponded: Bool {
+        pendingRequestCount == 0
+    }
+}
+
 protocol MCPServerConnection: Actor {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
@@ -161,6 +171,7 @@ protocol MCPServerConnection: Actor {
     func isViableForRetention() -> Bool
     func secondsSinceLastActivity() async -> TimeInterval
     func transportIngressSnapshot() async -> MCPTransportIngressSnapshot?
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot?
     func waitUntilResponseDeliveryDrained() async -> Bool
     /// Whether this is a legacy filesystem-backed connection (deprecated)
     nonisolated var isFilesystemBacked: Bool { get }
@@ -185,6 +196,10 @@ protocol MCPServerConnection: Actor {
 }
 
 extension MCPServerConnection {
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
+        nil
+    }
+
     func waitUntilResponseDeliveryDrained() async -> Bool {
         true
     }
@@ -5872,7 +5887,8 @@ actor ServerNetworkManager {
         assignedWindowID: Int?,
         contextBuilderRunID: UUID?,
         detachContextBuilderRunID: UUID?,
-        closeContext: MCPConnectionCloseContext
+        closeContext: MCPConnectionCloseContext,
+        responseDeliverySnapshot: MCPResponseDeliverySnapshot?
     ) async -> Bool {
         let windows = WindowStatesManager.shared.allWindows
         let targets: [WindowState]
@@ -5918,9 +5934,13 @@ actor ServerNetworkManager {
                     runID: contextBuilderRunID
                 )
                 let outcome: MCPServerViewModel.ContextBuilderTeardownPublicationOutcome = if wasDetached {
-                    isOrderlyPeerEOF
-                        ? .peerEOFDetached
-                        : .detachedWithoutOrderlyPeerEOF(reason: closeContext.reason)
+                    if isOrderlyPeerEOF {
+                        .peerEOFDetached
+                    } else if responseDeliverySnapshot?.acceptedRequestsFullyResponded == true {
+                        .detachedAfterResponseDeliveryDrained(reason: closeContext.reason)
+                    } else {
+                        .detachedWithoutOrderlyPeerEOF(reason: closeContext.reason)
+                    }
                 } else {
                     .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason)
                 }
@@ -6000,6 +6020,7 @@ actor ServerNetworkManager {
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
         let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
+        let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
 
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
@@ -6060,7 +6081,8 @@ actor ServerNetworkManager {
             assignedWindowID: assignedWindowID,
             contextBuilderRunID: cleanupRunPurpose == .discoverRun ? cleanupRunID : nil,
             detachContextBuilderRunID: detachContextBuilderRunID,
-            closeContext: context
+            closeContext: context,
+            responseDeliverySnapshot: responseDeliverySnapshot
         )
         #if DEBUG
             if cleanupRunPurpose == .discoverRun, let cleanupRunID {

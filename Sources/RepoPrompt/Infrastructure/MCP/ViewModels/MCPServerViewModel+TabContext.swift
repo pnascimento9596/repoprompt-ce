@@ -45,15 +45,27 @@ extension MCPServerViewModel {
 
     enum ContextBuilderTeardownPublicationOutcome: Equatable {
         case peerEOFDetached
+        case detachedAfterResponseDeliveryDrained(reason: String)
         case detachedWithoutOrderlyPeerEOF(reason: String)
         case resolvedWithoutPeerEOFDetachment(reason: String)
         case timedOut
         case cancelled
 
+        var completedDiscoveryCanCommit: Bool {
+            switch self {
+            case .peerEOFDetached, .detachedAfterResponseDeliveryDrained:
+                true
+            case .detachedWithoutOrderlyPeerEOF, .resolvedWithoutPeerEOFDetachment, .timedOut, .cancelled:
+                false
+            }
+        }
+
         var diagnosticSource: String {
             switch self {
             case .peerEOFDetached:
                 "peer_eof_detached"
+            case let .detachedAfterResponseDeliveryDrained(reason):
+                "detached_after_response_delivery_drained:\(reason)"
             case let .detachedWithoutOrderlyPeerEOF(reason):
                 "detached_without_orderly_peer_eof:\(reason)"
             case let .resolvedWithoutPeerEOFDetachment(reason):
