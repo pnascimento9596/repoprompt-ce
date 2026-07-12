@@ -3626,6 +3626,45 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return description.isEmpty ? String(describing: error) : description
     }
 
+    /// Fail-closed teardown for a Codex child whose RepoPrompt MCP routing never confirmed before its
+    /// first turn (issue #514). The app-server thread has already started, so the live controller is
+    /// torn down — leaving no active thread — and the readiness failure is published as the run's
+    /// terminal outcome. The message carries the native-start failure prefix so that when control
+    /// returns to the send path, its no-active-thread guard treats the failure as already reported and
+    /// finalizes without dispatching a first turn or appending a second error.
+    private func failCodexStartupForRoutingReadiness(
+        session: AgentModeViewModel.TabSession,
+        error: Error
+    ) async {
+        let message = "\(Self.codexNativeSessionFailurePrefix(attemptedResume: false)) \(Self.providerStartupFailureMessage(for: error))"
+        _ = invalidateCodexControllerForReconnect(
+            session: session,
+            expectedController: session.codexController,
+            source: "mcp-routing-readiness",
+            preserveRunID: true
+        )
+        if session.activeRunOwnership != nil, terminalCommitBarrier != nil {
+            await finalizeCodexRun(
+                session,
+                turnStatus: .failed,
+                reason: "mcp-routing-readiness",
+                errorMessage: message,
+                notifyOnCompleted: false,
+                deleteDeferredFilesWhenFailureHasNoInFlight: true
+            )
+        } else {
+            let alreadyReported = session.items.last.map { $0.kind == .error && Self.isCodexNativeSessionFailureText($0.text) } ?? false
+            if !alreadyReported {
+                session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
+            }
+            session.runState = .failed
+            setRunningStatus(nil, source: nil, session: session)
+            viewModel?.setAgentRunActive(session.tabID, isActive: false)
+        }
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+    }
+
     func ensureCodexNativeSession(
         session: AgentModeViewModel.TabSession,
         policyAlreadyInstalled: Bool = false,
@@ -3916,11 +3955,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if shouldWaitForRouting {
                 do {
                     try await lease.requireRouting(timeoutMs: codexLeaseRoutingTimeoutMs)
+                } catch is CancellationError {
+                    // A cancelled routing wait is an ordinary run cancellation, not a fail-closed
+                    // readiness failure; the run's cancellation machinery owns teardown. requireRouting
+                    // has already released the gate, one-shot policy, and routing waiter.
+                    logCodex("[AgentModeVM][CodexBootstrap] routing wait cancelled for tab \(session.tabID) run \(runID)")
                 } catch {
-                    // Routing did not complete: requireRouting has already released the gate,
-                    // one-shot policy, and routing waiter. This only records the failure; it does not
-                    // terminate the run, so the caller's send path still proceeds to startUserTurn.
+                    // Fail closed: RepoPrompt MCP routing was never confirmed for this run, so the
+                    // child cannot be trusted to hold RepoPrompt tools and must not reach its first
+                    // turn. requireRouting has already released the gate, one-shot policy, and routing
+                    // waiter; tear down the started thread and publish the readiness failure as the
+                    // run's terminal outcome so the parent sees a failed start instead of a tool-less
+                    // child.
                     logCodex("[AgentModeVM][CodexBootstrap] routing wait failed for tab \(session.tabID) run \(runID): \(error)")
+                    await failCodexStartupForRoutingReadiness(session: session, error: error)
                 }
             } else {
                 await lease.releaseWithoutRoutingWait()
@@ -4237,6 +4285,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             deferReconnectForCurrentActiveTurn: wasRunAlreadyActive,
             skipResumeWhenNoPriorCodexHistory: !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
         )
+        if Task.isCancelled {
+            // The run was cancelled during startup — e.g. while the MCP routing wait was suspended. The
+            // controller may still report an active thread before the run's cancellation machinery
+            // invalidates it, so re-check cancellation here rather than trusting the controller guard,
+            // and unwind without dispatching a first turn. Cancellation owns the terminal state, so this
+            // publishes no failure.
+            viewModel?.finalizeAttachmentsForTurn(
+                for: session,
+                reservationID: attachmentReservationID,
+                disposition: .restoreToPending
+            )
+            return .cancelled
+        }
         guard let controller = session.codexController,
               controller.hasActiveThread
         else {
