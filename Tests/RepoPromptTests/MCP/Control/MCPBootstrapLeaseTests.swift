@@ -491,6 +491,262 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             throw XCTSkip("Connection policy and catalog diagnostics are DEBUG-only.")
         #endif
     }
+
+    func testRequireRoutingThrowsReadinessErrorWhenRoutingTimesOut() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let gateID = UUID()
+            let recorder = PolicyRecorder()
+            await resetLeaseGlobals(runID: runID)
+
+            let lease = makeRoutingLease(
+                runID: runID,
+                gateID: gateID,
+                clientName: "bootstrap-lease-require-routing-timeout",
+                policyInstaller: { _ in await recorder.recordInstall() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            do {
+                try await lease.requireRouting(timeoutMs: 10)
+                XCTFail("requireRouting must throw when routing never completes")
+            } catch let error as MCPBootstrapReadinessError {
+                XCTAssertEqual(error, .routingUnavailable)
+            } catch {
+                XCTFail("requireRouting threw an unexpected error: \(error)")
+            }
+
+            let clearCount = await recorder.clearCount
+            XCTAssertEqual(clearCount, 1, "Timed-out routing must clear the pending connection policy exactly once")
+            await assertRoutingWaiterAndGateCleared(runID: runID)
+
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testRequireRoutingReturnsWhenRunRoutes() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let gateID = UUID()
+            let recorder = PolicyRecorder()
+            await resetLeaseGlobals(runID: runID)
+
+            let lease = makeRoutingLease(
+                runID: runID,
+                gateID: gateID,
+                clientName: "bootstrap-lease-require-routing-success",
+                policyInstaller: { _ in await recorder.recordInstall() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            // Route through the LIVE continuation path: start the wait, let it register its waiter,
+            // then signal routing. requireRouting must return without throwing and must leave the
+            // pending policy in place for the real connection.
+            let routingTask = Task { try await lease.requireRouting(timeoutMs: 5000) }
+            await waitForRoutingContinuations(runID: runID, atLeast: 1)
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            try await routingTask.value
+
+            let clearCount = await recorder.clearCount
+            XCTAssertEqual(clearCount, 0, "Successful routing must not clear the pending connection policy")
+            await assertRoutingWaiterAndGateCleared(runID: runID)
+
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testRequireRoutingThrowsCancellationErrorWhenCancelledAfterRegistration() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let gateID = UUID()
+            let recorder = PolicyRecorder()
+            await resetLeaseGlobals(runID: runID)
+
+            let lease = makeRoutingLease(
+                runID: runID,
+                gateID: gateID,
+                clientName: "bootstrap-lease-require-routing-cancel",
+                policyInstaller: { _ in await recorder.recordInstall() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            // Cancel only after the waiter registers, so the failure is genuinely a cancellation and
+            // not a timeout: requireRouting must surface CancellationError, not a readiness error.
+            let routingTask = Task { () -> Error? in
+                do {
+                    try await lease.requireRouting(timeoutMs: 5000)
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            await waitForRoutingContinuations(runID: runID, atLeast: 1)
+            routingTask.cancel()
+            let thrown = await routingTask.value
+            XCTAssertTrue(
+                thrown is CancellationError,
+                "Cancellation after registration must surface CancellationError, got \(String(describing: thrown))"
+            )
+
+            let clearCount = await recorder.clearCount
+            XCTAssertEqual(clearCount, 1, "A cancelled routing wait must still clear the pending policy exactly once")
+            await assertRoutingWaiterAndGateCleared(runID: runID)
+
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testRepeatedRequireRoutingWithRacingCancelJoinsSinglePolicyClear() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let gateID = UUID()
+            let recorder = PolicyRecorder()
+            await resetLeaseGlobals(runID: runID)
+
+            let lease = makeRoutingLease(
+                runID: runID,
+                gateID: gateID,
+                clientName: "bootstrap-lease-require-routing-race",
+                policyInstaller: { _ in await recorder.recordInstall() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            // Scenario: one requireRouting registers the live waiter and suspends; a second, repeated
+            // call arrives after the lease is already releasing and fails fast WITHOUT awaiting the
+            // releasing call's cleanup; a cancelAndCleanup races the suspended waiter. Both calls must
+            // fail closed with the routing readiness error, and the pending policy must be cleared once.
+            let suspendedCall = Task { () -> Error? in
+                do { try await lease.requireRouting(timeoutMs: 5000); return nil } catch { return error }
+            }
+            await waitForRoutingContinuations(runID: runID, atLeast: 1)
+            let repeatedCall = Task { () -> Error? in
+                do { try await lease.requireRouting(timeoutMs: 5000); return nil } catch { return error }
+            }
+            await lease.cancelAndCleanup()
+            let suspendedError = await suspendedCall.value
+            let repeatedError = await repeatedCall.value
+
+            XCTAssertTrue(
+                (suspendedError as? MCPBootstrapReadinessError) == .routingUnavailable,
+                "The suspended requireRouting must fail closed with .routingUnavailable, got \(String(describing: suspendedError))"
+            )
+            XCTAssertTrue(
+                (repeatedError as? MCPBootstrapReadinessError) == .routingUnavailable,
+                "The repeated requireRouting on the already-releasing lease must also fail closed with .routingUnavailable, got \(String(describing: repeatedError))"
+            )
+
+            let clearCount = await recorder.clearCount
+            XCTAssertEqual(clearCount, 1, "The pending policy must be cleared exactly once across the racing cleanups")
+            await assertRoutingWaiterAndGateCleared(runID: runID)
+
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testConcurrentCleanupJoinsSingleInFlightPolicyClear() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let gateID = UUID()
+            let events = CleanupEventLog()
+            let clearerGate = ClearerGate()
+            await resetLeaseGlobals(runID: runID)
+
+            let lease = makeRoutingLease(
+                runID: runID,
+                gateID: gateID,
+                clientName: "bootstrap-lease-cleanup-joinable",
+                policyClearer: { _ in
+                    await clearerGate.enterAndWait()
+                    await events.record("clear_completed")
+                }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            // requireRouting times out, so it clears the policy; the single clearer enters and parks
+            // on the gate, holding the one in-flight clear open.
+            let requireTask = Task { () -> Error? in
+                let outcome: Error?
+                do {
+                    try await lease.requireRouting(timeoutMs: 10)
+                    outcome = nil
+                } catch {
+                    outcome = error
+                }
+                await events.record("require_returned")
+                return outcome
+            }
+            await clearerGate.waitUntilEntered()
+
+            // A concurrent cancelAndCleanup must JOIN the same in-flight clear instead of observing a
+            // flag and returning while the clear is still suspended.
+            let cancelTask = Task {
+                await lease.cancelAndCleanup()
+                await events.record("cancel_returned")
+            }
+
+            // Deterministically wait until cancelAndCleanup enters clearPolicyOnce's existing-operation
+            // branch: it is now parked on the single in-flight clear, proving it joined rather than
+            // skipped. The probe returns the observed joiner count.
+            let joinerCount = await lease.debugWaitForPolicyClearJoiner()
+
+            // The join happened while the clear is still parked, so neither caller has returned.
+            let parkedEvents = await events.snapshot()
+            XCTAssertFalse(parkedEvents.contains("clear_completed"), "policy clear must still be in-flight")
+            XCTAssertFalse(parkedEvents.contains("require_returned"), "requireRouting must not return while the clear is parked")
+            XCTAssertFalse(parkedEvents.contains("cancel_returned"), "cancelAndCleanup must not return while the clear is parked")
+
+            // Release the single clear; both joined callers complete only afterwards.
+            await clearerGate.open()
+            let requireError = await requireTask.value
+            await cancelTask.value
+
+            let invocationCount = await clearerGate.invocationCount
+            XCTAssertEqual(invocationCount, 1, "the policy clearer must run exactly once for the joined cleanups")
+            XCTAssertEqual(joinerCount, 1, "exactly one caller (cancelAndCleanup) must have joined the single in-flight clear")
+
+            let finalEvents = await events.snapshot()
+            let clearIndex = finalEvents.firstIndex(of: "clear_completed")
+            let requireIndex = finalEvents.firstIndex(of: "require_returned")
+            let cancelIndex = finalEvents.firstIndex(of: "cancel_returned")
+            XCTAssertNotNil(clearIndex, "the clear must have completed")
+            if let clearIndex, let requireIndex {
+                XCTAssertLessThan(clearIndex, requireIndex, "requireRouting returned before the shared clear completed")
+            }
+            if let clearIndex, let cancelIndex {
+                XCTAssertLessThan(clearIndex, cancelIndex, "cancelAndCleanup returned before the shared clear completed")
+            }
+            XCTAssertTrue(
+                requireError is MCPBootstrapReadinessError,
+                "requireRouting must still surface the readiness error, got \(String(describing: requireError))"
+            )
+
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
 }
 
 private enum MCPBootstrapLeaseTestError: Error {
@@ -498,6 +754,68 @@ private enum MCPBootstrapLeaseTestError: Error {
 }
 
 private extension MCPBootstrapLeaseTests {
+    #if DEBUG
+        /// Await the live routing waiter registering at least `atLeast` continuations for `runID`,
+        /// polling the DEBUG continuation-count probe with cooperative yields (not a fixed sleep) as
+        /// the synchronization signal. Fails the test if the count is not reached before `timeout`.
+        func waitForRoutingContinuations(runID: UUID, atLeast: Int, timeout: TimeInterval = 5) async {
+            let deadline = Date().addingTimeInterval(timeout)
+            while await MCPRoutingWaiter.debugContinuationCount(runID: runID) < atLeast {
+                if Date() >= deadline {
+                    XCTFail("timed out waiting for \(atLeast) routing continuation(s) for run \(runID)")
+                    return
+                }
+                await Task.yield()
+            }
+        }
+
+        /// Resets the process-global bootstrap gate and the routing-waiter state for `runID` so each
+        /// lease test starts from a clean slate.
+        func resetLeaseGlobals(runID: UUID) async {
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        }
+
+        /// Builds a bootstrap lease with the shared agent-mode spec defaults; only the identity,
+        /// client name, and policy hooks vary between tests.
+        func makeRoutingLease(
+            runID: UUID,
+            gateID: UUID,
+            clientName: String,
+            policyInstaller: @escaping (MCPBootstrapLeaseSpec) async -> Void = { _ in },
+            policyClearer: @escaping (MCPBootstrapLeaseSpec) async -> Void = { _ in }
+        ) -> MCPBootstrapLease {
+            MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: gateID,
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: clientName,
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "\(clientName) regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: policyInstaller,
+                policyClearer: policyClearer
+            )
+        }
+
+        /// Asserts the run's routing waiter was torn down and the process-global bootstrap gate is idle.
+        func assertRoutingWaiterAndGateCleared(runID: UUID) async {
+            let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(waiterCount, 0, "Routing waiter must be torn down after the lease releases")
+            XCTAssertNil(activeGate, "Bootstrap gate must be released after the lease releases")
+        }
+    #endif
+
     @MainActor
     static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
         if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
@@ -514,6 +832,60 @@ private extension MCPBootstrapLeaseTests {
         }
         ServiceRegistry.unregister(service)
         throw MCPBootstrapLeaseTestError.routingServiceUnavailable
+    }
+}
+
+private actor CleanupEventLog {
+    private(set) var events: [String] = []
+
+    func record(_ event: String) {
+        events.append(event)
+    }
+
+    func snapshot() -> [String] {
+        events
+    }
+}
+
+/// Deterministic gate the joinable-cleanup test injects as the `policyClearer`: it parks the single
+/// in-flight clear until the test calls `open()`, and lets the test await first entry without sleeps.
+private actor ClearerGate {
+    private(set) var invocationCount = 0
+    private var hasEntered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var opened = false
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async {
+        invocationCount += 1
+        hasEntered = true
+        for waiter in enteredWaiters {
+            waiter.resume()
+        }
+        enteredWaiters.removeAll()
+        if opened {
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async {
+        if hasEntered {
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            enteredWaiters.append(continuation)
+        }
+    }
+
+    func open() {
+        opened = true
+        for waiter in releaseWaiters {
+            waiter.resume()
+        }
+        releaseWaiters.removeAll()
     }
 }
 

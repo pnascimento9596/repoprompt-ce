@@ -3914,7 +3914,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
 
             if shouldWaitForRouting {
-                _ = await lease.releaseWhenRouted(timeoutMs: codexLeaseRoutingTimeoutMs)
+                do {
+                    try await lease.requireRouting(timeoutMs: codexLeaseRoutingTimeoutMs)
+                } catch {
+                    // Routing did not complete: requireRouting has already released the gate,
+                    // one-shot policy, and routing waiter. This only records the failure; it does not
+                    // terminate the run, so the caller's send path still proceeds to startUserTurn.
+                    logCodex("[AgentModeVM][CodexBootstrap] routing wait failed for tab \(session.tabID) run \(runID): \(error)")
+                }
             } else {
                 await lease.releaseWithoutRoutingWait()
             }
