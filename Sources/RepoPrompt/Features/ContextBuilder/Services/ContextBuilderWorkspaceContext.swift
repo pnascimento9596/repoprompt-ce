@@ -183,7 +183,6 @@ struct ContextBuilderWorkspaceContext {
             selectedContextBuilderPromptIDs: source.selectedContextBuilderPromptIDs,
             tabName: source.tabName,
             runID: runID,
-            role: .contextBuilderDiscovery,
             activeAgentSessionID: parentAgentSessionID,
             worktreeBindingState: .hydrated(worktreeBindings),
             frozenLookupContext: lookupContext,

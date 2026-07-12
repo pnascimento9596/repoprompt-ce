@@ -9693,7 +9693,6 @@ actor ServerNetworkManager {
                     windowID: policy.windowID,
                     tabID: tabID,
                     runID: runID,
-                    role: policy.purpose == .discoverRun ? .contextBuilderDiscovery : .standard,
                     signalRouting: false
                 )
                 routed = installation.routed
@@ -10043,7 +10042,6 @@ actor ServerNetworkManager {
         windowID: Int,
         tabID: UUID,
         runID: UUID,
-        role: MCPServerViewModel.TabContextRole,
         signalRouting: Bool = true
     ) async -> (routed: Bool, replacementToken: MCPServerViewModel.PendingPolicyRunIDMappingToken?) {
         let resolved = await MainActor.run {
@@ -10069,7 +10067,6 @@ actor ServerNetworkManager {
                 workspaceID: resolved.workspaceID,
                 snapshot: resolved.snapshot,
                 runID: runID,
-                role: role,
                 signalRouting: signalRouting,
                 deferRunIDReplacementForPendingPolicy: true
             )

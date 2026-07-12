@@ -106,7 +106,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ], in: body)
     }
 
-    func testDiscoveryCreateRecordsSelectionIntentBeforePendingFreshnessAcknowledgement() throws {
+    func testCreateSelectionUsesCanonicalPersistencePath() throws {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
         let body = try XCTUnwrap(source.slice(
             from: "    private func performFileAction(\n",
@@ -115,13 +115,14 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
 
         try Self.assertOrdered([
             "freshness = \"pending\"",
-            "resolvedContext.snapshot.role == .contextBuilderDiscovery",
-            "requestedSelection = StoredSelection(",
+            "let baseSelection = resolvedContext.snapshot.selection",
+            "let requestedSelection = addResult.selection",
             "resolvedContext.snapshot.selection = requestedSelection",
             "persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)",
+            "requireCanonicalSelection(",
             "warning: acknowledgementWarnings.isEmpty ? nil"
         ], in: body)
-        XCTAssertTrue(body.contains("The created path was recorded in the private discovery selection"))
+        XCTAssertFalse(body.contains("private discovery selection"))
         XCTAssertTrue(body.contains("use operation ID \\(operationID) only to correlate this result"))
         XCTAssertFalse(body.contains("reconcile using operation ID"))
     }

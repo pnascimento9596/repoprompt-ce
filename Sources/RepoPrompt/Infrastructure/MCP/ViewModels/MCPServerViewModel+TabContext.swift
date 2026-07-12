@@ -22,12 +22,6 @@ extension MCPServerViewModel {
         let tab: ComposeTabState
         let selectionRevision: UInt64
         let usedAgentOutputAsPrompt: Bool
-        let selectionConflictResolution: ContextBuilderSelectionConflictResolution
-    }
-
-    enum ContextBuilderSelectionConflictResolution: Equatable {
-        case discoverySelectionCommitted
-        case concurrentCanonicalSelectionPreserved
     }
 
     struct ContextBuilderTabContextCommitResult {
@@ -40,7 +34,6 @@ extension MCPServerViewModel {
         let tab: ComposeTabState
         let selectionRevision: UInt64
         let usedAgentOutputAsPrompt: Bool
-        let selectionConflictResolution: ContextBuilderSelectionConflictResolution
     }
 
     enum ContextBuilderTabContextCommitOutcome: Equatable {
@@ -208,11 +201,6 @@ extension MCPServerViewModel {
         case supersededByOtherConnection
     }
 
-    enum TabContextRole: Equatable {
-        case standard
-        case contextBuilderDiscovery
-    }
-
     /// Value snapshot of a compose tab plus MCP routing metadata.
     ///
     /// This is the tab-first runtime model for MCP/Agent work. It intentionally
@@ -236,12 +224,6 @@ extension MCPServerViewModel {
         var tabName: String
         /// Optional run lease associated with this snapshot.
         var runID: UUID?
-        /// Runtime-only authority discriminator. Discovery owns a private selection until terminal commit.
-        let role: TabContextRole
-        /// Canonical selection captured when discovery isolation began. Revision-only churn is not a user conflict.
-        let discoveryBaseSelection: StoredSelection?
-        /// Run-private mutation fence. Canonical `selectionRevision` remains frozen for terminal conflict policy.
-        var privateSelectionRevision: UInt64
         /// Active persisted Agent session bound to this tab, if any.
         var activeAgentSessionID: UUID?
         /// Hydration-aware worktree binding state for the active Agent session at snapshot time.
@@ -274,9 +256,6 @@ extension MCPServerViewModel {
             selectedContextBuilderPromptIDs: [UUID] = [],
             tabName: String,
             runID: UUID?,
-            role: TabContextRole = .standard,
-            discoveryBaseSelection: StoredSelection? = nil,
-            privateSelectionRevision: UInt64 = 0,
             activeAgentSessionID: UUID? = nil,
             worktreeBindings: [AgentSessionWorktreeBinding] = [],
             worktreeBindingState: AgentSessionWorktreeBindingState? = nil,
@@ -296,10 +275,6 @@ extension MCPServerViewModel {
             self.selectedContextBuilderPromptIDs = selectedContextBuilderPromptIDs
             self.tabName = tabName
             self.runID = runID
-            self.role = role
-            self.discoveryBaseSelection = discoveryBaseSelection
-                ?? (role == .contextBuilderDiscovery ? selection : nil)
-            self.privateSelectionRevision = privateSelectionRevision
             self.activeAgentSessionID = activeAgentSessionID
             self.worktreeBindingState = worktreeBindingState
                 ?? (activeAgentSessionID == nil ? .notApplicable : .hydrated(worktreeBindings))
@@ -763,7 +738,6 @@ extension MCPServerViewModel {
 
     @MainActor
     private func beginMirroringForConnection(_ connectionID: UUID, context: TabScopedContext) {
-        guard context.role != .contextBuilderDiscovery else { return }
         if tabContextCancellablesByConnectionID[connectionID] != nil { return }
 
         guard let manager = workspaceManager else {
@@ -860,7 +834,6 @@ extension MCPServerViewModel {
 
     @MainActor
     private func pushVirtualContextToUI(_ context: TabScopedContext) async {
-        guard context.role != .contextBuilderDiscovery else { return }
         // `commitTabContext` already recounts when it applies the active tab. Avoid a
         // duplicate immediate recount after the heavy file-selector projection.
         await commitTabContext(context)
@@ -1101,7 +1074,6 @@ extension MCPServerViewModel {
         workspaceID requestedWorkspaceID: UUID?,
         windowID: Int,
         runID: UUID?,
-        role: TabContextRole = .standard,
         explicitlyBound: Bool,
         captureActiveUIState: Bool,
         flushActiveSelection: Bool
@@ -1137,7 +1109,6 @@ extension MCPServerViewModel {
                 selectedContextBuilderPromptIDs: snapshot.contextBuilder.selectedContextBuilderPromptIDs,
                 tabName: snapshot.name,
                 runID: runID,
-                role: role,
                 activeAgentSessionID: snapshot.activeAgentSessionID,
                 worktreeBindingState: snapshot.activeAgentSessionID.map {
                     agentWorktreeBindingStateProvider?($0, snapshot.id) ?? .unhydrated
@@ -1162,7 +1133,6 @@ extension MCPServerViewModel {
             selectedContextBuilderPromptIDs: composeSnapshot.contextBuilder.selectedContextBuilderPromptIDs,
             tabName: composeSnapshot.name,
             runID: runID,
-            role: role,
             activeAgentSessionID: composeSnapshot.activeAgentSessionID,
             worktreeBindingState: composeSnapshot.activeAgentSessionID.map {
                 agentWorktreeBindingStateProvider?($0, composeSnapshot.id) ?? .unhydrated
@@ -1278,7 +1248,6 @@ extension MCPServerViewModel {
         workspaceID providedWorkspaceID: UUID? = nil,
         snapshot: ComposeTabState,
         runID: UUID? = nil,
-        role: TabContextRole = .standard,
         signalRouting: Bool = true,
         deferRunIDReplacementForPendingPolicy: Bool = false
     ) -> PendingPolicyRunIDMappingToken? {
@@ -1295,7 +1264,6 @@ extension MCPServerViewModel {
             workspaceID: resolvedWorkspaceID,
             windowID: windowID,
             runID: runID,
-            role: role,
             explicitlyBound: false, // discovery run binding, not explicit bind_context
             captureActiveUIState: false,
             flushActiveSelection: false
@@ -1722,16 +1690,11 @@ extension MCPServerViewModel {
         merged.frozenLookupContext = context.frozenLookupContext
         merged.contextBuilderReviewTargetResolution = context.contextBuilderReviewTargetResolution
         merged.readFileAutoSelectionGeneration = context.readFileAutoSelectionGeneration
-        if context.role == .contextBuilderDiscovery {
-            // `role` is immutable and `latest` is standard, so discovery never uses this canonical copy helper.
-            return context
-        }
         return merged
     }
 
     enum MCPSelectionCoordinatorPersistenceResult: Equatable {
         case persisted
-        case privateSnapshot
         case unchanged
         case unavailable
     }
@@ -1910,38 +1873,6 @@ extension MCPServerViewModel {
     ) async -> MCPSelectionPersistenceVerification? {
         guard mutated else { return nil }
         let context = await persistenceSafeTabContext(resolved.snapshot)
-        if context.role == .contextBuilderDiscovery {
-            guard !resolved.usesActiveTabCompatibility,
-                  let connectionID = metadata.connectionID,
-                  var latest = tabContextByConnectionID[connectionID],
-                  latest.role == .contextBuilderDiscovery,
-                  latest.tabID == context.tabID,
-                  latest.windowID == context.windowID,
-                  latest.workspaceID == context.workspaceID,
-                  latest.runID == context.runID,
-                  latest.privateSelectionRevision == resolved.snapshot.privateSelectionRevision,
-                  latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
-            else {
-                return MCPSelectionPersistenceVerification(
-                    outcome: .unavailable,
-                    expectedSelection: context.selection,
-                    canonicalSelection: nil
-                )
-            }
-            let outcome: MCPSelectionCoordinatorPersistenceResult = latest.selection == context.selection
-                ? .unchanged
-                : .privateSnapshot
-            latest.selection = context.selection
-            if outcome == .privateSnapshot {
-                latest.privateSelectionRevision &+= 1
-            }
-            tabContextByConnectionID[connectionID] = latest
-            return MCPSelectionPersistenceVerification(
-                outcome: outcome,
-                expectedSelection: context.selection,
-                canonicalSelection: context.selection
-            )
-        }
         // The visible file-tree UI is backed by logical workspace roots. Mirroring a
         // worktree-only selection through it would drop paths that exist only in the bound root.
         var verification = await Self.persistMCPSelectionAndVerifyThroughCoordinator(
@@ -3244,54 +3175,18 @@ extension MCPServerViewModel {
         sourceSelection: StoredSelection? = nil
     ) async throws -> PrimaryGitArtifactCommitResult {
         let (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
-        guard let workspaceID = context.workspaceID else {
+        guard let workspaceID = context.workspaceID,
+              let selectionCoordinator
+        else {
             throw MCPError.internalError("Canonical tab selection is unavailable for Git artifact publication")
         }
 
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
         let lookupContext = await lookupContext(for: context)
-        let contextSelection = Self.logicalizeSelectionForPersistence(
-            sourceSelection ?? context.selection,
+        let contextSelection = sourceSelection ?? Self.logicalizeSelectionForPersistence(
+            context.selection,
             lookupContext: lookupContext
         )
-        if context.role == .contextBuilderDiscovery {
-            guard var latest = tabContextByConnectionID[connectionID],
-                  latest.role == .contextBuilderDiscovery,
-                  latest.tabID == context.tabID,
-                  latest.windowID == context.windowID,
-                  latest.workspaceID == context.workspaceID,
-                  latest.runID == context.runID,
-                  latest.privateSelectionRevision == context.privateSelectionRevision,
-                  latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
-            else {
-                throw MCPError.internalError("Git artifact publication tab context is no longer current")
-            }
-            let commitBase = selectionForPrimaryGitArtifactCommit(
-                latestSelection: latest.selection,
-                contextSelection: contextSelection
-            )
-            let mergeResult = mergePrimaryGitDiffArtifactsIntoSelection(
-                existing: commitBase,
-                candidates: candidates
-            )
-            latest.selection = Self.logicalizeSelectionForPersistence(
-                mergeResult.selection,
-                lookupContext: lookupContext
-            )
-            if latest.selection != context.selection {
-                latest.privateSelectionRevision &+= 1
-            }
-            tabContextByConnectionID[connectionID] = latest
-            return PrimaryGitArtifactCommitResult(
-                selection: latest.selection,
-                selectionRevision: context.selectionRevision,
-                newlyAddedArtifacts: mergeResult.newlyAddedArtifacts,
-                autoSelectedAliases: mergeResult.newlyAddedArtifacts.compactMap(\.clientAlias)
-            )
-        }
-        guard let selectionCoordinator else {
-            throw MCPError.internalError("Canonical tab selection is unavailable for Git artifact publication")
-        }
         var mergeResult: WorkspaceGitDiffArtifactSelectionMergeResult?
         guard let transaction = await selectionCoordinator.transformSelection(
             for: identity,
@@ -3519,7 +3414,8 @@ extension MCPServerViewModel {
               fence.identity == WorkspaceSelectionIdentity(
                   workspaceID: workspaceID,
                   tabID: context.tabID
-              )
+              ),
+              let selectionCoordinator
         else {
             return .unavailable(reason: "canonical tab selection is unavailable")
         }
@@ -3578,31 +3474,6 @@ extension MCPServerViewModel {
 
         let expected = lookupContext.logicalizeSelection(expectedPhysicalSelection)
         let requested = lookupContext.logicalizeSelection(requestedPhysicalSelection)
-        if context.role == .contextBuilderDiscovery {
-            guard let connectionID = metadata.connectionID,
-                  var latest = tabContextByConnectionID[connectionID],
-                  latest.role == .contextBuilderDiscovery,
-                  latest.tabID == context.tabID,
-                  latest.workspaceID == context.workspaceID,
-                  latest.runID == context.runID,
-                  latest.privateSelectionRevision == context.privateSelectionRevision,
-                  latest.selection == expected
-            else {
-                return .conflict(reason: "private discovery selection changed concurrently")
-            }
-            latest.selection = requested
-            if requested != expected {
-                latest.privateSelectionRevision &+= 1
-            }
-            tabContextByConnectionID[connectionID] = latest
-            return .committed(
-                selection: requested,
-                selectionRevision: context.selectionRevision
-            )
-        }
-        guard let selectionCoordinator else {
-            return .unavailable(reason: "canonical tab selection is unavailable")
-        }
         var matchedExpected = false
         guard let transaction = await selectionCoordinator.transformSelection(
             for: fence.identity,
@@ -4068,11 +3939,7 @@ extension MCPServerViewModel {
             {
                 let sanitized = sanitizeTaskName(taskName)
                 if !sanitized.isEmpty {
-                    if context.role == .contextBuilderDiscovery {
-                        context.tabName = sanitized
-                    } else {
-                        renameComposeTabIfNeeded(tabID: context.tabID, newName: sanitized)
-                    }
+                    renameComposeTabIfNeeded(tabID: context.tabID, newName: sanitized)
                 }
             }
         }
@@ -4278,8 +4145,7 @@ extension MCPServerViewModel {
                 nestedRunID: expectedRunID,
                 tab: committedWrite.tab,
                 selectionRevision: committedWrite.selectionRevision,
-                usedAgentOutputAsPrompt: committedWrite.usedAgentOutputAsPrompt,
-                selectionConflictResolution: committedWrite.selectionConflictResolution
+                usedAgentOutputAsPrompt: committedWrite.usedAgentOutputAsPrompt
             )
             return ContextBuilderTabContextCommitResult(
                 outcome: .committed,
@@ -4556,17 +4422,10 @@ extension MCPServerViewModel {
 
         var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
         let isActive = (manager.workspaces[workspaceIndex].activeComposeTabID == updatedTab.id)
-        let canonicalSelectionRevisionAdvanced = manager.selectionRevisionForMCP(
+        let canonicalSelectionAdvanced = manager.selectionRevisionForMCP(
             workspaceID: workspaceID,
             tabID: context.tabID
         ) != context.selectionRevision
-
-        // Selection revisions may advance for semantic no-ops while discovery is running.
-        // Preserve canonical state only when it actually differs from the isolated source.
-        let canonicalSelectionAdvanced = canonicalSelectionRevisionAdvanced && (
-            context.discoveryBaseSelection == nil
-                || updatedTab.selection != context.discoveryBaseSelection
-        )
 
         if canonicalSelectionAdvanced {
             tabContextLog("commitTabContext preserving newer canonical selection tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil")")
@@ -4579,9 +4438,6 @@ extension MCPServerViewModel {
             updatedTab.contextOverrides.overridePromptText = ""
         }
         updatedTab.selectedMetaPromptIDs = context.selectedMetaPromptIDs
-        if context.role == .contextBuilderDiscovery {
-            updatedTab.name = context.tabName
-        }
         updatedTab.lastModified = Date()
 
         // Preserve the active file-selector tab before storing. `applyComposeTabState(_:)`
@@ -4612,10 +4468,7 @@ extension MCPServerViewModel {
             identity: identity,
             tab: storedTab,
             selectionRevision: committedSelectionRevision,
-            usedAgentOutputAsPrompt: context.usedAgentOutputAsPrompt,
-            selectionConflictResolution: canonicalSelectionAdvanced
-                ? .concurrentCanonicalSelectionPreserved
-                : .discoverySelectionCommitted
+            usedAgentOutputAsPrompt: context.usedAgentOutputAsPrompt
         )
         tabContextLog("commitTabContext stored selection/prompt tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil") workspaceID=\(workspaceID)")
 
@@ -4636,9 +4489,7 @@ extension MCPServerViewModel {
         manager.beginApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext applying to UI: tab=\(applyTab.id) selectionCount=\(applyTab.selection.selectedPaths.count) promptChars=\(applyTab.promptText.count)")
         await manager.applyComposeTabState(applyTab)
-        // `applyComposeTabState` performs a final recount after its heavy selection restore.
-        // Refresh after the whole apply so any selection revision emitted by that tail remains
-        // covered by the terminal publication fence.
+        // Refresh after the full UI apply because its final recount can enqueue another stale snapshot.
         selectionCoordinator?.protectCanonicalMCPSelectionFromDeferredUISnapshots(
             applyTab.selection,
             for: identity

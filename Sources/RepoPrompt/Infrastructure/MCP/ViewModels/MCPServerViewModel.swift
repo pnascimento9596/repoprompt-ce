@@ -4458,9 +4458,6 @@ final class MCPServerViewModel: ObservableObject {
         _ batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
     ) async -> MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult {
-        if readFileAutoSelectionContext(for: key)?.role == .contextBuilderDiscovery {
-            return await applyContextBuilderDiscoveryAutoSelectionBatch(batch, for: key)
-        }
         let certificateLookup = await lookupReadFileAutoSelectionCoverageCertificate(batch: batch, for: key)
         if certificateLookup == .hit {
             return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
@@ -4603,77 +4600,6 @@ final class MCPServerViewModel: ObservableObject {
             changed: false,
             missReason: missReason
         )
-    }
-
-    @MainActor
-    private func applyContextBuilderDiscoveryAutoSelectionBatch(
-        _ batch: MCPReadFileAutoSelectionCoordinator.CanonicalBatch,
-        for key: MCPReadFileAutoSelectionCoordinator.ContextKey
-    ) async -> MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult {
-        for attempt in 0 ..< 3 {
-            if attempt > 0 { await Task.yield() }
-            guard !Task.isCancelled,
-                  isReadFileAutoSelectionContextCurrent(key),
-                  let initialContext = readFileAutoSelectionContext(for: key),
-                  initialContext.role == .contextBuilderDiscovery
-            else { return .unchanged }
-
-            let metadata = RequestMetadata(
-                connectionID: {
-                    if case let .bound(connectionID, _) = key.route { return connectionID }
-                    return nil
-                }(),
-                clientName: nil,
-                windowID: key.windowID
-            )
-            let lookupContext = await contextBuilderDiscoveryLookupContext(
-                initialContext: initialContext,
-                metadata: metadata
-            )
-            let candidateSelection = await readFileAutoSelectionCandidate(
-                batch: batch,
-                base: initialContext.selection,
-                lookupRootScope: lookupContext.rootScope
-            )
-            let candidate = lookupContext.logicalizeSelection(candidateSelection)
-            guard MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
-                initialContext.selection,
-                isPreservedBy: candidate
-            ) else { return .unchanged }
-            guard !Task.isCancelled,
-                  isReadFileAutoSelectionContextCurrent(key),
-                  case let .bound(connectionID, _) = key.route,
-                  var latest = tabContextByConnectionID[connectionID],
-                  latest.role == .contextBuilderDiscovery,
-                  latest.runID == initialContext.runID,
-                  latest.privateSelectionRevision == initialContext.privateSelectionRevision,
-                  latest.readFileAutoSelectionGeneration == initialContext.readFileAutoSelectionGeneration
-            else { return .unchanged }
-            guard latest.selection == initialContext.selection else { continue }
-
-            let changed = latest.selection != candidate
-            latest.selection = candidate
-            if changed {
-                latest.privateSelectionRevision &+= 1
-            }
-            tabContextByConnectionID[connectionID] = latest
-            return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
-                mirrorKey: nil,
-                disposition: changed ? .changed : .semanticNoOp
-            )
-        }
-        return .unchanged
-    }
-
-    @MainActor
-    private func contextBuilderDiscoveryLookupContext(
-        initialContext: TabScopedContext,
-        metadata: RequestMetadata
-    ) async -> WorkspaceLookupContext {
-        if let frozen = initialContext.frozenLookupContext {
-            return frozen
-        }
-        return await resolveFileToolLookupContext(from: metadata)
     }
 
     @MainActor
@@ -6029,26 +5955,7 @@ final class MCPServerViewModel: ObservableObject {
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            var requestedSelection = addResult.selection
-            if freshness == "pending",
-               resolvedContext.snapshot.role == .contextBuilderDiscovery,
-               requestedSelection == baseSelection,
-               let standardizedCreatedPath = StoredSelectionPathNormalization.standardizedPath(effectivePath)
-            {
-                var selectedPaths = StoredSelectionPathNormalization.standardizedPaths(baseSelection.selectedPaths)
-                if !selectedPaths.contains(standardizedCreatedPath) {
-                    selectedPaths.append(standardizedCreatedPath)
-                }
-                requestedSelection = StoredSelection(
-                    selectedPaths: selectedPaths,
-                    manualCodemapPaths: baseSelection.manualCodemapPaths.filter { $0 != standardizedCreatedPath },
-                    slices: baseSelection.slices,
-                    codemapAutoEnabled: baseSelection.codemapAutoEnabled
-                )
-                acknowledgementWarnings.append(
-                    "The created path was recorded in the private discovery selection, but catalog-backed selection resolution remains unconfirmed until workspace freshness catches up."
-                )
-            }
+            let requestedSelection = addResult.selection
             if requestedSelection != baseSelection {
                 resolvedContext.snapshot.selection = requestedSelection
                 let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)

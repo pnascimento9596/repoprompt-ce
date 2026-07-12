@@ -4,153 +4,34 @@ import XCTest
 
 @MainActor
 final class ContextBuilderSelectionTransactionTests: XCTestCase {
-    func testDiscoverySelectionMutationIsPrivateAndReadsItsOwnWrite() async throws {
-        let fixture = try await makeFixture(name: "private")
+    func testContextBuilderToolMutationPublishesCanonicalSelectionImmediately() async throws {
+        let fixture = try await makeFixture(name: "immediate")
         defer { fixture.cleanup() }
         let source = StoredSelection(selectedPaths: [fixture.fileA.path])
         let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
         try await fixture.seedCanonical(source)
-        let context = try fixture.installContext(selection: source, role: .contextBuilderDiscovery)
+        let context = try fixture.installContext(selection: source)
 
         let verification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
             .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
-            metadata: fixture.metadata,
-            mutated: true
-        )
-
-        XCTAssertEqual(verification?.canonicalSelection, discovered)
-        XCTAssertEqual(fixture.boundContext?.selection, discovered)
-        XCTAssertEqual(fixture.canonicalSelection, source)
-        let boundContext = try XCTUnwrap(fixture.boundContext)
-        let stabilizedSelection = await fixture.window.mcpServer.stabilizedVirtualSelection(for: boundContext)
-        XCTAssertEqual(stabilizedSelection, discovered)
-    }
-
-    func testSuccessfulDiscoveryPublishesOnceAtTerminalCommit() async throws {
-        let fixture = try await makeFixture(name: "success")
-        defer { fixture.cleanup() }
-        await fixture.window.promptManager.switchComposeTab(fixture.tabID)
-        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
-        let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
-        try await fixture.seedCanonical(source)
-        let context = try fixture.installContext(selection: source, role: .contextBuilderDiscovery)
-        _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
-            metadata: fixture.metadata,
-            mutated: true
-        )
-        XCTAssertEqual(fixture.canonicalSelection, source)
-
-        let result = await fixture.window.mcpServer.commitContextBuilderTabContext(
-            connectionID: fixture.connectionID,
-            expectedRunID: fixture.runID,
-            isStillCurrent: { true }
-        )
-
-        XCTAssertEqual(result.outcome, .committed)
-        XCTAssertEqual(result.committedTab?.selectionConflictResolution, .discoverySelectionCommitted)
-        XCTAssertEqual(fixture.canonicalSelection, discovered)
-        XCTAssertEqual(
-            fixture.window.selectionCoordinator.selectionForActiveUISnapshot(
-                source,
-                tabID: fixture.tabID
-            ),
-            discovered,
-            "A UI snapshot queued before terminal publication must not revoke the discovery selection"
-        )
-        XCTAssertNil(fixture.boundContext)
-    }
-
-    func testTerminalConflictPreservesConcurrentUserSelection() async throws {
-        let fixture = try await makeFixture(name: "conflict")
-        defer { fixture.cleanup() }
-        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
-        let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
-        let concurrent = StoredSelection(selectedPaths: [fixture.fileC.path])
-        try await fixture.seedCanonical(source)
-        let context = try fixture.installContext(selection: source, role: .contextBuilderDiscovery)
-        _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
-            metadata: fixture.metadata,
-            mutated: true
-        )
-        _ = await fixture.window.selectionCoordinator.persistSelection(
-            concurrent,
-            for: fixture.identity,
-            source: .runtimeMutation,
-            mirrorToUIIfActive: true
-        )
-
-        let result = await fixture.window.mcpServer.commitContextBuilderTabContext(
-            connectionID: fixture.connectionID,
-            expectedRunID: fixture.runID,
-            isStillCurrent: { true }
-        )
-
-        XCTAssertEqual(result.outcome, .committed)
-        XCTAssertEqual(result.committedTab?.selectionConflictResolution, .concurrentCanonicalSelectionPreserved)
-        XCTAssertEqual(result.committedTab?.tab.selection, concurrent)
-        XCTAssertEqual(fixture.canonicalSelection, concurrent)
-    }
-
-    func testTerminalCommitIgnoresRevisionOnlyCanonicalChurn() async throws {
-        let fixture = try await makeFixture(name: "revision-only")
-        defer { fixture.cleanup() }
-        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
-        let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
-        try await fixture.seedCanonical(source)
-        let context = try fixture.installContext(selection: source, role: .contextBuilderDiscovery)
-        _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
-            metadata: fixture.metadata,
-            mutated: true
-        )
-
-        var tab = try XCTUnwrap(fixture.window.workspaceManager.composeTab(for: fixture.identity))
-        tab.selection = source
-        XCTAssertTrue(fixture.window.workspaceManager.updateComposeTabStoredOnly(
-            tab,
-            inWorkspaceID: fixture.workspaceID
-        ))
-        XCTAssertEqual(fixture.canonicalSelection, source)
-
-        let result = await fixture.window.mcpServer.commitContextBuilderTabContext(
-            connectionID: fixture.connectionID,
-            expectedRunID: fixture.runID,
-            isStillCurrent: { true }
-        )
-
-        XCTAssertEqual(result.outcome, .committed)
-        XCTAssertEqual(result.committedTab?.selectionConflictResolution, .discoverySelectionCommitted)
-        XCTAssertEqual(fixture.canonicalSelection, discovered)
-    }
-
-    func testStandardAgentContextStillPersistsCanonically() async throws {
-        let fixture = try await makeFixture(name: "agent")
-        defer { fixture.cleanup() }
-        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
-        let agentSelection = StoredSelection(selectedPaths: [fixture.fileB.path])
-        try await fixture.seedCanonical(source)
-        let context = try fixture.installContext(selection: source, role: .standard)
-
-        let verification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
-            .init(snapshot: context.withSelection(agentSelection), usesActiveTabCompatibility: false),
             metadata: fixture.metadata,
             mutated: true
         )
 
         XCTAssertTrue(verification?.isVerified == true)
-        XCTAssertEqual(fixture.canonicalSelection, agentSelection)
-        XCTAssertEqual(fixture.boundContext?.role, .standard)
+        XCTAssertEqual(verification?.canonicalSelection, discovered)
+        XCTAssertEqual(fixture.canonicalSelection, discovered)
+        XCTAssertEqual(fixture.boundContext?.selection, discovered)
     }
 
-    func testOraclePackagingAfterDiscardedDiscoveryUsesCanonicalSelection() async throws {
-        let fixture = try await makeFixture(name: "oracle")
+    func testSuccessfulEarlierToolMutationSurvivesLaterDiscoveryFailure() async throws {
+        let fixture = try await makeFixture(name: "failure")
         defer { fixture.cleanup() }
         let source = StoredSelection(selectedPaths: [fixture.fileA.path])
         let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
         try await fixture.seedCanonical(source)
-        let context = try fixture.installContext(selection: source, role: .contextBuilderDiscovery)
+        let context = try fixture.installContext(selection: source)
+
         _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
             .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
             metadata: fixture.metadata,
@@ -162,9 +43,85 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             windowID: fixture.window.windowID,
             runID: fixture.runID
         )
+        let failedCommit = await fixture.window.mcpServer.commitContextBuilderTabContext(
+            connectionID: fixture.connectionID,
+            expectedRunID: fixture.runID,
+            isStillCurrent: { true }
+        )
 
-        let canonicalContext = try fixture.makeContext(selection: source, role: .standard)
-        let stabilized = await fixture.window.mcpServer.stabilizedVirtualContext(for: canonicalContext)
+        guard case .missingFinalContext = failedCommit.outcome else {
+            return XCTFail("Expected the failed discovery to have no terminal context")
+        }
+        XCTAssertEqual(fixture.canonicalSelection, discovered)
+    }
+
+    func testContextBuilderAndOrdinaryAgentMutationsUseSameCanonicalPath() async throws {
+        let fixture = try await makeFixture(name: "shared-path")
+        defer { fixture.cleanup() }
+        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
+        let first = StoredSelection(selectedPaths: [fixture.fileB.path])
+        let second = StoredSelection(selectedPaths: [fixture.fileC.path])
+        try await fixture.seedCanonical(source)
+
+        let contextBuilderContext = try fixture.installContext(selection: source)
+        let firstVerification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            .init(snapshot: contextBuilderContext.withSelection(first), usesActiveTabCompatibility: false),
+            metadata: fixture.metadata,
+            mutated: true
+        )
+        let ordinaryAgentContext = try XCTUnwrap(fixture.boundContext)
+        let secondVerification = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            .init(snapshot: ordinaryAgentContext.withSelection(second), usesActiveTabCompatibility: false),
+            metadata: fixture.metadata,
+            mutated: true
+        )
+
+        XCTAssertEqual(firstVerification?.canonicalSelection, first)
+        XCTAssertEqual(secondVerification?.canonicalSelection, second)
+        XCTAssertEqual(fixture.canonicalSelection, second)
+    }
+
+    func testDeferredUISnapshotCannotClobberImmediateCanonicalPublication() async throws {
+        let fixture = try await makeFixture(name: "ui-fence")
+        defer { fixture.cleanup() }
+        await fixture.window.promptManager.switchComposeTab(fixture.tabID)
+        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
+        let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
+        try await fixture.seedCanonical(source)
+        let context = try fixture.installContext(selection: source)
+
+        _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
+            metadata: fixture.metadata,
+            mutated: true
+        )
+
+        XCTAssertEqual(
+            fixture.window.selectionCoordinator.selectionForActiveUISnapshot(
+                source,
+                tabID: fixture.tabID
+            ),
+            discovered,
+            "A UI snapshot queued before the tool mutation must not revoke canonical selection"
+        )
+        XCTAssertEqual(fixture.canonicalSelection, discovered)
+    }
+
+    func testOraclePackagingObservesImmediateCanonicalContextBuilderSelection() async throws {
+        let fixture = try await makeFixture(name: "oracle-packaging")
+        defer { fixture.cleanup() }
+        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
+        let discovered = StoredSelection(selectedPaths: [fixture.fileB.path])
+        try await fixture.seedCanonical(source)
+        let context = try fixture.installContext(selection: source)
+
+        _ = await fixture.window.mcpServer.persistResolvedTabContextSnapshot(
+            .init(snapshot: context.withSelection(discovered), usesActiveTabCompatibility: false),
+            metadata: fixture.metadata,
+            mutated: true
+        )
+
+        let stabilized = await fixture.window.mcpServer.stabilizedVirtualContext(for: context)
         let packaging = OracleViewModel.OracleSendPackagingContext(
             sourceTabID: stabilized.tabID,
             sourceWorkspaceID: stabilized.workspaceID,
@@ -178,8 +135,35 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
             provenance: .direct
         )
 
-        XCTAssertEqual(packaging.selection, source)
-        XCTAssertFalse(packaging.selection.selectedPaths.contains(fixture.fileB.path))
+        XCTAssertEqual(packaging.selection, discovered)
+        XCTAssertFalse(packaging.selection.selectedPaths.contains(fixture.fileA.path))
+    }
+
+    func testTerminalCommitPreservesNewerCanonicalSelection() async throws {
+        let fixture = try await makeFixture(name: "terminal-fence")
+        defer { fixture.cleanup() }
+        let source = StoredSelection(selectedPaths: [fixture.fileA.path])
+        let newer = StoredSelection(selectedPaths: [fixture.fileC.path])
+        try await fixture.seedCanonical(source)
+        let staleRunContext = try fixture.installContext(selection: source)
+
+        _ = await fixture.window.selectionCoordinator.persistSelection(
+            newer,
+            for: fixture.identity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
+        fixture.window.mcpServer.tabContextByConnectionID[fixture.connectionID] = staleRunContext
+
+        let result = await fixture.window.mcpServer.commitContextBuilderTabContext(
+            connectionID: fixture.connectionID,
+            expectedRunID: fixture.runID,
+            isStillCurrent: { true }
+        )
+
+        XCTAssertEqual(result.outcome, .committed)
+        XCTAssertEqual(result.committedTab?.tab.selection, newer)
+        XCTAssertEqual(fixture.canonicalSelection, newer)
     }
 
     private func makeFixture(name: String) async throws -> Fixture {
@@ -256,19 +240,13 @@ private struct Fixture {
         XCTAssertEqual(canonicalSelection, selection)
     }
 
-    func installContext(
-        selection: StoredSelection,
-        role: MCPServerViewModel.TabContextRole
-    ) throws -> MCPServerViewModel.TabContextSnapshot {
-        let context = try makeContext(selection: selection, role: role)
+    func installContext(selection: StoredSelection) throws -> MCPServerViewModel.TabContextSnapshot {
+        let context = try makeContext(selection: selection)
         window.mcpServer.tabContextByConnectionID[connectionID] = context
         return context
     }
 
-    func makeContext(
-        selection: StoredSelection,
-        role: MCPServerViewModel.TabContextRole
-    ) throws -> MCPServerViewModel.TabContextSnapshot {
+    func makeContext(selection: StoredSelection) throws -> MCPServerViewModel.TabContextSnapshot {
         let tab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
         return MCPServerViewModel.TabContextSnapshot(
             tabID: tabID,
@@ -276,12 +254,14 @@ private struct Fixture {
             workspaceID: workspaceID,
             promptText: tab.promptText,
             selection: selection,
-            selectionRevision: window.workspaceManager.selectionRevisionForMCP(workspaceID: workspaceID, tabID: tabID),
+            selectionRevision: window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: tabID
+            ),
             selectedMetaPromptIDs: tab.selectedMetaPromptIDs,
             selectedContextBuilderPromptIDs: tab.contextBuilder.selectedContextBuilderPromptIDs,
             tabName: tab.name,
             runID: runID,
-            role: role,
             explicitlyBound: false
         )
     }
