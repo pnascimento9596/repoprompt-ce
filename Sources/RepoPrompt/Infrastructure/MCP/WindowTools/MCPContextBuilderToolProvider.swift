@@ -92,8 +92,141 @@ private struct ContextBuilderToolResult: Codable {
 
 enum ContextBuilderResponseDisposition {
     case contextOnly
-    case generate(HeadlessMode)
+    case generate(HeadlessMode, prompt: String)
     case failed(String)
+}
+
+/// Typed-prompt resolution outcome for a completed Context Builder run. `resolved` carries the prompt
+/// handed to the follow-up model; each failure case names a distinct reason the provider can report
+/// safely, without echoing withheld caller instructions or discovery-guideline content.
+enum ContextBuilderTypedPromptResolution: Equatable {
+    case resolved(String)
+    /// The request carried no caller task or context and no reusable committed prompt existed.
+    case missingCallerTask
+    /// Caller instructions consisted only of discovery guidelines, which are withheld from the follow-up model.
+    case discoveryGuidelinesOnly
+    /// Caller instructions used unsupported or malformed discovery-guideline markup, so resolution failed closed.
+    case malformedDiscoveryMarkup
+    /// Only copied discovery output was committed and no independent caller task exists to answer.
+    case onlyCopiedDiscoveryOutput
+}
+
+enum ContextBuilderTypedPromptResolver {
+    private static let openingTag = "<discovery_agent-guidelines>"
+    private static let closingTag = "</discovery_agent-guidelines>"
+    private static let reservedName = "discovery_agent-guidelines"
+
+    /// Outcome of stripping reserved discovery-guideline markup from caller instructions. The empty and
+    /// guidelines-only cases are kept distinct so resolution can tell "caller supplied nothing" apart from
+    /// "caller supplied only withheld guidelines" without re-parsing.
+    private enum SanitizedCallerInstructions {
+        case prompt(String)
+        case empty
+        case onlyGuidelines
+        case malformed
+    }
+
+    static func resolve(
+        effectivePrompt: String,
+        usedAgentOutputAsPrompt: Bool,
+        callerInstructions: String
+    ) -> ContextBuilderTypedPromptResolution {
+        if !usedAgentOutputAsPrompt,
+           !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return .resolved(effectivePrompt)
+        }
+        switch sanitizeCallerInstructions(callerInstructions) {
+        case let .prompt(prompt):
+            return .resolved(prompt)
+        case .malformed:
+            return .malformedDiscoveryMarkup
+        case .onlyGuidelines:
+            return .discoveryGuidelinesOnly
+        case .empty:
+            // A committed prompt flagged as copied discovery output is deliberately not reused, so an empty
+            // caller fallback means only that copied output exists; otherwise no caller task was provided at all.
+            return usedAgentOutputAsPrompt ? .onlyCopiedDiscoveryOutput : .missingCallerTask
+        }
+    }
+
+    private static func sanitizeCallerInstructions(_ instructions: String) -> SanitizedCallerInstructions {
+        var sanitized = ""
+        var cursor = instructions.startIndex
+        var insideGuidelines = false
+        var removedGuidelines = false
+
+        while cursor < instructions.endIndex {
+            guard instructions[cursor] == "<" else {
+                if !insideGuidelines {
+                    sanitized.append(instructions[cursor])
+                }
+                cursor = instructions.index(after: cursor)
+                continue
+            }
+
+            guard let closingAngle = closingAngleIndex(in: instructions, after: cursor) else {
+                let remainder = instructions[cursor...]
+                guard remainder.range(of: reservedName, options: .caseInsensitive) == nil else {
+                    return .malformed
+                }
+                if !insideGuidelines {
+                    sanitized.append(contentsOf: remainder)
+                }
+                break
+            }
+
+            let afterTag = instructions.index(after: closingAngle)
+            let tag = instructions[cursor ..< afterTag]
+            if tag == openingTag {
+                guard !insideGuidelines else { return .malformed }
+                insideGuidelines = true
+                removedGuidelines = true
+            } else if tag == closingTag {
+                guard insideGuidelines else { return .malformed }
+                insideGuidelines = false
+            } else {
+                // Quote-aware tokenization keeps reserved markup inside attributes from becoming removable blocks.
+                guard tag.range(of: reservedName, options: .caseInsensitive) == nil else {
+                    return .malformed
+                }
+                if !insideGuidelines {
+                    sanitized.append(contentsOf: tag)
+                }
+            }
+            cursor = afterTag
+        }
+
+        guard !insideGuidelines else { return .malformed }
+        let result = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !result.isEmpty {
+            return .prompt(result)
+        }
+        return removedGuidelines ? .onlyGuidelines : .empty
+    }
+
+    private static func closingAngleIndex(
+        in instructions: String,
+        after openingAngle: String.Index
+    ) -> String.Index? {
+        var cursor = instructions.index(after: openingAngle)
+        var activeQuote: Character?
+
+        while cursor < instructions.endIndex {
+            let character = instructions[cursor]
+            if let quote = activeQuote {
+                if character == quote {
+                    activeQuote = nil
+                }
+            } else if character == "\"" || character == "'" {
+                activeQuote = character
+            } else if character == ">" {
+                return cursor
+            }
+            cursor = instructions.index(after: cursor)
+        }
+        return nil
+    }
 }
 
 @MainActor
@@ -444,15 +577,18 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     responseType: responseType,
                     terminalDisposition: snapshot.terminalDisposition,
                     usedAgentOutputAsPrompt: snapshot.usedAgentOutputAsPrompt,
-                    effectivePrompt: effectivePrompt
+                    effectivePrompt: effectivePrompt,
+                    callerInstructions: instructions
                 )
+                var resultPrompt = effectivePrompt
 
                 switch responseDisposition {
                 case .contextOnly:
                     break
                 case let .failed(message):
                     throw MCPError.internalError(message)
-                case let .generate(mode):
+                case let .generate(mode, prompt):
+                    resultPrompt = prompt
                     try Task.checkCancellation()
                     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
                     if mode == .review, let workspaceContext {
@@ -543,7 +679,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 tabResolution.agentModeSessionID,
                                 tabResolution.agentModeRunID,
                                 mode,
-                                effectivePrompt,
+                                prompt,
                                 sel,
                                 lookupContext,
                                 tabResolution.reviewGitContext,
@@ -586,7 +722,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     ContextBuilderToolResult(
                         tabID: resultTab.id.uuidString,
                         status: status,
-                        prompt: effectivePrompt,
+                        prompt: resultPrompt,
                         fileCount: fileCount,
                         totalTokens: normalizedTokens,
                         userTotalTokens: userTotalTokens,
@@ -652,7 +788,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         responseType: ContextBuilderResponseType?,
         terminalDisposition: ContextBuilderRunTerminalOutcome,
         usedAgentOutputAsPrompt: Bool,
-        effectivePrompt: String
+        effectivePrompt: String,
+        callerInstructions: String
     ) -> ContextBuilderResponseDisposition {
         guard responseType?.wantsResponse == true else { return .contextOnly }
 
@@ -660,21 +797,49 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         case .cancelled, .failed:
             return .contextOnly
         case .completed:
-            guard !usedAgentOutputAsPrompt else {
-                return .failed(
-                    "Context Builder completed without a typed direct response for the requested \(responseType?.rawValue ?? "response")"
-                )
-            }
-            guard !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return .failed(
-                    "Context Builder completed without a prompt for the requested \(responseType?.rawValue ?? "response")"
-                )
+            let prompt: String
+            switch ContextBuilderTypedPromptResolver.resolve(
+                effectivePrompt: effectivePrompt,
+                usedAgentOutputAsPrompt: usedAgentOutputAsPrompt,
+                callerInstructions: callerInstructions
+            ) {
+            case let .resolved(resolvedPrompt):
+                prompt = resolvedPrompt
+            case .missingCallerTask:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "the request included no caller task or context to answer"
+                ))
+            case .onlyCopiedDiscoveryOutput:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "only copied discovery output is available and no independent caller task was provided"
+                ))
+            case .discoveryGuidelinesOnly:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "the caller instructions contained only discovery guidelines, which are withheld from the follow-up model"
+                ))
+            case .malformedDiscoveryMarkup:
+                return .failed(typedPromptFailure(
+                    responseType,
+                    reason: "the caller instructions used unsupported or malformed discovery-guideline markup"
+                ))
             }
             guard let mode = responseType?.headlessMode else {
                 return .failed("Context Builder requested response mode is unavailable")
             }
-            return .generate(mode)
+            return .generate(mode, prompt: prompt)
         }
+    }
+
+    /// Composes a safe typed-prompt failure message. `reason` names why resolution failed without echoing
+    /// withheld caller instructions or discovery-guideline content; "without a prompt" stays the stable stem.
+    private nonisolated static func typedPromptFailure(
+        _ responseType: ContextBuilderResponseType?,
+        reason: String
+    ) -> String {
+        "Context Builder completed without a prompt for the requested \(responseType?.rawValue ?? "response"): \(reason)"
     }
 
     private static func withHeartbeat<T: Sendable>(
