@@ -1176,6 +1176,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
 
             let activeWorkspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+            ContextBuilderTestReadinessSupport.seedCanonicalProviderReadiness(
+                apiSettingsViewModel: composition.apiSettingsViewModel,
+                workspaceID: activeWorkspace.id
+            )
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
