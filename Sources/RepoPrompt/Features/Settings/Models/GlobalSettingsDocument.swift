@@ -121,9 +121,34 @@ enum AgentModelsInheritanceMode: String, Codable, Equatable {
     case useWorkspaceOverrides
 }
 
-enum AgentModelsEditingScope: Equatable {
+enum AgentModelsEditingScope: Hashable {
     case global
     case workspace(UUID)
+}
+
+/// Stable identity for one Agent Models operation. The source workspace drives
+/// workspace-local wizard bookkeeping while `scope` is the exact durable profile
+/// the operation may read or mutate.
+struct AgentModelsOperationIdentity: Hashable {
+    let sourceWorkspaceID: UUID
+    let scope: AgentModelsEditingScope
+
+    init(sourceWorkspaceID: UUID, scope: AgentModelsEditingScope) {
+        self.sourceWorkspaceID = sourceWorkspaceID
+        self.scope = scope
+    }
+
+    init(sourceWorkspaceID: UUID, inheritanceMode: AgentModelsInheritanceMode) {
+        self.sourceWorkspaceID = sourceWorkspaceID
+        scope = inheritanceMode == .useWorkspaceOverrides ? .workspace(sourceWorkspaceID) : .global
+    }
+
+    func matches(sourceWorkspaceID: UUID, inheritanceMode: AgentModelsInheritanceMode) -> Bool {
+        self == AgentModelsOperationIdentity(
+            sourceWorkspaceID: sourceWorkspaceID,
+            inheritanceMode: inheritanceMode
+        )
+    }
 }
 
 enum ContextBuilderSettingsWriteIntent {

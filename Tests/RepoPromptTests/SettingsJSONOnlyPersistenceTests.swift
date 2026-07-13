@@ -2118,6 +2118,141 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         return url
     }
 
+    func testTierCleanupNormalizesAllAgentModelsProfilesInOneSaveAndNotifiesExactScopes() throws {
+        let workspaceID = UUID()
+        let tierRaw = AIModel.openAIServiceTierVariant(base: .gpt54Pro, tier: "flex").rawValue
+        let tierSelectionRaw = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: tierRaw
+        ).rawValue
+        let normalizedSelectionRaw = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AIModel.gpt54Pro.rawValue
+        ).rawValue
+        let emptyBaseSelectionRaw = "\(AgentProviderKind.codexExec.rawValue):openai_tier__flex__"
+        let parseInvalidSelectionRaw = "agent-selection:\(AgentProviderKind.codexExec.rawValue):\(tierRaw)"
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            agentModelsSettings: [
+                workspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(
+                        planningModelRaw: tierRaw,
+                        preferredComposeModelRaw: tierRaw,
+                        mcpAgentRoleOverrides: [
+                            "explore": tierSelectionRaw,
+                            "engineer": emptyBaseSelectionRaw
+                        ]
+                    )
+                )
+            ],
+            globalDefaults: GlobalDefaults(
+                discoverAgentRaw: AgentProviderKind.codexExec.rawValue,
+                discoverModelsByAgent: [AgentProviderKind.codexExec.rawValue: tierRaw],
+                mcpAgentRoleOverrides: [
+                    "code": tierSelectionRaw,
+                    "review": parseInvalidSelectionRaw
+                ]
+            ),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(preferredComposeModel: tierRaw, planningModel: tierRaw)
+            )
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        store.normalizeDisabledOpenAIServiceTierVariants()
+
+        XCTAssertEqual(fileStore.saveCount, 1)
+        XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(store.globalAgentModelsProfile().preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().contextBuilderModelsByAgent?[AgentProviderKind.codexExec.rawValue],
+            AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertEqual(store.globalAgentModelsProfile().mcpAgentRoleOverrides?["code"], normalizedSelectionRaw)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().mcpAgentRoleOverrides?["review"],
+            parseInvalidSelectionRaw,
+            "Parse-invalid overrides must survive byte-identical"
+        )
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["explore"],
+            normalizedSelectionRaw
+        )
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides?["engineer"],
+            emptyBaseSelectionRaw,
+            "A parsed tier wrapper with an empty base must survive without reconstruction"
+        )
+        XCTAssertEqual(Set(recorder.snapshot().compactMap(\.scope)), Set(["global", "workspace"]))
+
+        store.normalizeDisabledOpenAIServiceTierVariants()
+        XCTAssertEqual(fileStore.saveCount, 1, "Cleanup must be idempotent")
+    }
+
+    func testDisablingServiceTierVariantsInstallsParsingPolicyBeforeCleanup() throws {
+        let defaults = try makeIsolatedDefaults()
+        defaults.set(true, forKey: "openAIShowServiceTierVariants")
+        var policyObservedDuringCleanup: Bool?
+
+        APISettingsViewModel.persistOpenAIShowServiceTierVariants(
+            false,
+            defaults: defaults,
+            normalizeDisabledVariants: {
+                policyObservedDuringCleanup = defaults.bool(forKey: "openAIShowServiceTierVariants")
+            }
+        )
+
+        XCTAssertEqual(policyObservedDuringCleanup, false)
+        XCTAssertFalse(defaults.bool(forKey: "openAIShowServiceTierVariants"))
+    }
+
+    func testReloadNotifiesChangedAndRemovedAgentModelsScopesAfterInstallation() throws {
+        let changedWorkspaceID = UUID()
+        let removedWorkspaceID = UUID()
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            agentModelsSettings: [
+                changedWorkspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+                ),
+                removedWorkspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue)
+                )
+            ],
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(planningModel: AIModel.gpt54Pro.rawValue)
+            )
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+        fileStore.document = GlobalSettingsDocument(
+            agentModelsSettings: [
+                changedWorkspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(planningModelRaw: AIModel.claude4Sonnet.rawValue)
+                )
+            ],
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: GlobalScalarPreferences(
+                modelSelection: .init(planningModel: AIModel.claude4Sonnet.rawValue)
+            )
+        )
+
+        XCTAssertTrue(store.reloadFromDisk())
+        XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.claude4Sonnet.rawValue)
+        let notifications = recorder.snapshot()
+        XCTAssertTrue(notifications.contains { $0.scope == "global" && $0.workspaceID == nil })
+        XCTAssertTrue(notifications.contains { $0.workspaceID == changedWorkspaceID })
+        XCTAssertTrue(notifications.contains { $0.workspaceID == removedWorkspaceID })
+    }
+
     private var obsoleteGitignorePreferenceKey: String {
         ["respect", "Git", "ignore"].joined()
     }

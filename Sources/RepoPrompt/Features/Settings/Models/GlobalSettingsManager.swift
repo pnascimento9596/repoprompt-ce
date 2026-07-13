@@ -573,6 +573,82 @@ class GlobalSettingsStore: ObservableObject {
         return normalizedAgentModelsProfile(profile)
     }
 
+    /// Removes hidden OpenAI service-tier wrappers from every Agent Models profile
+    /// in one durable transaction. Notifications are synchronous and emitted only
+    /// after the complete state has been installed and saved.
+    func normalizeDisabledOpenAIServiceTierVariants() {
+        func normalized(_ raw: String?) -> String? {
+            guard let raw else { return nil }
+            return AIModel.rawValueWithoutOpenAIServiceTier(raw)
+        }
+
+        func normalizedTieredRoleOverrides(_ overrides: [String: String]?) -> [String: String]? {
+            overrides?.mapValues { raw in
+                guard let selection = AgentModelSelectionID.parse(raw) else { return raw }
+                let modelRaw = AIModel.rawValueWithoutOpenAIServiceTier(selection.modelRaw)
+                guard modelRaw != selection.modelRaw,
+                      !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else {
+                    return raw
+                }
+                return AgentModelSelectionID(agentRaw: selection.agentRaw, modelRaw: modelRaw).rawValue
+            }
+        }
+
+        var globalChanged = false
+        var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
+        let planning = normalized(modelSelection.planningModel)
+        let compose = normalized(modelSelection.preferredComposeModel)
+        if planning != modelSelection.planningModel || compose != modelSelection.preferredComposeModel {
+            modelSelection.planningModel = planning
+            modelSelection.preferredComposeModel = compose
+            scalarPreferences.modelSelection = modelSelection
+            globalChanged = true
+        }
+        if let models = globalDefaults.discoverModelsByAgent {
+            let next = models.mapValues { AIModel.rawValueWithoutOpenAIServiceTier($0) }
+            if next != models {
+                globalDefaults.discoverModelsByAgent = next
+                globalChanged = true
+            }
+        }
+        let roleOverrides = normalizedTieredRoleOverrides(globalDefaults.mcpAgentRoleOverrides)
+        if roleOverrides != globalDefaults.mcpAgentRoleOverrides {
+            globalDefaults.mcpAgentRoleOverrides = roleOverrides
+            globalChanged = true
+        }
+
+        var changedWorkspaceIDs: [UUID] = []
+        for workspaceID in agentModelsSettingsByWorkspaceID.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard var settings = agentModelsSettingsByWorkspaceID[workspaceID], var profile = settings.profile else { continue }
+            let old = profile
+            profile.planningModelRaw = normalized(profile.planningModelRaw)
+            profile.preferredComposeModelRaw = normalized(profile.preferredComposeModelRaw)
+            if let models = profile.contextBuilderModelsByAgent {
+                profile.contextBuilderModelsByAgent = models.mapValues { AIModel.rawValueWithoutOpenAIServiceTier($0) }
+            }
+            profile.mcpAgentRoleOverrides = normalizedTieredRoleOverrides(profile.mcpAgentRoleOverrides)
+            guard profile != old else { continue }
+            settings.profile = profile
+            agentModelsSettingsByWorkspaceID[workspaceID] = settings
+            changedWorkspaceIDs.append(workspaceID)
+        }
+
+        let legacyKey = "contextBuilderModel"
+        if let raw = defaults.string(forKey: legacyKey) {
+            let next = AIModel.rawValueWithoutOpenAIServiceTier(raw)
+            if next != raw { defaults.set(next, forKey: legacyKey) }
+        }
+
+        guard globalChanged || !changedWorkspaceIDs.isEmpty else { return }
+        objectWillChange.send()
+        save()
+        if globalChanged { postAgentModelsSettingsDidChange(scope: .global) }
+        for workspaceID in changedWorkspaceIDs {
+            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
+        }
+    }
+
     func setAgentModelsMCPAgentRoleOverrides(
         _ overrides: [String: String]?,
         scope: AgentModelsEditingScope
@@ -2016,7 +2092,9 @@ class GlobalSettingsStore: ObservableObject {
 
     // MARK: - Persistence
 
-    private func load() {
+    private func load(notifyAgentModelsChanges: Bool = false) {
+        let oldGlobalProfile = globalAgentModelsProfile()
+        let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
         let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
         let loadedExistingDocument = fileExists ? try? fileStore.load() : nil
         let existingFileWasCorrupt = fileExists && loadedExistingDocument == nil
@@ -2040,6 +2118,17 @@ class GlobalSettingsStore: ObservableObject {
         }
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
         persistenceBlockReason = fileStore.blockReason
+        if notifyAgentModelsChanges {
+            postInstalledAgentModelsChanges(
+                oldGlobalProfile: oldGlobalProfile,
+                oldWorkspaceSettings: oldWorkspaceSettings
+            )
+            NotificationCenter.default.post(
+                name: .recommendationsShouldRefresh,
+                object: self,
+                userInfo: ["reason": "globalSettingsInstalled"]
+            )
+        }
     }
 
     /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
@@ -2051,7 +2140,7 @@ class GlobalSettingsStore: ObservableObject {
     func recoverBlockedPersistenceAfterBackup() -> Bool {
         let backedUp = fileStore.performUserInitiatedRecovery(replacementDocument: makeDocument())
         objectWillChange.send()
-        load()
+        load(notifyAgentModelsChanges: true)
         return backedUp
     }
 
@@ -2063,7 +2152,7 @@ class GlobalSettingsStore: ObservableObject {
         let imported = fileStore.performUserInitiatedCompatibleImport()
         objectWillChange.send()
         if imported {
-            load()
+            load(notifyAgentModelsChanges: true)
         } else {
             persistenceBlockReason = fileStore.blockReason
         }
@@ -2080,6 +2169,8 @@ class GlobalSettingsStore: ObservableObject {
     @discardableResult
     func reloadFromDisk() -> Bool {
         do {
+            let oldGlobalProfile = globalAgentModelsProfile()
+            let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
             let document = try fileStore.load()
             objectWillChange.send()
             copySettings = document.copySettings
@@ -2094,11 +2185,35 @@ class GlobalSettingsStore: ObservableObject {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
             persistenceBlockReason = fileStore.blockReason
+            postInstalledAgentModelsChanges(
+                oldGlobalProfile: oldGlobalProfile,
+                oldWorkspaceSettings: oldWorkspaceSettings
+            )
+            NotificationCenter.default.post(
+                name: .recommendationsShouldRefresh,
+                object: self,
+                userInfo: ["reason": "globalSettingsInstalled"]
+            )
             return true
         } catch {
             persistenceBlockReason = fileStore.blockReason
             print("⚠️ Failed to reload global settings JSON at \(fileStore.fileURL.path): \(error)")
             return false
+        }
+    }
+
+    private func postInstalledAgentModelsChanges(
+        oldGlobalProfile: AgentModelsSettingsProfile,
+        oldWorkspaceSettings: [UUID: WorkspaceAgentModelsSettings]
+    ) {
+        if oldGlobalProfile != globalAgentModelsProfile() {
+            postAgentModelsSettingsDidChange(scope: .global)
+        }
+        let workspaceIDs = Set(oldWorkspaceSettings.keys).union(agentModelsSettingsByWorkspaceID.keys)
+        for workspaceID in workspaceIDs.sorted(by: { $0.uuidString < $1.uuidString })
+            where oldWorkspaceSettings[workspaceID] != agentModelsSettingsByWorkspaceID[workspaceID]
+        {
+            postAgentModelsSettingsDidChange(scope: .workspace, workspaceID: workspaceID)
         }
     }
 
