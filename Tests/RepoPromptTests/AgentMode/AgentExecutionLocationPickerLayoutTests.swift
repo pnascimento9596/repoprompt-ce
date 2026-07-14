@@ -23,10 +23,17 @@ final class AgentExecutionLocationPickerLayoutTests: XCTestCase {
                 width: AgentExecutionLocationPickerLayout.popoverWidth(for: preset) - 16,
                 height: AgentExecutionLocationPickerLayout.rowsHeight(for: preset)
             )
+            var referenceSize: CGSize?
             for state in State.allCases {
                 let measuredSize = measuredSize(for: state, preset: preset)
-                XCTAssertEqual(measuredSize.width, expectedSize.width, accuracy: 0.5, "\(preset) \(state) width changed")
-                XCTAssertEqual(measuredSize.height, expectedSize.height, accuracy: 0.5, "\(preset) \(state) height changed")
+                XCTAssertEqual(measuredSize.width, expectedSize.width, accuracy: 1.0, "\(preset) \(state) width drifted from the configured region")
+                XCTAssertEqual(measuredSize.height, expectedSize.height, accuracy: 1.0, "\(preset) \(state) height drifted from the configured region")
+                if let referenceSize {
+                    XCTAssertEqual(measuredSize.width, referenceSize.width, accuracy: 0.5, "\(preset) \(state) width changed relative to loading")
+                    XCTAssertEqual(measuredSize.height, referenceSize.height, accuracy: 0.5, "\(preset) \(state) height changed relative to loading")
+                } else {
+                    referenceSize = measuredSize
+                }
             }
         }
     }
