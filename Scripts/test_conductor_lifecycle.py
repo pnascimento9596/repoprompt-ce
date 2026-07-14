@@ -1928,11 +1928,14 @@ class SmokeOperationTests(unittest.TestCase):
         self.assertIn("set candidatePID to (unix id of candidateProcess) as integer", source)
         self.assertIn("if candidatePID is targetPID then", source)
         self.assertIn("if ((unix id of candidateProcess) as integer) is targetPID then return", source)
-        self.assertIn("set frontmost of candidateProcess to true", source)
+        self.assertIn("set frontmost to true", source)
         self.assertIn("key code 53", source)
+        self.assertIn("entire contents of window windowIndex whose value of attribute", source)
+        self.assertIn("repeat with windowIndex from 1 to 1", source)
         self.assertNotIn("first application process whose unix id is targetPID", source)
         self.assertNotIn("process appProcessName", source)
         self.assertNotIn("contents of candidateProcess", source)
+        self.assertNotIn("on firstElementWithIdentifier", source)
 
     def test_manage_worktree_list_stage_runs_after_tree_roots_before_agent_manage(self) -> None:
         calls: list[tuple[str, list[str]]] = []

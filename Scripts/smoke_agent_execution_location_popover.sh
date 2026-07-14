@@ -46,33 +46,64 @@ on assertProcessExistsForPID(targetPID)
     error "Could not find the RepoPrompt debug process with PID " & targetPID
 end assertProcessExistsForPID
 
-on firstElementWithIdentifier(containerRef, targetIdentifier)
+on firstElementForPID(targetPID, targetIdentifier)
     tell application "System Events"
-        try
-            set candidateIdentifier to value of attribute "AXIdentifier" of containerRef
-            if candidateIdentifier is not missing value and candidateIdentifier as text is targetIdentifier then return containerRef
-        end try
-        try
-            repeat with childRef in UI elements of containerRef
-                set foundRef to my firstElementWithIdentifier(childRef, targetIdentifier)
-                if foundRef is not missing value then return foundRef
-            end repeat
-        end try
+        repeat with candidateProcess in application processes
+            if ((unix id of candidateProcess) as integer) is targetPID then
+                tell candidateProcess
+                    -- Focused UI smoke targets the front window only; searching
+                    -- background windows can traverse hundreds of stale tabs.
+                    repeat with windowIndex from 1 to 1
+                        if targetIdentifier is "agent-execution-location-pill" then
+                            try
+                                set matches to entire contents of window windowIndex whose value of attribute "AXIdentifier" is "agent-execution-location-pill"
+                                if (count of matches) > 0 then return item 1 of matches
+                            end try
+                        else if targetIdentifier is "agent-execution-location-option-local" then
+                            try
+                                set matches to entire contents of window windowIndex whose value of attribute "AXIdentifier" is "agent-execution-location-option-local"
+                                if (count of matches) > 0 then return item 1 of matches
+                            end try
+                        else if targetIdentifier is "agent-execution-location-option-new-worktree" then
+                            try
+                                set matches to entire contents of window windowIndex whose value of attribute "AXIdentifier" is "agent-execution-location-option-new-worktree"
+                                if (count of matches) > 0 then return item 1 of matches
+                            end try
+                        else if targetIdentifier is "agent-execution-location-existing-list" then
+                            try
+                                set matches to entire contents of window windowIndex whose value of attribute "AXIdentifier" is "agent-execution-location-existing-list"
+                                if (count of matches) > 0 then return item 1 of matches
+                            end try
+                        else if targetIdentifier is "agent-execution-location-existing-empty" then
+                            try
+                                set matches to entire contents of window windowIndex whose value of attribute "AXIdentifier" is "agent-execution-location-existing-empty"
+                                if (count of matches) > 0 then return item 1 of matches
+                            end try
+                        else if targetIdentifier is "agent-execution-location-existing-error" then
+                            try
+                                set matches to entire contents of window windowIndex whose value of attribute "AXIdentifier" is "agent-execution-location-existing-error"
+                                if (count of matches) > 0 then return item 1 of matches
+                            end try
+                        else
+                            error "Unsupported execution-location accessibility identifier " & targetIdentifier
+                        end if
+                    end repeat
+                end tell
+                return missing value
+            end if
+        end repeat
     end tell
-    return missing value
-end firstElementWithIdentifier
+    error "Could not find the RepoPrompt debug process with PID " & targetPID
+end firstElementForPID
 
 on waitForElement(targetPID, targetIdentifier, shouldExist)
-    repeat 40 times
-        tell application "System Events"
-            repeat with candidateProcess in application processes
-                if ((unix id of candidateProcess) as integer) is targetPID then
-                    set foundRef to my firstElementWithIdentifier(candidateProcess, targetIdentifier)
-                    if shouldExist and foundRef is not missing value then return foundRef
-                    if not shouldExist and foundRef is missing value then return missing value
-                end if
-            end repeat
-        end tell
+    -- Native AX snapshots can take about a second on a tab-heavy debug app;
+    -- keep polling bounded so a missing identifier fails before the conductor
+    -- stage timeout rather than multiplying an expensive traversal indefinitely.
+    repeat 8 times
+        set foundRef to my firstElementForPID(targetPID, targetIdentifier)
+        if shouldExist and foundRef is not missing value then return foundRef
+        if not shouldExist and foundRef is missing value then return missing value
         delay 0.1
     end repeat
     if shouldExist then error "Could not find accessibility element " & targetIdentifier
@@ -80,14 +111,15 @@ on waitForElement(targetPID, targetIdentifier, shouldExist)
 end waitForElement
 
 on clickElementForPID(targetPID, targetIdentifier)
+    set elementRef to my firstElementForPID(targetPID, targetIdentifier)
+    if elementRef is missing value then error "Could not find accessibility element " & targetIdentifier
     tell application "System Events"
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
-                set elementRef to my firstElementWithIdentifier(candidateProcess, targetIdentifier)
-                if elementRef is not missing value then
-                    if ((unix id of candidateProcess) as integer) is targetPID then click elementRef
+                tell candidateProcess
+                    if ((unix id) as integer) is my targetPID then click elementRef
                     return
-                end if
+                end tell
             end if
         end repeat
     end tell
@@ -96,17 +128,11 @@ end clickElementForPID
 
 on waitForTerminalState(targetPID)
     set terminalIdentifiers to {"agent-execution-location-existing-list", "agent-execution-location-existing-empty", "agent-execution-location-existing-error"}
-    repeat 60 times
-        tell application "System Events"
-            repeat with candidateProcess in application processes
-                if ((unix id of candidateProcess) as integer) is targetPID then
-                    repeat with terminalIdentifier in terminalIdentifiers
-                        set foundRef to my firstElementWithIdentifier(candidateProcess, terminalIdentifier as text)
-                        if foundRef is not missing value then return foundRef
-                    end repeat
-                end if
-            end repeat
-        end tell
+    repeat 20 times
+        repeat with terminalIdentifier in terminalIdentifiers
+            set foundRef to my firstElementForPID(targetPID, terminalIdentifier as text)
+            if foundRef is not missing value then return foundRef
+        end repeat
         delay 0.1
     end repeat
     error "Existing-worktree picker did not transition from loading to a terminal state"
@@ -147,9 +173,11 @@ on captureWindowIdentityForPID(targetPID)
     tell application "System Events"
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
-                if not (exists window 1 of candidateProcess) then error "RepoPrompt debug app has no front window"
-                set windowRef to window 1 of candidateProcess
-                return my captureWindowIdentity(windowRef)
+                tell candidateProcess
+                    if not (exists window 1) then error "RepoPrompt debug app has no front window"
+                    set windowRef to window 1
+                    return my captureWindowIdentity(windowRef)
+                end tell
             end if
         end repeat
     end tell
@@ -161,10 +189,12 @@ on hasWindowWithIdentity(targetPID, identity)
     tell application "System Events"
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
-                repeat with candidateWindow in windows of candidateProcess
-                    if my windowMatchesIdentity(candidateWindow, identity) then set matchingWindowCount to matchingWindowCount + 1
-                end repeat
-                exit repeat
+                tell candidateProcess
+                    repeat with candidateWindow in windows
+                        if my windowMatchesIdentity(candidateWindow, identity) then set matchingWindowCount to matchingWindowCount + 1
+                    end repeat
+                    exit repeat
+                end tell
             end if
         end repeat
     end tell
@@ -182,13 +212,15 @@ on focusProcessForPID(targetPID)
     tell application "System Events"
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
-                set frontmost of candidateProcess to true
-                if ((unix id of candidateProcess) as integer) is not targetPID then error "RepoPrompt debug PID changed during focus"
-                repeat 30 times
-                    if exists window 1 of candidateProcess then return
-                    delay 0.2
-                end repeat
-                error "RepoPrompt debug app has no front window"
+                tell candidateProcess
+                    if ((unix id) as integer) is not my targetPID then error "RepoPrompt debug PID changed during focus"
+                    set frontmost to true
+                    repeat 30 times
+                        if exists window 1 then return
+                        delay 0.2
+                    end repeat
+                    error "RepoPrompt debug app has no front window"
+                end tell
             end if
         end repeat
     end tell
@@ -199,10 +231,12 @@ on escapePopoverForPID(targetPID)
     tell application "System Events"
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
-                set frontmost of candidateProcess to true
-                if ((unix id of candidateProcess) as integer) is not targetPID then error "RepoPrompt debug PID changed before Escape"
-                key code 53
-                return
+                tell candidateProcess
+                    if ((unix id) as integer) is not my targetPID then error "RepoPrompt debug PID changed before Escape"
+                    set frontmost to true
+                    key code 53
+                    return
+                end tell
             end if
         end repeat
     end tell
