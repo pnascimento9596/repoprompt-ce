@@ -1935,6 +1935,7 @@ class SmokeOperationTests(unittest.TestCase):
         self.assertNotIn("first application process whose unix id is targetPID", source)
         self.assertNotIn("process appProcessName", source)
         self.assertNotIn("contents of candidateProcess", source)
+        self.assertNotIn("my targetPID", source)
         self.assertNotIn("on firstElementWithIdentifier", source)
 
     def test_manage_worktree_list_stage_runs_after_tree_roots_before_agent_manage(self) -> None:

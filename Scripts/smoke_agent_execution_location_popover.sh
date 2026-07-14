@@ -117,7 +117,11 @@ on clickElementForPID(targetPID, targetIdentifier)
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
                 tell candidateProcess
-                    if ((unix id) as integer) is my targetPID then click elementRef
+                    if ((unix id) as integer) is targetPID then
+                        click elementRef
+                    else
+                        error "RepoPrompt debug PID changed before click"
+                    end if
                     return
                 end tell
             end if
@@ -213,8 +217,13 @@ on focusProcessForPID(targetPID)
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
                 tell candidateProcess
-                    if ((unix id) as integer) is not my targetPID then error "RepoPrompt debug PID changed during focus"
+                    if ((unix id) as integer) is not targetPID then error "RepoPrompt debug PID changed during focus"
                     set frontmost to true
+                    repeat 10 times
+                        if frontmost then exit repeat
+                        delay 0.1
+                    end repeat
+                    if not frontmost then error "RepoPrompt debug app did not become frontmost"
                     repeat 30 times
                         if exists window 1 then return
                         delay 0.2
@@ -232,8 +241,13 @@ on escapePopoverForPID(targetPID)
         repeat with candidateProcess in application processes
             if ((unix id of candidateProcess) as integer) is targetPID then
                 tell candidateProcess
-                    if ((unix id) as integer) is not my targetPID then error "RepoPrompt debug PID changed before Escape"
+                    if ((unix id) as integer) is not targetPID then error "RepoPrompt debug PID changed before Escape"
                     set frontmost to true
+                    repeat 10 times
+                        if frontmost then exit repeat
+                        delay 0.1
+                    end repeat
+                    if not frontmost then error "RepoPrompt debug app did not become frontmost before Escape"
                     key code 53
                     return
                 end tell
