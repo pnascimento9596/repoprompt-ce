@@ -126,6 +126,42 @@ final class MCPServiceProxyRaceTests: XCTestCase {
         XCTAssertEqual(snapshot.completed, Set(0 ..< 3))
     }
 
+    func testAlreadyCancelledCallerDoesNotStartChildren() async throws {
+        let entryGate = MCPProxyRaceGate()
+        let probe = MCPProxyRaceProbe(expectedStartCount: 3)
+        let operations = (0 ..< 3).map { childID in
+            makeOperation(
+                childID: childID,
+                winnerID: nil,
+                winnerResult: .success(.transportCompleted),
+                probe: probe
+            )
+        }
+        let race = Task {
+            await entryGate.wait()
+            return try await MCPService.awaitFirstProxyOutcome(
+                killSignal: operations[0],
+                watchdog: operations[1],
+                transport: operations[2]
+            )
+        }
+
+        race.cancel()
+        await entryGate.release()
+
+        do {
+            _ = try await race.value
+            XCTFail("Expected outer cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let snapshot = await probe.snapshot()
+        XCTAssertTrue(snapshot.started.isEmpty)
+        XCTAssertTrue(snapshot.cancelled.isEmpty)
+        XCTAssertTrue(snapshot.completed.isEmpty)
+    }
+
     private func makeOperation(
         childID: Int,
         winnerID: Int?,
@@ -174,6 +210,7 @@ private enum MCPProxyRaceTestError: Error, Equatable {
 
 private actor MCPProxyRaceProbe {
     struct Snapshot {
+        let started: Set<Int>
         let cancelled: Set<Int>
         let completed: Set<Int>
     }
@@ -223,7 +260,7 @@ private actor MCPProxyRaceProbe {
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(cancelled: cancelled, completed: completed)
+        Snapshot(started: started, cancelled: cancelled, completed: completed)
     }
 }
 

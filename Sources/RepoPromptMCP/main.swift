@@ -2146,43 +2146,45 @@ actor MCPService: Service {
         transport: @escaping @Sendable () async throws -> MCPServiceProxyTaskOutcome
     ) async throws -> MCPServiceProxyTaskOutcome {
         let settlement = MCPServiceProxySettlementState()
-        let killSignalTask = Task {
-            do {
-                _ = try await settlement.claim(.completed(.success(killSignal())))
-            } catch {
-                _ = settlement.claim(.completed(.failure(error)))
-            }
-        }
-        let watchdogTask = Task {
-            do {
-                _ = try await settlement.claim(.completed(.success(watchdog())))
-            } catch {
-                _ = settlement.claim(.completed(.failure(error)))
-            }
-        }
-        let transportTask = Task {
-            do {
-                _ = try await settlement.claim(.completed(.success(transport())))
-            } catch {
-                _ = settlement.claim(.completed(.failure(error)))
-            }
-        }
-
         let outcome = await withTaskCancellationHandler {
-            await settlement.finish()
-        } onCancel: {
-            _ = settlement.claim(.callerCancelled)
+            guard !Task.isCancelled else {
+                _ = settlement.claim(.callerCancelled)
+                return await settlement.finish()
+            }
+
+            let killSignalTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(killSignal())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+            let watchdogTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(watchdog())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+            let transportTask = Task {
+                do {
+                    _ = try await settlement.claim(.completed(.success(transport())))
+                } catch {
+                    _ = settlement.claim(.completed(.failure(error)))
+                }
+            }
+
+            let outcome = await settlement.finish()
             killSignalTask.cancel()
             watchdogTask.cancel()
             transportTask.cancel()
+            await killSignalTask.value
+            await watchdogTask.value
+            await transportTask.value
+            return outcome
+        } onCancel: {
+            _ = settlement.claim(.callerCancelled)
         }
-
-        killSignalTask.cancel()
-        watchdogTask.cancel()
-        transportTask.cancel()
-        await killSignalTask.value
-        await watchdogTask.value
-        await transportTask.value
 
         switch outcome {
         case let .completed(result):
