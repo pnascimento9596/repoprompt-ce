@@ -3509,6 +3509,34 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexControllerFeatureState = nil
     }
 
+    /// Cancels every tab-scoped background task that watches or drives the
+    /// active Codex controller. Callers own semantic teardown — reconnect
+    /// marking, queue abandonment, interaction/liveness settlement, shutdown
+    /// sequencing, and tool-tracking waits.
+    private func cancelCodexTabScopedControllerTasks(for tabID: UUID) {
+        cancelCodexIdleShutdown(for: tabID)
+        cancelCodexTransportClosedFallback(for: tabID)
+        stopCodexStallWatchdog(for: tabID)
+        stopBashLivenessTask(for: tabID)
+    }
+
+    /// Mechanically retires per-controller runtime state on the session — the
+    /// event stream task, watchdog state, and controller-instance metadata —
+    /// so every teardown route clears new controller-scoped fields in one place.
+    private func clearCodexControllerRuntimeState(
+        for session: AgentModeViewModel.TabSession,
+        cancelEventTask: Bool = true
+    ) {
+        if cancelEventTask {
+            session.codexEventTask?.cancel()
+        }
+        session.codexEventTask = nil
+        session.codexEventTaskRunID = nil
+        session.codexLastEventAt = nil
+        resetCodexWatchdogState(session)
+        clearCodexControllerInstanceState(for: session)
+    }
+
     @discardableResult
     private func invalidateCodexControllerForReconnect(
         session: AgentModeViewModel.TabSession,
@@ -3528,23 +3556,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         } else {
             controllerToShutdown = session.codexController
         }
-        cancelCodexTransportClosedFallback(for: session.tabID)
         markCodexReconnectNeeded(for: session, source: source)
-        cancelCodexIdleShutdown(for: session.tabID)
-        stopBashLivenessTask(for: session.tabID)
-        stopCodexStallWatchdog(for: session.tabID)
-        if cancelEventTask {
-            session.codexEventTask?.cancel()
-        }
-        session.codexEventTask = nil
-        session.codexEventTaskRunID = nil
-        session.codexLastEventAt = nil
-        resetCodexWatchdogState(session)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
+        clearCodexControllerRuntimeState(for: session, cancelEventTask: cancelEventTask)
         abandonCodexFallbackQueue(
             session: session,
             reason: "Codex queued follow-up was cancelled because the controller was replaced."
         )
-        clearCodexControllerInstanceState(for: session)
         if !preserveRunID {
             session.runID = nil
         }
@@ -3694,14 +3712,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         controller: any CodexSessionControlling
     ) async {
         cancelCodexThreadNameSync(for: session.tabID)
-        cancelCodexIdleShutdown(for: session.tabID)
-        cancelCodexTransportClosedFallback(for: session.tabID)
-        stopBashLivenessTask(for: session.tabID)
-        stopCodexStallWatchdog(for: session.tabID)
-        session.codexEventTask?.cancel()
-        session.codexEventTask = nil
-        session.codexEventTaskRunID = nil
-        session.codexLastEventAt = nil
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
+        clearCodexControllerRuntimeState(for: session)
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
         session.pendingCommandRunningByKey.removeAll()
@@ -3712,9 +3724,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         resetTrackedCodexTurns(session)
         session.pendingCodexComputerUseActivation = nil
         clearCodexPendingInteractions(in: session)
-        resetCodexWatchdogState(session)
         clearCodexNativeToolLiveness(session)
-        clearCodexControllerInstanceState(for: session)
         await controller.shutdown()
         await stopCodexToolTrackingAndWait(for: session)
     }
@@ -8135,8 +8145,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func clearCodexSessionState(_ session: AgentModeViewModel.TabSession) {
         cancelCodexThreadNameSync(for: session.tabID)
-        cancelCodexIdleShutdown(for: session.tabID)
-        stopCodexStallWatchdog(for: session.tabID)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
         clearCodexRecoveryAttempt(for: session.runID)
         resetCodexResumeTimeoutState(for: session)
         session.codexConversationID = nil
@@ -8165,17 +8174,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexNeedsReconnect = false
         session.pendingCodexComputerUseActivation = nil
         clearCodexPendingInteractions(in: session)
-        cancelCodexTransportClosedFallback(for: session.tabID)
-        stopBashLivenessTask(for: session.tabID)
         if let controller = session.codexController {
             Task { await controller.shutdown() }
         }
-        clearCodexControllerInstanceState(for: session)
-        session.codexEventTask?.cancel()
-        session.codexEventTask = nil
-        session.codexEventTaskRunID = nil
-        session.codexLastEventAt = nil
-        resetCodexWatchdogState(session)
+        clearCodexControllerRuntimeState(for: session)
         clearCodexNativeToolLiveness(session)
         stopCodexToolTracking(for: session)
     }
@@ -8241,17 +8243,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             markCodexReconnectNeeded(for: session, source: "user-cancel-detached", scheduleSave: false)
         }
         cancelCodexThreadNameSync(for: session.tabID)
-        cancelCodexIdleShutdown(for: session.tabID)
-        cancelCodexTransportClosedFallback(for: session.tabID)
-        stopCodexStallWatchdog(for: session.tabID)
-        stopBashLivenessTask(for: session.tabID)
-        clearCodexControllerInstanceState(for: session)
+        cancelCodexTabScopedControllerTasks(for: session.tabID)
+        clearCodexControllerRuntimeState(for: session)
         session.runID = nil
-        session.codexEventTask?.cancel()
-        session.codexEventTask = nil
-        session.codexEventTaskRunID = nil
-        session.codexLastEventAt = nil
-        resetCodexWatchdogState(session)
         clearCodexNativeToolLiveness(session)
         settleCodexComputerUseActivationAfterTurn(session, reason: "user-cancel")
         return { [weak self] in
@@ -8305,10 +8299,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let shutdownRunID = clearTabScopedCoordinatorState ? session.runID : detachedRunID
         if clearTabScopedCoordinatorState {
             cancelCodexThreadNameSync(for: session.tabID)
-            cancelCodexIdleShutdown(for: session.tabID)
-            cancelCodexTransportClosedFallback(for: session.tabID)
-            stopCodexStallWatchdog(for: session.tabID)
-            stopBashLivenessTask(for: session.tabID)
+            cancelCodexTabScopedControllerTasks(for: session.tabID)
         }
         clearCodexRecoveryAttempt(for: session.runID)
         session.pendingCommandRunningFlushTask?.cancel()
@@ -8324,13 +8315,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         if let controller = session.codexController {
             await controller.shutdown()
         }
-        clearCodexControllerInstanceState(for: session)
+        clearCodexControllerRuntimeState(for: session)
         session.runID = nil
-        session.codexEventTask?.cancel()
-        session.codexEventTask = nil
-        session.codexEventTaskRunID = nil
-        session.codexLastEventAt = nil
-        resetCodexWatchdogState(session)
         if clearTabScopedCoordinatorState {
             await stopCodexToolTrackingAndWait(for: session)
         } else {
