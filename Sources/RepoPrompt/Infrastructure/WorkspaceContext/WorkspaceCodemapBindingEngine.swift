@@ -6619,6 +6619,8 @@ actor WorkspaceCodemapBindingEngine {
             state.queuedWork.prepend(contentsOf: state.deferredWork)
             state.deferredWork.removeAll(keepingCapacity: false)
         }
+        // Admission order is the priority policy: a later session mutation must not overtake
+        // an earlier projection mutation. Batch compatibility may only group adjacent work.
         state.queuedWork.append(item)
         counters.manifestWriterPeakQueuedItems = max(
             counters.manifestWriterPeakQueuedItems,
@@ -6735,6 +6737,7 @@ actor WorkspaceCodemapBindingEngine {
                     batchID: batch.id
                 ) else { return }
                 currentWriter.inFlightBatch = nil
+                currentWriter.deferredFailureCount = 0
                 let completed = detachManifestWaiters(
                     from: &currentWriter,
                     workKey: workKey,
@@ -6835,6 +6838,7 @@ actor WorkspaceCodemapBindingEngine {
                     batchID: batch.id
                 ) else { return }
                 currentWriter.inFlightBatch = nil
+                currentWriter.deferredFailureCount = 0
                 let completed = detachManifestWaiters(
                     from: &currentWriter,
                     workKey: workKey,
@@ -6904,6 +6908,7 @@ actor WorkspaceCodemapBindingEngine {
 
     private func retryDeferredManifestWriter(namespace: CodeMapRootManifestNamespace) async {
         try? await Task.sleep(for: Self.manifestWriterDeferredRetryDelay)
+        guard !Task.isCancelled else { return }
         await resumeDeferredManifestWriter(namespace: namespace)
     }
 
@@ -7027,8 +7032,6 @@ actor WorkspaceCodemapBindingEngine {
             }
             session.pipelines[workKey.scope.pipelineIdentity] = pipeline
             roots[workKey.scope.rootEpoch] = .eligible(session)
-            emit(.manifestFailure, rootEpoch: workKey.scope.rootEpoch, numericValue: UInt64(workItems.count))
-            incrementCounter(\.manifestFailures)
         }
     }
 
