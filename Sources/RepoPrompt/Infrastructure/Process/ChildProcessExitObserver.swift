@@ -108,6 +108,10 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         attributes: .concurrent
     )
 
+    /// - Parameter afterClosingRootSignalingBeforeReap: Runs on the process-wide
+    ///   reaper registry queue between signal-window closure and the destructive
+    ///   reap; it must never block, or exit processing for every observed child
+    ///   stalls behind it.
     init(
         pid: pid_t,
         beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void = { _ in },
@@ -159,12 +163,23 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         }
     }
 
+    /// Retry pacing for persistent wait failures: the observer never abandons
+    /// reap ownership, so the interval doubles from 10 ms to a 1 s ceiling to
+    /// bound registry and queue pressure while the failure persists.
+    static func waitFailureRetryDelay(consecutiveFailures: Int) -> TimeInterval {
+        let base: TimeInterval = 0.010
+        let ceiling: TimeInterval = 1.0
+        let boundedExponent = min(max(consecutiveFailures - 1, 0), 7)
+        return min(base * pow(2, Double(boundedExponent)), ceiling)
+    }
+
     private static func beginObservation(
         pid: pid_t,
         state: State,
         beforePublishingOutcome: @escaping @Sendable (Outcome) -> Void,
         afterClosingRootSignalingBeforeReap: @escaping @Sendable () -> Void,
-        statusObserver: @escaping StatusObserver
+        statusObserver: @escaping StatusObserver,
+        consecutiveWaitFailures: Int = 0
     ) {
         statusObserver(
             pid,
@@ -176,13 +191,16 @@ final class ChildProcessExitObserver: @unchecked Sendable {
                 if case .failure(.waitFailed) = result,
                    state.reopenRootSignalingAfterWaitFailure()
                 {
-                    outcomePublicationQueue.asyncAfter(deadline: .now() + .milliseconds(10)) {
+                    let failureCount = consecutiveWaitFailures + 1
+                    let retryDelay = waitFailureRetryDelay(consecutiveFailures: failureCount)
+                    outcomePublicationQueue.asyncAfter(deadline: .now() + retryDelay) {
                         beginObservation(
                             pid: pid,
                             state: state,
                             beforePublishingOutcome: beforePublishingOutcome,
                             afterClosingRootSignalingBeforeReap: afterClosingRootSignalingBeforeReap,
-                            statusObserver: statusObserver
+                            statusObserver: statusObserver,
+                            consecutiveWaitFailures: failureCount
                         )
                     }
                     return

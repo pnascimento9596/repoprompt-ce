@@ -451,6 +451,41 @@ final class ProcessTerminationExitStatusTests: XCTestCase {
         await cleanup.run()
     }
 
+    func testWaitFailureRetryDelayDoublesFromTenMillisecondsToOneSecondCeiling() {
+        XCTAssertEqual(ChildProcessExitObserver.waitFailureRetryDelay(consecutiveFailures: 1), 0.010, accuracy: 0.0001)
+        XCTAssertEqual(ChildProcessExitObserver.waitFailureRetryDelay(consecutiveFailures: 2), 0.020, accuracy: 0.0001)
+        XCTAssertEqual(ChildProcessExitObserver.waitFailureRetryDelay(consecutiveFailures: 3), 0.040, accuracy: 0.0001)
+        XCTAssertEqual(ChildProcessExitObserver.waitFailureRetryDelay(consecutiveFailures: 7), 0.640, accuracy: 0.0001)
+        XCTAssertEqual(ChildProcessExitObserver.waitFailureRetryDelay(consecutiveFailures: 8), 1.0, accuracy: 0.0001)
+        XCTAssertEqual(ChildProcessExitObserver.waitFailureRetryDelay(consecutiveFailures: 50), 1.0, accuracy: 0.0001)
+    }
+
+    func testObservedExitSurvivesRepeatedWaitFailuresWithSoleReap() async throws {
+        let spawned = try ProcessLauncher.spawn(
+            command: "/bin/sh",
+            arguments: ["-c", "exit 7"],
+            environment: [:],
+            workingDirectory: nil
+        )
+        let statusObserver = FailNTimesChildStatusObserver(failures: 3)
+        let observer = ChildProcessExitObserver(
+            pid: spawned.pid,
+            statusObserver: { pid, beforeReap, completion in
+                statusObserver.observe(
+                    pid: pid,
+                    beforeReap: beforeReap,
+                    completion: completion
+                )
+            }
+        )
+        closeFixtureHandles(spawned)
+
+        let outcome = await observer.wait(timeout: 5)
+        XCTAssertEqual(outcome, .exited(.exited(code: 7)))
+        XCTAssertEqual(statusObserver.observationCount, 4)
+        assertAlreadyReaped(spawned.pid)
+    }
+
     func testWaitForTerminationStatusReportsRealChildExitAndSignal() async throws {
         let exiting = try ProcessLauncher.spawn(
             command: "/bin/sh",
@@ -635,6 +670,43 @@ private final class BlockedPreReapGate: @unchecked Sendable {
         released = true
         lock.unlock()
         releaseSemaphore.signal()
+    }
+}
+
+private final class FailNTimesChildStatusObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failureCount: Int
+    private var attempts = 0
+
+    init(failures: Int) {
+        failureCount = failures
+    }
+
+    var observationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return attempts
+    }
+
+    func observe(
+        pid: pid_t,
+        beforeReap: @escaping @Sendable () -> Void,
+        completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
+    ) {
+        lock.lock()
+        attempts += 1
+        let attempt = attempts
+        lock.unlock()
+
+        if attempt <= failureCount {
+            completion(.failure(.waitFailed("injected persistent wait failure \(attempt)")))
+            return
+        }
+        ProcessTermination.observeChildStatus(
+            pid: pid,
+            beforeReap: beforeReap,
+            completion: completion
+        )
     }
 }
 
