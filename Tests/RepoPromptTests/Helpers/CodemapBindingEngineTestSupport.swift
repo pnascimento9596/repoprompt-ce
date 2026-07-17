@@ -294,6 +294,7 @@ class CodemapBindingEngineTestCase: XCTestCase {
         runtime: CodeMapArtifactRuntime,
         policy: WorkspaceCodemapBindingEnginePolicy = .default,
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
+        manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .init { _ in },
         overlay: WorkspaceCodemapLiveOverlay? = nil,
         initialQueueOrdinal: UInt64 = 1,
         initialAdmissionOrdinal: UInt64 = 1,
@@ -375,6 +376,7 @@ class CodemapBindingEngineTestCase: XCTestCase {
             overlay: overlay ?? WorkspaceCodemapLiveOverlay(),
             policy: policy,
             hooks: hooks,
+            manifestWriterRetryWaiter: manifestWriterRetryWaiter,
             initialQueueOrdinal: initialQueueOrdinal,
             initialAdmissionOrdinal: initialAdmissionOrdinal,
             initialCounterValue: initialCounterValue,
@@ -711,6 +713,10 @@ final class EngineManifestFaultOnPublication: @unchecked Sendable {
 
     var triggeredCount: Int {
         lock.withLock { didFail ? 1 : 0 }
+    }
+
+    var observedPublicationCount: Int {
+        lock.withLock { publicationCount }
     }
 
     func action(_ point: CodeMapRootManifestStoreFaultPoint) -> CodeMapRootManifestStoreFaultAction {

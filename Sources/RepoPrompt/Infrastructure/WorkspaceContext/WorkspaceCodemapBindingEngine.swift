@@ -90,8 +90,6 @@ struct WorkspaceCodemapManifestFIFO<Element> {
 actor WorkspaceCodemapBindingEngine {
     private static let maximumManifestWriterBatchItemCount = 64
     private static let maximumManifestWriterDeferredAttempts = 3
-    private static let maximumManifestWriterDeferredItemCount = 256
-    private static let manifestWriterDeferredRetryDelay = Duration.milliseconds(100)
 
     private final class DemandCancellationState: @unchecked Sendable {
         private let lock = NSLock()
@@ -305,7 +303,9 @@ actor WorkspaceCodemapBindingEngine {
         var writerID: UUID?
         var task: Task<Void, Never>?
         var retryTask: Task<Void, Never>?
+        var retryID: UUID?
         var queuedWork = WorkspaceCodemapManifestFIFO<ManifestMutationWorkItem>()
+        var deferredHeadBatch: ManifestMutationBatch?
         var deferredWork: [ManifestMutationWorkItem] = []
         var deferredFailureCount: UInt = 0
         var inFlightBatch: ManifestMutationBatch?
@@ -476,6 +476,7 @@ actor WorkspaceCodemapBindingEngine {
     private let overlay: WorkspaceCodemapLiveOverlay
     private let policy: WorkspaceCodemapBindingEnginePolicy
     private let hooks: WorkspaceCodemapBindingEngineHooks
+    private let manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter
     private let uptimeNanoseconds: @Sendable () -> UInt64
     private let accessEpochSeconds: @Sendable () -> UInt64
     private var roots: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
@@ -543,6 +544,7 @@ actor WorkspaceCodemapBindingEngine {
         overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
         policy: WorkspaceCodemapBindingEnginePolicy = .default,
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
+        manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .production,
         initialQueueOrdinal: UInt64 = 1,
         initialAdmissionOrdinal: UInt64 = 1,
         initialCounterValue: UInt64 = 0,
@@ -562,6 +564,7 @@ actor WorkspaceCodemapBindingEngine {
         self.overlay = overlay
         self.policy = policy
         self.hooks = hooks
+        self.manifestWriterRetryWaiter = manifestWriterRetryWaiter
         nextQueueOrdinal = max(1, initialQueueOrdinal)
         nextAdmissionOrdinal = max(1, initialAdmissionOrdinal)
         counters = WorkspaceCodemapBindingEngineCounters(initialValue: initialCounterValue)
@@ -6580,6 +6583,7 @@ actor WorkspaceCodemapBindingEngine {
         )
         enqueueManifestWorkItem(item, namespace: pipeline.namespace)
         emit(.manifestRevisionQueued, rootEpoch: rootEpoch, numericValue: revision)
+        await hooks.afterManifestRevisionQueuedBeforeWaiterInstall(rootEpoch, revision)
         let succeeded = await waitForManifestRevision(
             scope: scope,
             revision: revision,
@@ -6613,36 +6617,65 @@ actor WorkspaceCodemapBindingEngine {
         namespace: CodeMapRootManifestNamespace
     ) {
         var state = manifestWriters[namespace] ?? ManifestWriterState()
-        if state.writerID == nil, !state.deferredWork.isEmpty {
-            state.retryTask?.cancel()
-            state.retryTask = nil
-            state.queuedWork.prepend(contentsOf: state.deferredWork)
-            state.deferredWork.removeAll(keepingCapacity: false)
-        }
         // Admission order is the priority policy: a later session mutation must not overtake
         // an earlier projection mutation. Batch compatibility may only group adjacent work.
         state.queuedWork.append(item)
-        counters.manifestWriterPeakQueuedItems = max(
-            counters.manifestWriterPeakQueuedItems,
-            UInt64(state.queuedWork.count)
-        )
+        recordManifestWriterPeakQueuedItems(in: state)
         guard state.writerID == nil else {
             manifestWriters[namespace] = state
             return
         }
-        let writerID = UUID()
-        state.writerID = writerID
-        manifestWriters[namespace] = state
-        let task = Task { await self.runManifestWriter(namespace: namespace, writerID: writerID) }
-        guard var current = manifestWriters[namespace], current.writerID == writerID else {
-            task.cancel()
+        // A live retry owns the next writer start. New admissions stay queued behind the
+        // deferred head and tail instead of shortening the failure backoff.
+        guard state.retryTask == nil else {
+            manifestWriters[namespace] = state
             return
         }
-        current.task = task
-        manifestWriters[namespace] = current
+        if state.deferredHeadBatch != nil || !state.deferredWork.isEmpty {
+            scheduleDeferredManifestRetry(in: &state, namespace: namespace)
+        } else {
+            startManifestWriter(in: &state, namespace: namespace)
+        }
+        manifestWriters[namespace] = state
+    }
+
+    private func recordManifestWriterPeakQueuedItems(in state: ManifestWriterState) {
+        let queuedItemCount = state.queuedWork.count +
+            state.deferredWork.count +
+            (state.deferredHeadBatch?.items.count ?? 0)
+        counters.manifestWriterPeakQueuedItems = max(
+            counters.manifestWriterPeakQueuedItems,
+            UInt64(queuedItemCount)
+        )
+    }
+
+    private func startManifestWriter(
+        in state: inout ManifestWriterState,
+        namespace: CodeMapRootManifestNamespace
+    ) {
+        let writerID = UUID()
+        state.writerID = writerID
+        state.task = Task {
+            await self.runManifestWriter(namespace: namespace, writerID: writerID)
+        }
+    }
+
+    private func scheduleDeferredManifestRetry(
+        in state: inout ManifestWriterState,
+        namespace: CodeMapRootManifestNamespace
+    ) {
+        guard state.retryTask == nil else { return }
+        let retryID = UUID()
+        state.retryID = retryID
+        state.retryTask = Task {
+            await self.retryDeferredManifestWriter(namespace: namespace, retryID: retryID)
+        }
     }
 
     private func dequeueManifestBatch(from writer: inout ManifestWriterState) -> ManifestMutationBatch? {
+        if let deferredHeadBatch = writer.deferredHeadBatch {
+            return deferredHeadBatch
+        }
         let maximumByteCount = policy.maximumQueuedProjectionManifestMutationByteCountPerRoot
         let items = writer.queuedWork.popBatch(
             maximumItemCount: Self.maximumManifestWriterBatchItemCount,
@@ -6737,7 +6770,10 @@ actor WorkspaceCodemapBindingEngine {
                     batchID: batch.id
                 ) else { return }
                 currentWriter.inFlightBatch = nil
-                currentWriter.deferredFailureCount = 0
+                if currentWriter.deferredHeadBatch?.id == batch.id {
+                    currentWriter.deferredHeadBatch = nil
+                    currentWriter.deferredFailureCount = 0
+                }
                 let completed = detachManifestWaiters(
                     from: &currentWriter,
                     workKey: workKey,
@@ -6782,7 +6818,7 @@ actor WorkspaceCodemapBindingEngine {
             let revision = batch.highestRevision
             var changes = batch.changesByPath
             for (path, change) in pipeline.pendingManifestChanges where change.revision <= revision {
-                if changes[path]?.revision ?? 0 <= change.revision {
+                if (changes[path]?.revision ?? 0) <= change.revision {
                     changes[path] = change
                 }
             }
@@ -6838,7 +6874,10 @@ actor WorkspaceCodemapBindingEngine {
                     batchID: batch.id
                 ) else { return }
                 currentWriter.inFlightBatch = nil
-                currentWriter.deferredFailureCount = 0
+                if currentWriter.deferredHeadBatch?.id == batch.id {
+                    currentWriter.deferredHeadBatch = nil
+                    currentWriter.deferredFailureCount = 0
+                }
                 let completed = detachManifestWaiters(
                     from: &currentWriter,
                     workKey: workKey,
@@ -6882,21 +6921,33 @@ actor WorkspaceCodemapBindingEngine {
                     batchID: batch.id
                 ) else { return }
                 currentWriter.inFlightBatch = nil
-                var deferredWork = batch.items
-                deferredWork.append(contentsOf: currentWriter.queuedWork.drain())
-                currentWriter.deferredWork = deferredWork
-                currentWriter.deferredFailureCount += 1
-                if currentWriter.deferredFailureCount >= Self.maximumManifestWriterDeferredAttempts {
-                    dropDeferredWorkPrefix(batch.items.count, from: &currentWriter)
+                if currentWriter.deferredHeadBatch?.id == batch.id {
+                    currentWriter.deferredFailureCount += 1
+                } else {
+                    currentWriter.deferredHeadBatch = batch
+                    currentWriter.deferredFailureCount = 1
                 }
-                while currentWriter.deferredWork.count > Self.maximumManifestWriterDeferredItemCount {
-                    let excess = currentWriter.deferredWork.count - Self.maximumManifestWriterDeferredItemCount
-                    dropDeferredWorkPrefix(excess, from: &currentWriter)
+                currentWriter.deferredWork.append(contentsOf: currentWriter.queuedWork.drain())
+                recordManifestWriterPeakQueuedItems(in: currentWriter)
+                if currentWriter.deferredFailureCount >= Self.maximumManifestWriterDeferredAttempts,
+                   let exhaustedHead = currentWriter.deferredHeadBatch
+                {
+                    currentWriter.deferredHeadBatch = nil
+                    currentWriter.deferredFailureCount = 0
+                    discardManifestWorkItems(
+                        exhaustedHead.items,
+                        from: &currentWriter,
+                        terminalWaiterRevision: exhaustedHead.highestRevision
+                    )
                 }
+                shedNewestDeferredManifestWorkIfNeeded(from: &currentWriter)
                 currentWriter.writerID = nil
                 currentWriter.task = nil
-                if !currentWriter.deferredWork.isEmpty {
-                    currentWriter.retryTask = Task { await self.retryDeferredManifestWriter(namespace: namespace) }
+                if currentWriter.deferredHeadBatch != nil ||
+                    !currentWriter.deferredWork.isEmpty ||
+                    !currentWriter.queuedWork.isEmpty
+                {
+                    scheduleDeferredManifestRetry(in: &currentWriter, namespace: namespace)
                 }
                 storeManifestWriterState(currentWriter, namespace: namespace)
                 incrementCounter(\.manifestFailures)
@@ -6906,37 +6957,44 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func retryDeferredManifestWriter(namespace: CodeMapRootManifestNamespace) async {
-        try? await Task.sleep(for: Self.manifestWriterDeferredRetryDelay)
+    private func retryDeferredManifestWriter(
+        namespace: CodeMapRootManifestNamespace,
+        retryID: UUID
+    ) async {
+        do {
+            try await manifestWriterRetryWaiter.sleep(
+                .milliseconds(policy.manifestWriterDeferredRetryMilliseconds)
+            )
+        } catch {
+            // Production Task.sleep cancellation is paired with writer teardown. An injected
+            // waiter may fail independently; only actual task cancellation suppresses resume.
+            guard !Task.isCancelled else { return }
+        }
         guard !Task.isCancelled else { return }
-        await resumeDeferredManifestWriter(namespace: namespace)
+        await resumeDeferredManifestWriter(namespace: namespace, retryID: retryID)
     }
 
-    private func resumeDeferredManifestWriter(namespace: CodeMapRootManifestNamespace) {
-        guard var state = manifestWriters[namespace], state.writerID == nil else { return }
-        guard !state.deferredWork.isEmpty else {
-            state.retryTask = nil
-            manifestWriters[namespace] = state
-            return
-        }
-        state.retryTask?.cancel()
+    private func resumeDeferredManifestWriter(
+        namespace: CodeMapRootManifestNamespace,
+        retryID: UUID
+    ) {
+        guard var state = manifestWriters[namespace],
+              state.writerID == nil,
+              state.retryID == retryID
+        else { return }
         state.retryTask = nil
-        state.queuedWork.prepend(contentsOf: state.deferredWork)
-        state.deferredWork.removeAll(keepingCapacity: false)
-        counters.manifestWriterPeakQueuedItems = max(
-            counters.manifestWriterPeakQueuedItems,
-            UInt64(state.queuedWork.count)
-        )
-        let writerID = UUID()
-        state.writerID = writerID
-        manifestWriters[namespace] = state
-        let task = Task { await self.runManifestWriter(namespace: namespace, writerID: writerID) }
-        guard var current = manifestWriters[namespace], current.writerID == writerID else {
-            task.cancel()
+        state.retryID = nil
+        if !state.deferredWork.isEmpty {
+            state.queuedWork.prepend(contentsOf: state.deferredWork)
+            state.deferredWork.removeAll(keepingCapacity: false)
+            recordManifestWriterPeakQueuedItems(in: state)
+        }
+        guard state.deferredHeadBatch != nil || !state.queuedWork.isEmpty else {
+            storeManifestWriterState(state, namespace: namespace)
             return
         }
-        current.task = task
-        manifestWriters[namespace] = current
+        startManifestWriter(in: &state, namespace: namespace)
+        manifestWriters[namespace] = state
     }
 
     private func discardManifestBatch(
@@ -6954,6 +7012,10 @@ actor WorkspaceCodemapBindingEngine {
         )
         if writer.inFlightBatch?.id == batch.id {
             writer.inFlightBatch = nil
+        }
+        if writer.deferredHeadBatch?.id == batch.id {
+            writer.deferredHeadBatch = nil
+            writer.deferredFailureCount = 0
         }
         if case var .eligible(session)? = roots[workKey.scope.rootEpoch],
            session.id == workKey.sessionID,
@@ -6977,37 +7039,59 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func dropDeferredWorkPrefix(
-        _ count: Int,
+    private func shedNewestDeferredManifestWorkIfNeeded(
         from state: inout ManifestWriterState
     ) {
-        guard count > 0, !state.deferredWork.isEmpty else { return }
-        let count = min(count, state.deferredWork.count)
-        let dropped = Array(state.deferredWork.prefix(count))
-        state.deferredWork.removeFirst(count)
-        state.deferredFailureCount = 0
-        discardManifestWorkItems(dropped, from: &state)
+        let protectedHeadCount = state.deferredHeadBatch?.items.count ?? 0
+        let maximumTailCount = max(
+            0,
+            policy.maximumManifestWriterDeferredItemCount - protectedHeadCount
+        )
+        guard state.deferredWork.count > maximumTailCount else { return }
+        // Preserve the stable failed batch and the oldest admitted tail. The head is already
+        // bounded by the batch limit, so a policy cap below that limit may be exceeded only
+        // by that single contiguous batch.
+        let excess = state.deferredWork.count - maximumTailCount
+        let shed = Array(state.deferredWork.suffix(excess))
+        state.deferredWork.removeLast(excess)
+        discardManifestWorkItems(shed, from: &state)
     }
 
     private func discardManifestWorkItems(
         _ workItems: [ManifestMutationWorkItem],
-        from state: inout ManifestWriterState
+        from state: inout ManifestWriterState,
+        terminalWaiterRevision: UInt64? = nil
     ) {
         guard !workItems.isEmpty else { return }
-        var byWorkKey: [ManifestWriterWorkKey: (maxRevision: UInt64, workItemIDs: Set<UUID>)] = [:]
+        var byWorkKey: [
+            ManifestWriterWorkKey: (revisions: Set<UInt64>, workItemIDs: Set<UUID>)
+        ] = [:]
         for item in workItems {
-            let entry = byWorkKey[item.workKey, default: (maxRevision: 0, workItemIDs: Set<UUID>())]
+            let entry = byWorkKey[
+                item.workKey,
+                default: (revisions: Set<UInt64>(), workItemIDs: Set<UUID>())
+            ]
             byWorkKey[item.workKey] = (
-                maxRevision: max(entry.maxRevision, item.revision),
+                revisions: entry.revisions.union([item.revision]),
                 workItemIDs: entry.workItemIDs.union([item.id])
             )
         }
         for (workKey, entry) in byWorkKey {
-            let detached = detachManifestWaiters(
-                from: &state,
-                workKey: workKey,
-                revision: entry.maxRevision
-            )
+            let detached: [ManifestWriteWaiter] = if let terminalWaiterRevision {
+                detachManifestWaiters(
+                    from: &state,
+                    workKey: workKey,
+                    revision: terminalWaiterRevision
+                )
+            } else {
+                // Capacity shedding rejects only the newest exact revisions. A through-revision
+                // sweep here would incorrectly fail retained older admissions.
+                detachManifestWaiters(
+                    from: &state,
+                    workKey: workKey,
+                    revisions: entry.revisions
+                )
+            }
             for waiter in detached {
                 waiter.continuation.resume(returning: false)
             }
@@ -7026,9 +7110,9 @@ actor WorkspaceCodemapBindingEngine {
                 }
             }
             if didRemove {
-                pipeline.manifestState = pipeline.pendingManifestChanges.isEmpty
-                    ? .clean(generation: 0)
-                    : .dirtyRetryRequired
+                // Abandonment is never equivalent to durability. Keep the live session dirty
+                // even when the discarded newest mutation owned the only pending path entry.
+                pipeline.manifestState = .dirtyRetryRequired
             }
             session.pipelines[workKey.scope.pipelineIdentity] = pipeline
             roots[workKey.scope.rootEpoch] = .eligible(session)
@@ -7075,13 +7159,46 @@ actor WorkspaceCodemapBindingEngine {
         return detached
     }
 
+    private func detachManifestWaiters(
+        from writer: inout ManifestWriterState,
+        workKey: ManifestWriterWorkKey,
+        revisions: Set<UInt64>
+    ) -> [ManifestWriteWaiter] {
+        guard !revisions.isEmpty,
+              let waiters = writer.waitersByWorkKey[workKey]
+        else { return [] }
+        var detached: [ManifestWriteWaiter] = []
+        var retained: [ManifestWriteWaiter] = []
+        detached.reserveCapacity(waiters.count)
+        retained.reserveCapacity(waiters.count)
+        for waiter in waiters {
+            if revisions.contains(waiter.revision) {
+                detached.append(waiter)
+            } else {
+                retained.append(waiter)
+            }
+        }
+        if retained.isEmpty {
+            writer.waitersByWorkKey.removeValue(forKey: workKey)
+        } else {
+            writer.waitersByWorkKey[workKey] = retained
+        }
+        for waiter in detached {
+            writer.waiterWorkKeyByID.removeValue(forKey: waiter.id)
+        }
+        return detached
+    }
+
     private func storeManifestWriterState(
         _ state: ManifestWriterState,
         namespace: CodeMapRootManifestNamespace
     ) {
         if state.writerID == nil,
            state.task == nil,
+           state.retryTask == nil,
+           state.retryID == nil,
            state.queuedWork.isEmpty,
+           state.deferredHeadBatch == nil,
            state.deferredWork.isEmpty,
            state.inFlightBatch == nil,
            state.waitersByWorkKey.isEmpty,
@@ -7339,7 +7456,12 @@ actor WorkspaceCodemapBindingEngine {
                 var state = manifestWriters[namespace] ?? ManifestWriterState()
                 let hasRelevantWork = state.queuedWork.contains {
                     $0.workKey == workKey && $0.revision >= revision
+                } || state.deferredWork.contains {
+                    $0.workKey == workKey && $0.revision >= revision
                 } || (
+                    state.deferredHeadBatch?.workKey == workKey &&
+                        (state.deferredHeadBatch?.highestRevision ?? 0) >= revision
+                ) || (
                     state.inFlightBatch?.workKey == workKey &&
                         (state.inFlightBatch?.highestRevision ?? 0) >= revision
                 )
@@ -7354,6 +7476,7 @@ actor WorkspaceCodemapBindingEngine {
                 ))
                 state.waiterWorkKeyByID[waiterID] = workKey
                 manifestWriters[namespace] = state
+                emit(.manifestWaiterInstalled, rootEpoch: scope.rootEpoch, numericValue: revision)
             }
         } onCancel: {
             Task { await self.cancelManifestWaiter(namespace: namespace, waiterID: waiterID) }
@@ -7390,10 +7513,30 @@ actor WorkspaceCodemapBindingEngine {
             guard var state = manifestWriters[namespace] else { continue }
             state.queuedWork.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
             state.deferredWork.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
+            if state.deferredHeadBatch?.workKey.scope.rootEpoch == rootEpoch {
+                state.deferredHeadBatch = nil
+                state.deferredFailureCount = 0
+            }
             let detachedKeys = state.waitersByWorkKey.keys.filter { $0.scope.rootEpoch == rootEpoch }
             let detached = detachedKeys.flatMap { state.waitersByWorkKey.removeValue(forKey: $0) ?? [] }
             for waiter in detached {
                 state.waiterWorkKeyByID.removeValue(forKey: waiter.id)
+            }
+            if state.writerID == nil {
+                if state.deferredHeadBatch == nil,
+                   state.deferredWork.isEmpty,
+                   state.queuedWork.isEmpty
+                {
+                    state.retryTask?.cancel()
+                    state.retryTask = nil
+                    state.retryID = nil
+                } else if state.retryTask == nil {
+                    if state.deferredHeadBatch != nil || !state.deferredWork.isEmpty {
+                        scheduleDeferredManifestRetry(in: &state, namespace: namespace)
+                    } else {
+                        startManifestWriter(in: &state, namespace: namespace)
+                    }
+                }
             }
             storeManifestWriterState(state, namespace: namespace)
             for waiter in detached {
