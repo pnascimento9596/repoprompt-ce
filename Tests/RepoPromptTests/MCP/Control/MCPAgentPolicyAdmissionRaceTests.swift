@@ -545,6 +545,8 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             )
             XCTAssertEqual(firstBoundContext.tabID, firstTabID)
 
+            await MCPRoutingWaiter.cleanup(runID: secondRunID)
+            await MCPRoutingWaiter.register(runID: secondRunID)
             await installAuthoritativePolicy(
                 runID: secondRunID,
                 tabID: secondTabID,
@@ -586,6 +588,10 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             XCTAssertEqual(retainedContextAfterRejection.selection, firstBoundContext.selection)
             XCTAssertNil(window.mcpServer.connectionID(forRunID: secondRunID))
             XCTAssertTrue(pendingAfterRejection.contains { $0.runID == secondRunID })
+            let observedAfterWrongRunRejection = await MCPRoutingWaiter.childConnectionWasObserved(
+                runID: secondRunID
+            )
+            XCTAssertFalse(observedAfterWrongRunRejection)
 
             let rejectedHandoverResult = await manager.debugApplyPendingPolicy(
                 clientName: clientName,
@@ -600,6 +606,10 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             XCTAssertEqual(rejectedHandoverResult.runID, secondRunID)
             let rejectedHandoverRunID = await manager.runIDForConnection(rejectedHandoverConnectionID)
             XCTAssertNil(rejectedHandoverRunID)
+            let observedAfterWrongSessionRejection = await MCPRoutingWaiter.childConnectionWasObserved(
+                runID: secondRunID
+            )
+            XCTAssertFalse(observedAfterWrongSessionRejection)
 
             let freshSessionKey = "fresh-run-token-\(UUID().uuidString)"
             XCTAssertNotEqual(freshSessionKey, sessionKey)
@@ -617,6 +627,10 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             let freshRunID = await manager.runIDForConnection(freshConnectionID)
             XCTAssertEqual(freshRunID, secondRunID)
             XCTAssertEqual(window.mcpServer.tabContextByConnectionID[freshConnectionID]?.tabID, secondTabID)
+            let observedAfterConsumingConnection = await MCPRoutingWaiter.childConnectionWasObserved(
+                runID: secondRunID
+            )
+            XCTAssertTrue(observedAfterConsumingConnection)
 
             await cleanup(
                 runID: secondRunID,
@@ -624,6 +638,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 windowID: windowID,
                 expectedPID: getpid()
             )
+            await MCPRoutingWaiter.cleanup(runID: secondRunID)
             await manager.removeConnection(rejectedHandoverConnectionID)
             await cleanup(
                 runID: firstRunID,

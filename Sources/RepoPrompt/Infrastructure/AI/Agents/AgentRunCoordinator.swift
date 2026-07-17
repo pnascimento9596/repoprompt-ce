@@ -153,7 +153,8 @@ final class AgentRunCoordinator {
     func releaseGateWhenRouted(
         runID: UUID,
         gateID: UUID? = nil,
-        timeoutMs: Int = defaultRoutingTimeoutMs
+        timeoutMs: Int = defaultRoutingTimeoutMs,
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
     ) async -> GateRoutingReleaseResult {
         let timeoutSeconds = TimeInterval(timeoutMs) / 1000.0
 
@@ -162,7 +163,8 @@ final class AgentRunCoordinator {
         let observedRoutingOutcome = await withTaskCancellationHandler {
             await MCPRoutingWaiter.waitForRoutingOutcome(
                 runID: runID,
-                timeoutSeconds: timeoutSeconds
+                timeoutSeconds: timeoutSeconds,
+                progressLifecycle: progressLifecycle
             )
         } onCancel: {
             // Expedite: tell the waiter this run will never route (task was cancelled)

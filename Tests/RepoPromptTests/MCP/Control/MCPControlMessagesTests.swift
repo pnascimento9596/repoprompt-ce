@@ -153,7 +153,7 @@ final class MCPControlMessagesTests: XCTestCase {
             }
         }
 
-        func testStandardMCPProgressUsesRequestTokenWhileCLIControlRemainsFallback() async {
+        func testStandardMCPProgressUsesRequestTokenWithoutDuplicatingCLIControlFallback() async {
             let manager = ServerNetworkManager()
             let standardConnectionID = UUID()
             let standardConnection = ProgressRecordingMCPConnection()
@@ -196,6 +196,35 @@ final class MCPControlMessagesTests: XCTestCase {
             let standardControlEvents = await standardConnection.controlEvents()
             XCTAssertTrue(standardControlEvents.isEmpty)
             await manager.debugRemoveConnection(standardConnectionID)
+
+            let tokenBearingCLIConnectionID = UUID()
+            let tokenBearingCLIConnection = ProgressRecordingMCPConnection()
+            await manager.debugInstallDirectAdmissionConnectionForTesting(
+                connectionID: tokenBearingCLIConnectionID,
+                connection: tokenBearingCLIConnection,
+                pendingClientID: "RepoPrompt CLI (standard progress test)"
+            )
+
+            let cliProgressState = MCPRequestProgressState(token: .integer(510))
+            await ServerNetworkManager.withConnectionID(
+                tokenBearingCLIConnectionID,
+                progressState: cliProgressState
+            ) {
+                await manager.sendProgress(
+                    for: tokenBearingCLIConnectionID,
+                    tool: "context_builder",
+                    kind: .stage,
+                    stage: "discovering",
+                    message: "Waiting for child MCP routing"
+                )
+            }
+
+            let cliStandardEvents = await tokenBearingCLIConnection.standardEvents()
+            XCTAssertEqual(cliStandardEvents.map(\.token), [.integer(510)])
+            XCTAssertEqual(cliStandardEvents.map(\.progress), [1])
+            let cliControlEvents = await tokenBearingCLIConnection.controlEvents()
+            XCTAssertTrue(cliControlEvents.isEmpty, "standard progress must not duplicate legacy CLI control progress")
+            await manager.debugRemoveConnection(tokenBearingCLIConnectionID)
 
             let compatibilityConnectionID = UUID()
             let compatibilityConnection = ProgressRecordingMCPConnection()

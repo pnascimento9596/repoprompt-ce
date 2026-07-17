@@ -19,6 +19,75 @@ typealias MCPBootstrapRoutingProgressReporter = @MainActor @Sendable (
     MCPBootstrapRoutingProgress
 ) async -> Void
 
+actor MCPBootstrapRoutingProgressLifecycle {
+    private let reporter: MCPBootstrapRoutingProgressReporter
+    private var childConnectionObserved = false
+    private var terminalOutcome: MCPRoutingWaitOutcome?
+    private var deliveryTask: Task<Void, Never>?
+    private var didFinish = false
+
+    init(reporter: @escaping MCPBootstrapRoutingProgressReporter) {
+        self.reporter = reporter
+        deliveryTask = Task {
+            await reporter(.waitingForChildConnection)
+        }
+    }
+
+    func recordChildConnectionObserved() {
+        guard terminalOutcome == nil, !childConnectionObserved else { return }
+        childConnectionObserved = true
+        enqueue([.childConnectionObserved, .waitingForRouting])
+    }
+
+    func recordTerminal(_ outcome: MCPRoutingWaitOutcome) {
+        guard terminalOutcome == nil else { return }
+        terminalOutcome = outcome
+    }
+
+    func finish(with outcome: MCPRoutingWaitOutcome) async {
+        recordTerminal(outcome)
+        guard !didFinish else {
+            await deliveryTask?.value
+            return
+        }
+        didFinish = true
+
+        let finalOutcome = terminalOutcome ?? outcome
+        if case .timedOut(childConnectionObserved: true) = finalOutcome,
+           !childConnectionObserved
+        {
+            childConnectionObserved = true
+            enqueue([.childConnectionObserved, .waitingForRouting])
+        }
+
+        switch finalOutcome {
+        case .routed:
+            enqueue([.routingConfirmed])
+        case let .timedOut(childConnectionObserved):
+            enqueue([
+                childConnectionObserved
+                    ? .routingTimeoutAfterConnection
+                    : .routingTimeoutBeforeConnection
+            ])
+        case .failed, .cancelled:
+            break
+        }
+
+        await deliveryTask?.value
+    }
+
+    private func enqueue(_ phases: [MCPBootstrapRoutingProgress]) {
+        let previousDelivery = deliveryTask
+        let reporter = reporter
+        deliveryTask = Task {
+            await previousDelivery?.value
+            for phase in phases {
+                await reporter(phase)
+            }
+        }
+    }
+}
+
 /// Specification describing the MCP bootstrap requirements for a single run.
 /// Used by both agent-mode and headless discovery paths.
 struct MCPBootstrapLeaseSpec {
@@ -295,22 +364,15 @@ actor MCPBootstrapLease {
         hasReleased = true
 
         let ownedGateBeforeWait = ownsGate
+        let progressLifecycle = progressReporter.map {
+            MCPBootstrapRoutingProgressLifecycle(reporter: $0)
+        }
         async let pendingReleaseResult = AgentRunCoordinator.shared.releaseGateWhenRouted(
             runID: spec.runID,
             gateID: spec.gateID,
-            timeoutMs: timeoutMs
+            timeoutMs: timeoutMs,
+            progressLifecycle: progressLifecycle
         )
-        await progressReporter?(.waitingForChildConnection)
-        let connectionObservationTask = progressReporter.map { progressReporter in
-            Task {
-                guard await MCPRoutingWaiter.waitUntilChildConnectionObserved(
-                    runID: spec.runID
-                ) else { return false }
-                await progressReporter(.childConnectionObserved)
-                await progressReporter(.waitingForRouting)
-                return true
-            }
-        }
 
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() waiting for routing client=\(spec.clientName ?? "<none>") timeoutMs=\(timeoutMs)")
         #if DEBUG
@@ -325,9 +387,6 @@ actor MCPBootstrapLease {
             )
         #endif
         let releaseResult = await pendingReleaseResult
-        let childConnectionWasObserved = await MCPRoutingWaiter.childConnectionWasObserved(
-            runID: spec.runID
-        )
         ownsGate = false
         let routed = releaseResult.routed
         if ownedGateBeforeWait || releaseResult.gateRelease.released {
@@ -370,36 +429,7 @@ actor MCPBootstrapLease {
             await cleanupRoutingOnce()
         }
 
-        let shouldReportConnectionObservation = switch releaseResult.routingOutcome {
-        case .routed:
-            childConnectionWasObserved
-        case let .timedOut(childConnectionObserved):
-            childConnectionObserved
-        case .failed, .cancelled:
-            false
-        }
-        if shouldReportConnectionObservation {
-            let observationWasReported = await connectionObservationTask?.value ?? false
-            if !observationWasReported {
-                await progressReporter?(.childConnectionObserved)
-                await progressReporter?(.waitingForRouting)
-            }
-        } else {
-            connectionObservationTask?.cancel()
-            await connectionObservationTask?.value
-        }
-        switch releaseResult.routingOutcome {
-        case .routed:
-            await progressReporter?(.routingConfirmed)
-        case let .timedOut(childConnectionObserved):
-            await progressReporter?(
-                childConnectionObserved
-                    ? .routingTimeoutAfterConnection
-                    : .routingTimeoutBeforeConnection
-            )
-        case .failed, .cancelled:
-            break
-        }
+        await progressLifecycle?.finish(with: releaseResult.routingOutcome)
 
         return routed
     }

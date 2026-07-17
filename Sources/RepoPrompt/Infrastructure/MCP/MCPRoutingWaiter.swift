@@ -31,6 +31,7 @@ actor MCPRoutingWaiter {
         let id: UUID
         let continuation: CheckedContinuation<MCPRoutingWaitOutcome, Never>
         let timeoutTask: Task<Void, Never>?
+        let progressLifecycle: MCPBootstrapRoutingProgressLifecycle?
     }
 
     private struct ConnectionObservationContinuation {
@@ -73,23 +74,43 @@ actor MCPRoutingWaiter {
     /// run-owned child connection had been matched when this waiter's deadline expired.
     func waitForRoutingOutcome(
         runID: UUID,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
     ) async -> MCPRoutingWaitOutcome {
         // Fast path: already resolved
-        if let outcome = waitersByRunID[runID]?.terminalOutcome {
+        if let state = waitersByRunID[runID],
+           let outcome = state.terminalOutcome
+        {
+            if state.childConnectionObserved {
+                await progressLifecycle?.recordChildConnectionObserved()
+            }
+            await progressLifecycle?.recordTerminal(outcome)
             log.info("waitForRoutingOutcome fast-path: runID=\(runID.uuidString) outcome=\(String(describing: outcome))")
             return outcome
         }
 
         // Safety check: runID must be registered before waiting.
-        guard waitersByRunID[runID] != nil else {
+        guard let initialState = waitersByRunID[runID] else {
+            await progressLifecycle?.recordTerminal(.failed)
             log.warning("waitForRoutingOutcome: unregistered runID \(runID.uuidString) - returning failure")
             return .failed
+        }
+        if initialState.childConnectionObserved {
+            await progressLifecycle?.recordChildConnectionObserved()
+        }
+        if let state = waitersByRunID[runID],
+           let outcome = state.terminalOutcome
+        {
+            if state.childConnectionObserved {
+                await progressLifecycle?.recordChildConnectionObserved()
+            }
+            await progressLifecycle?.recordTerminal(outcome)
+            return outcome
         }
 
         // Wait via continuation with per-waiter identity for targeted timeout/cancellation.
         let waiterID = UUID()
-        return await withTaskCancellationHandler {
+        let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<MCPRoutingWaitOutcome, Never>) in
                 // Check again in case resolved while setting up
                 if let outcome = waitersByRunID[runID]?.terminalOutcome {
@@ -111,7 +132,8 @@ actor MCPRoutingWaiter {
                         WaitingContinuation(
                             id: waiterID,
                             continuation: continuation,
-                            timeoutTask: timeoutTask
+                            timeoutTask: timeoutTask,
+                            progressLifecycle: progressLifecycle
                         )
                     )
                 }
@@ -119,6 +141,8 @@ actor MCPRoutingWaiter {
         } onCancel: {
             Task { await self.handleCancellation(runID: runID, waiterID: waiterID) }
         }
+        await progressLifecycle?.recordTerminal(outcome)
+        return outcome
     }
 
     /// Waits until the exact run-owned pending policy has matched a child connection.
@@ -165,7 +189,11 @@ actor MCPRoutingWaiter {
         state.childConnectionObserved = true
         let observers = state.connectionObservationContinuations
         state.connectionObservationContinuations = []
+        let progressLifecycles = state.continuations.compactMap(\.progressLifecycle)
         waitersByRunID[runID] = state
+        for progressLifecycle in progressLifecycles {
+            await progressLifecycle.recordChildConnectionObserved()
+        }
         observers.forEach { $0.continuation.resume(returning: true) }
 
         #if DEBUG
@@ -183,7 +211,7 @@ actor MCPRoutingWaiter {
     /// Called when a runID is successfully bound to a connection/window.
     /// Resumes all waiters with `true`.
     func notifyRouted(runID: UUID) async {
-        guard resolve(runID: runID, outcome: .routed) else { return }
+        guard await resolve(runID: runID, outcome: .routed) else { return }
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                 runID: runID,
@@ -196,7 +224,7 @@ actor MCPRoutingWaiter {
     /// Called when routing is known to be impossible (cleanup, cancellation, etc).
     /// Resumes all waiters with `false`.
     func notifyFailed(runID: UUID) async {
-        guard resolve(runID: runID, outcome: .failed) else { return }
+        guard await resolve(runID: runID, outcome: .failed) else { return }
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                 runID: runID,
@@ -209,7 +237,7 @@ actor MCPRoutingWaiter {
     // MARK: - Internal
 
     @discardableResult
-    private func resolve(runID: UUID, outcome: MCPRoutingWaitOutcome) -> Bool {
+    private func resolve(runID: UUID, outcome: MCPRoutingWaitOutcome) async -> Bool {
         guard var state = waitersByRunID[runID] else {
             log.warning("resolve: unregistered runID \(runID.uuidString) outcome=\(String(describing: outcome)) - ignoring")
             return false
@@ -239,6 +267,10 @@ actor MCPRoutingWaiter {
         log.info("resolve: runID=\(runID.uuidString) outcome=\(String(describing: outcome)) resumingCount=\(continuations.count)")
 
         for waiter in continuations {
+            if state.childConnectionObserved {
+                await waiter.progressLifecycle?.recordChildConnectionObserved()
+            }
+            await waiter.progressLifecycle?.recordTerminal(outcome)
             waiter.timeoutTask?.cancel()
             waiter.continuation.resume(returning: outcome)
         }
@@ -268,7 +300,7 @@ actor MCPRoutingWaiter {
     }
 
     /// Handles timeout of one waiter without terminally resolving the runID.
-    private func handleTimeout(runID: UUID, waiterID: UUID) {
+    private func handleTimeout(runID: UUID, waiterID: UUID) async {
         guard var state = waitersByRunID[runID], state.terminalOutcome == nil else { return }
         guard let index = state.continuations.firstIndex(where: { $0.id == waiterID }) else { return }
         let waiter = state.continuations.remove(at: index)
@@ -276,6 +308,7 @@ actor MCPRoutingWaiter {
             childConnectionObserved: state.childConnectionObserved
         )
         waitersByRunID[runID] = state
+        await waiter.progressLifecycle?.recordTerminal(outcome)
         log.info("waiter timeout: runID=\(runID.uuidString) waiterID=\(waiterID.uuidString)")
         waiter.continuation.resume(returning: outcome)
     }
@@ -283,11 +316,12 @@ actor MCPRoutingWaiter {
     /// Handles cancellation of a single waiter without resolving the entire runID.
     /// Removes only the specific cancelled waiter and resumes it with `false`.
     /// Other waiters for the same runID are unaffected.
-    private func handleCancellation(runID: UUID, waiterID: UUID) {
+    private func handleCancellation(runID: UUID, waiterID: UUID) async {
         guard var state = waitersByRunID[runID], state.terminalOutcome == nil else { return }
         guard let index = state.continuations.firstIndex(where: { $0.id == waiterID }) else { return }
         let waiter = state.continuations.remove(at: index)
         waitersByRunID[runID] = state
+        await waiter.progressLifecycle?.recordTerminal(.cancelled)
         waiter.timeoutTask?.cancel()
         waiter.continuation.resume(returning: .cancelled)
     }
@@ -343,9 +377,14 @@ extension MCPRoutingWaiter {
 
     static func waitForRoutingOutcome(
         runID: UUID,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
     ) async -> MCPRoutingWaitOutcome {
-        await shared.waitForRoutingOutcome(runID: runID, timeoutSeconds: timeoutSeconds)
+        await shared.waitForRoutingOutcome(
+            runID: runID,
+            timeoutSeconds: timeoutSeconds,
+            progressLifecycle: progressLifecycle
+        )
     }
 
     static func waitUntilChildConnectionObserved(runID: UUID) async -> Bool {
