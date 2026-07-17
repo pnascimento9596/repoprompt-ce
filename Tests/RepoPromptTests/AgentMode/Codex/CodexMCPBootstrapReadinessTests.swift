@@ -38,7 +38,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: 0,
-                workspacePath: "/tmp/codex-mcp-readiness-throwing",
+                workspacePaths: .uniform("/tmp/codex-mcp-readiness-throwing"),
                 options: options,
                 clientShutdownBehavior: .stopOnShutdown,
                 expectedMCPClientName: expectedClientName,
@@ -81,7 +81,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: "/tmp/codex-mcp-readiness-cancellation",
+            workspacePaths: .uniform("/tmp/codex-mcp-readiness-cancellation"),
             options: options,
             clientShutdownBehavior: .stopOnShutdown,
             expectedMCPClientName: expectedClientName,
@@ -129,7 +129,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
                 commandName: executableURL.path,
                 additionalPathHints: [],
                 requestTimeout: 5,
-                workingDirectory: directory.path
+                processLaunchDirectory: directory.path
             )
         )
 
@@ -147,7 +147,7 @@ final class CodexMCPBootstrapReadinessTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 0,
-            workspacePath: directory.path,
+            workspacePaths: .uniform(directory.path),
             options: options,
             clientShutdownBehavior: .stopOnShutdown,
             expectedMCPClientName: expectedClientName,
