@@ -198,6 +198,20 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
     }
 
     func testQueuedManifestCompletionsShareOneBoundedPublicationAndResolveAllWaiters() async throws {
+        // Coexistence smoke only: the provider's fixed readiness ceiling is the liveness guarantee.
+        let settlementRegistry = MCPCodeStructureSettlementRegistry()
+        let settlementWindowID = 73
+        guard case let .admitted(settlementSlot) = settlementRegistry.admit(
+            windowID: settlementWindowID,
+            connectionID: UUID(),
+            invocationID: UUID()
+        ) else {
+            return XCTFail("Expected read-only settlement lease")
+        }
+        XCTAssertEqual(settlementSlot.resolveGraceExpiry(), .detach)
+        XCTAssertEqual(settlementSlot.activateDetach(), .activated)
+        defer { _ = settlementSlot.recordCompletion(.cancellation) }
+
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
             named: "repository",
@@ -238,6 +252,13 @@ final class CodemapBindingEngineManifestWriteTests: CodemapBindingEngineTestCase
         XCTAssertEqual(accounting.counters.manifestWriteItems, 3)
         XCTAssertEqual(accounting.counters.manifestWriteCoalescedItems, 1)
         XCTAssertEqual(accounting.counters.manifestWriterPeakQueuedItems, 2)
+        XCTAssertEqual(
+            settlementRegistry.snapshot(windowID: settlementWindowID),
+            .init(activeCount: 1, detachedCount: 1),
+            "PR487 coexistence smoke: detached read-only settlement must not claim manifest writer authority"
+        )
+        XCTAssertEqual(settlementSlot.recordCompletion(.success), .settleDetached)
+        await settlementRegistry.awaitDrained(windowID: settlementWindowID)
 
         await fixture.engine.unloadRoot(rootEpoch: fixture.rootEpoch)
         let reloaded = try await makeEngineFixture(root: root, runtime: runtime)

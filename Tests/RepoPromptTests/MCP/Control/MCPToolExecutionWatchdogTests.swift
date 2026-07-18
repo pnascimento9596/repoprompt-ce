@@ -170,6 +170,118 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         XCTAssertEqual(pendingSchedulingTasks, 0)
     }
 
+    func testSlotCompletionJustBeforeDeadlineReturnsValueAndReleasesLease() async throws {
+        let clock = ExecutionWatchdogManualClock()
+        let events = ExecutionWatchdogEventRecorder()
+        let settlements = ExecutionWatchdogSettlementRecorder()
+        let operationGate = ExecutionWatchdogUncooperativeGate()
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 7
+        guard case let .admitted(settlementSlot) = registry.admit(
+            windowID: windowID,
+            connectionID: UUID(),
+            invocationID: UUID()
+        ) else {
+            return XCTFail("Expected settlement lease")
+        }
+
+        let task = Task<Int, Error> {
+            try await MCPToolExecutionWatchdog.execute(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                settlementSlot: settlementSlot,
+                environment: clock.environment,
+                onEvent: { await events.append($0) },
+                onSynchronousSettlement: { await settlements.append($0) }
+            ) {
+                await operationGate.wait()
+                return 42
+            }
+        }
+
+        try await clock.waitForSleeperCount(1)
+        try await clock.advanceWithoutWakingSleepers(
+            by: MCPTimeoutPolicy.boundedToolExecutionDeadline - .nanoseconds(1)
+        )
+        await operationGate.release()
+
+        let value = try await task.value
+        let recordedEvents = await events.snapshot()
+        let recordedSettlements = await settlements.snapshot()
+        let sleeperCount = await clock.sleeperCount()
+        XCTAssertEqual(value, 42)
+        XCTAssertEqual(recordedEvents, [])
+        XCTAssertEqual(recordedSettlements, [.success])
+        XCTAssertEqual(sleeperCount, 0)
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+    }
+
+    func testSlotCompletionRecordedBeforeDeadlineConsumptionSettlesLeaseAndTimesOut() async throws {
+        let clock = ExecutionWatchdogManualClock()
+        let events = ExecutionWatchdogEventRecorder()
+        let settlements = ExecutionWatchdogSettlementRecorder()
+        let operationGate = ExecutionWatchdogUncooperativeGate()
+        let schedulingGate = ExecutionWatchdogSchedulingGate(blocking: .deadlineExpired)
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 7
+        guard case let .admitted(settlementSlot) = registry.admit(
+            windowID: windowID,
+            connectionID: UUID(),
+            invocationID: UUID()
+        ) else {
+            return XCTFail("Expected settlement lease")
+        }
+
+        let task = Task<Int, Error> {
+            try await MCPToolExecutionWatchdog.execute(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                settlementSlot: settlementSlot,
+                environment: clock.environment(
+                    eventDidProduce: { await schedulingGate.eventDidProduce($0) },
+                    beforeEventConsumption: { await schedulingGate.beforeEventConsumption($0) }
+                ),
+                onEvent: { await events.append($0) },
+                onSynchronousSettlement: { await settlements.append($0) }
+            ) {
+                await operationGate.wait()
+                return 42
+            }
+        }
+
+        try await clock.waitForSleeperCount(1)
+        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+        await schedulingGate.waitUntilConsumptionPaused()
+        await operationGate.release()
+        await schedulingGate.waitUntilProduced(.operationCompleted)
+        await schedulingGate.open()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected execution timeout")
+        } catch let error as MCPToolExecutionWatchdogError {
+            XCTAssertEqual(error, .executionTimedOut(settlement: .success))
+        }
+        let recordedEvents = await events.snapshot()
+        let recordedSettlements = await settlements.snapshot()
+        let sleeperCount = await clock.sleeperCount()
+        let pendingSchedulingTasks = await schedulingGate.pendingTaskCount()
+        XCTAssertEqual(recordedEvents, [
+            .deadlineExpired,
+            .settledDuringGrace(.success, cancellationRequested: false)
+        ])
+        XCTAssertEqual(recordedSettlements, [.success])
+        XCTAssertEqual(sleeperCount, 0)
+        XCTAssertEqual(pendingSchedulingTasks, 0)
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+    }
+
     func testDeadlineCancelsCooperativeOperationAndReturnsSingleTimeout() async throws {
         let clock = ExecutionWatchdogManualClock()
         let events = ExecutionWatchdogEventRecorder()
@@ -276,7 +388,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         XCTAssertEqual(recordedEvents, [
             .deadlineExpired,
             .cancellationRequested(origin: .watchdogDeadline),
-            .cleanupGraceExpired
+            .cleanupGraceExpired(resolvedDisposition: .forceDisconnect)
         ])
 
         await gate.release()
@@ -287,11 +399,21 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let events = ExecutionWatchdogEventRecorder()
         let settlements = ExecutionWatchdogSettlementRecorder()
         let gate = ExecutionWatchdogUncooperativeGate()
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 91
+        guard case let .admitted(settlementSlot) = registry.admit(
+            windowID: windowID,
+            connectionID: UUID(),
+            invocationID: UUID()
+        ) else {
+            return XCTFail("Expected settlement lease")
+        }
         let task = Task<Int, Error> {
             try await MCPToolExecutionWatchdog.execute(
                 deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
                 cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
                 cleanupDisposition: .detachAndSettle,
+                settlementSlot: settlementSlot,
                 environment: clock.environment,
                 onEvent: { await events.append($0) },
                 onDetachedSettlement: { await settlements.append($0) }
@@ -320,7 +442,7 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         XCTAssertEqual(eventsAfterDetach, [
             .deadlineExpired,
             .cancellationRequested(origin: .watchdogDeadline),
-            .cleanupGraceExpired,
+            .cleanupGraceExpired(resolvedDisposition: .detachAndSettle),
             .detachedForSettlement
         ])
 
@@ -330,6 +452,72 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         let finalSleeperCount = await clock.sleeperCount()
         XCTAssertEqual(finalSettlements, [.success])
         XCTAssertEqual(finalSleeperCount, 0)
+        await registry.awaitDrained(windowID: windowID)
+    }
+
+    func testSettlementDuringDetachActivationReportsSettledDuringGrace() async throws {
+        let clock = ExecutionWatchdogManualClock()
+        let events = ExecutionWatchdogEventRecorder()
+        let synchronousSettlements = ExecutionWatchdogSettlementRecorder()
+        let detachedSettlements = ExecutionWatchdogSettlementRecorder()
+        let gate = ExecutionWatchdogUncooperativeGate()
+        let registry = MCPCodeStructureSettlementRegistry()
+        let windowID = 93
+        guard case let .admitted(settlementSlot) = registry.admit(
+            windowID: windowID,
+            connectionID: UUID(),
+            invocationID: UUID()
+        ) else {
+            return XCTFail("Expected settlement lease")
+        }
+        let environment = clock.environment(
+            beforeDetachActivation: {
+                _ = settlementSlot.recordCompletion(.success)
+            }
+        )
+        let task = Task<Int, Error> {
+            try await MCPToolExecutionWatchdog.execute(
+                deadline: MCPTimeoutPolicy.boundedToolExecutionDeadline,
+                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                cleanupDisposition: .detachAndSettle,
+                settlementSlot: settlementSlot,
+                environment: environment,
+                onEvent: { await events.append($0) },
+                onSynchronousSettlement: { await synchronousSettlements.append($0) },
+                onDetachedSettlement: { await detachedSettlements.append($0) }
+            ) {
+                await gate.wait()
+                return 1
+            }
+        }
+
+        try await clock.waitForSleeperCount(1)
+        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
+        try await clock.waitForSleeperCount(1)
+        try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected settled execution timeout")
+        } catch let error as MCPToolExecutionWatchdogError {
+            XCTAssertEqual(error, .executionTimedOut(settlement: .success))
+        }
+        let recordedEvents = await events.snapshot()
+        let recordedSynchronousSettlements = await synchronousSettlements.snapshot()
+        let recordedDetachedSettlements = await detachedSettlements.snapshot()
+        XCTAssertEqual(recordedEvents, [
+            .deadlineExpired,
+            .cancellationRequested(origin: .watchdogDeadline),
+            .settledDuringGrace(.success, cancellationRequested: true)
+        ])
+        XCTAssertEqual(recordedSynchronousSettlements, [.success])
+        XCTAssertEqual(recordedDetachedSettlements, [])
+        XCTAssertEqual(
+            registry.snapshot(windowID: windowID),
+            .init(activeCount: 0, detachedCount: 0)
+        )
+
+        await gate.release()
     }
 
     func testManualClockAdvancesElapsedTimeWithoutRegisteredSleepers() async throws {
@@ -791,14 +979,16 @@ actor ExecutionWatchdogManualClock {
     nonisolated func environment(
         eventDidProduce: @escaping @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void = { _ in },
         beforeEventConsumption: @escaping @Sendable (MCPToolExecutionWatchdogSchedulingPoint) async -> Void = { _ in },
-        beforeCleanupGraceTaskRegistration: @escaping @Sendable () async -> Void = {}
+        beforeCleanupGraceTaskRegistration: @escaping @Sendable () async -> Void = {},
+        beforeDetachActivation: @escaping @Sendable () -> Void = {}
     ) -> MCPToolExecutionWatchdogEnvironment {
         MCPToolExecutionWatchdogEnvironment(
             now: { self.currentTime() },
             sleep: { try await self.sleep(for: $0) },
             eventDidProduce: eventDidProduce,
             beforeEventConsumption: beforeEventConsumption,
-            beforeCleanupGraceTaskRegistration: beforeCleanupGraceTaskRegistration
+            beforeCleanupGraceTaskRegistration: beforeCleanupGraceTaskRegistration,
+            beforeDetachActivation: beforeDetachActivation
         )
     }
 

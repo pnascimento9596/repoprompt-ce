@@ -11581,21 +11581,25 @@ actor ServerNetworkManager {
                                             connectionID: connectionID,
                                             invocationID: invocationID
                                         ) {
-                                        case let .detachEligible(slot):
+                                        case let .admitted(slot):
                                             settlementAdmission = (.detachAndSettle, slot)
-                                        case .forceDisconnect:
-                                            // Preserve the currently legal second same-window structure call.
-                                            // Only its cleanup disposition changes if it later ignores cancellation.
-                                            settlementAdmission = (.forceDisconnect, nil)
-                                        case .busy:
-                                            throw MCPToolExecutionDispatchError.structureSettlementBusy(windowID: windowID)
+                                        case let .busy(reason):
+                                            throw MCPToolExecutionDispatchError.structureSettlementBusy(
+                                                windowID: windowID,
+                                                reason: reason
+                                            )
                                         }
                                     } else {
                                         settlementAdmission = (contract.cleanupDisposition, nil)
                                     }
 
+                                    defer {
+                                        _ = settlementAdmission.slot?.closeBeforeExecutionExit()
+                                    }
+
                                     @Sendable func emitExecutionTrace(
                                         _ phase: MCPToolExecutionTraceEvent.Phase,
+                                        resolvedCleanupDisposition: MCPToolExecutionCleanupDisposition? = nil,
                                         cancellationRequested: Bool? = nil,
                                         cancellationOutcome: String? = nil,
                                         cancellationOrigin: MCPToolExecutionCancellationOrigin? = nil,
@@ -11616,7 +11620,7 @@ actor ServerNetworkManager {
                                             contractKind: contract.kind,
                                             executionDeadlineSeconds: contract.deadline?.mcpSeconds,
                                             cleanupGraceSeconds: contract.cancellationGrace?.mcpSeconds,
-                                            cleanupDisposition: settlementAdmission.cleanupDisposition,
+                                            cleanupDisposition: resolvedCleanupDisposition ?? settlementAdmission.cleanupDisposition,
                                             phase: phase,
                                             elapsedMilliseconds: max(0, now.mcpMilliseconds - executionTraceOrigin.mcpMilliseconds),
                                             cancellationRequested: cancellationRequested,
@@ -11703,14 +11707,11 @@ actor ServerNetworkManager {
                                                 terminalBarrier: false
                                             )
                                         )
-                                        _ = settlementAdmission.slot?.complete()
                                     }
 
                                     @Sendable func recordDetachedSettlement(
                                         _ providerSettlement: MCPToolExecutionSettlement
                                     ) async {
-                                        let completionDisposition = settlementAdmission.slot?.complete()
-                                        guard completionDisposition == .detached else { return }
                                         await emitExecutionTrace(
                                             .detachedSettled,
                                             cancellationRequested: true,
@@ -11747,7 +11748,6 @@ actor ServerNetworkManager {
                                     @Sendable func recordAbandonedSettlement(
                                         _ providerSettlement: MCPToolExecutionSettlement
                                     ) async {
-                                        _ = settlementAdmission.slot?.complete()
                                         await emitExecutionTrace(
                                             .handlerCompleted,
                                             cancellationRequested: true,
@@ -11764,6 +11764,19 @@ actor ServerNetworkManager {
                                         )
                                     }
 
+                                    @Sendable func recordForceDisconnectedSettlement(
+                                        _ providerSettlement: MCPToolExecutionSettlement
+                                    ) async {
+                                        EditFlowPerf.lifecycleEvent(
+                                            EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                                            correlation: lifecycleCorrelation,
+                                            EditFlowPerf.Dimensions(
+                                                toolName: toolName,
+                                                outcome: "force_disconnected_settled_\(providerSettlement.rawValue)"
+                                            )
+                                        )
+                                    }
+
                                     switch contract {
                                     case let .bounded(deadline, cancellationGrace, _):
                                         do {
@@ -11771,6 +11784,7 @@ actor ServerNetworkManager {
                                                 deadline: deadline,
                                                 cancellationGrace: cancellationGrace,
                                                 cleanupDisposition: settlementAdmission.cleanupDisposition ?? .forceDisconnect,
+                                                settlementSlot: settlementAdmission.slot,
                                                 environment: executionWatchdogEnvironment,
                                                 onEvent: { event in
                                                     switch event {
@@ -11790,18 +11804,19 @@ actor ServerNetworkManager {
                                                             cancellationOrigin: cancellationRequested ? .watchdogDeadline : nil,
                                                             graceOutcome: cancellationRequested ? "settled" : "late_completion"
                                                         )
-                                                    case .cleanupGraceExpired:
+                                                    case let .cleanupGraceExpired(resolvedDisposition):
                                                         await emitExecutionTrace(
                                                             .cleanupGraceExpired,
+                                                            resolvedCleanupDisposition: resolvedDisposition,
                                                             cancellationRequested: true,
                                                             cancellationOrigin: .watchdogDeadline,
                                                             graceOutcome: "expired",
                                                             escalationReason: "handler_ignored_cancellation"
                                                         )
                                                     case .detachedForSettlement:
-                                                        guard settlementAdmission.slot?.markDetached() == true else { return }
                                                         await emitExecutionTrace(
                                                             .detachedForSettlement,
+                                                            resolvedCleanupDisposition: .detachAndSettle,
                                                             cancellationRequested: true,
                                                             cancellationOrigin: .watchdogDeadline,
                                                             settlement: "detached",
@@ -11813,11 +11828,13 @@ actor ServerNetworkManager {
                                                 onSynchronousSettlement: recordSynchronousSettlement,
                                                 onDetachedSettlement: recordDetachedSettlement,
                                                 onAbandonedSettlement: recordAbandonedSettlement,
+                                                onForceDisconnectedSettlement: recordForceDisconnectedSettlement,
                                                 operation: tracedOperation
                                             )
                                         } catch MCPToolExecutionWatchdogError.cleanupUnresponsive {
                                             await emitExecutionTrace(
                                                 .connectionForceDisconnectRequested,
+                                                resolvedCleanupDisposition: .forceDisconnect,
                                                 cancellationRequested: true,
                                                 cancellationOrigin: .watchdogDeadline,
                                                 graceOutcome: "expired",
@@ -11912,15 +11929,22 @@ actor ServerNetworkManager {
                                         outcome = "executionContractMissing"
                                         shouldForceDisconnect = false
                                         errorMetadata = [:]
-                                    case let MCPToolExecutionDispatchError.structureSettlementBusy(windowID):
+                                    case let MCPToolExecutionDispatchError.structureSettlementBusy(windowID, reason):
                                         code = "tool_execution_structure_settlement_busy"
-                                        message = "A prior timed-out get_code_structure operation for window \(windowID) is still settling. Retry after it drains."
+                                        let abandoned = reason == .abandoned
+                                        message = abandoned
+                                            ? "A prior canceled get_code_structure operation for window \(windowID) is still settling. Retry after it drains."
+                                            : "A prior timed-out get_code_structure operation for window \(windowID) is still settling. Retry after it drains."
                                         outcome = "executionStructureSettlementBusy"
                                         shouldForceDisconnect = false
                                         errorMetadata = [
                                             "retryable": .bool(true),
                                             "retry_after_ms": .int(250),
-                                            "busy_reason": .string("detached_settlement_in_progress"),
+                                            "busy_reason": .string(
+                                                abandoned
+                                                    ? "abandoned_settlement_in_progress"
+                                                    : "detached_settlement_in_progress"
+                                            ),
                                             "settlement": .string("busy")
                                         ]
                                     case MCPToolExecutionDispatchError.structureSettlementWindowUnresolved:

@@ -59,7 +59,7 @@ enum MCPToolExecutionContract: Equatable {
 
 enum MCPToolExecutionDispatchError: Error, Equatable {
     case missingContract(toolName: String)
-    case structureSettlementBusy(windowID: Int)
+    case structureSettlementBusy(windowID: Int, reason: MCPCodeStructureSettlementRegistry.BusyReason)
     case structureSettlementWindowUnresolved
 }
 

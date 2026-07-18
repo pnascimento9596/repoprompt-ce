@@ -111,6 +111,19 @@ import XCTest
                     MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds,
                     caseLabel
                 )
+                let getCodeStructure = try XCTUnwrap(MCPToolDurationInventory.entries.first {
+                    $0.toolName == MCPWindowToolName.getCodeStructure
+                }, caseLabel)
+                XCTAssertEqual(getCodeStructure.semanticWaitMaximumSeconds, 10, caseLabel)
+                XCTAssertTrue(
+                    getCodeStructure.qualification.contains("competing grace expiry resolves atomically"),
+                    caseLabel
+                )
+                XCTAssertTrue(
+                    getCodeStructure.qualification.contains("already-admitted same-window calls"),
+                    caseLabel
+                )
+                XCTAssertFalse(getCodeStructure.qualification.contains("bounded +1"), caseLabel)
                 let manageWorkspaces = try XCTUnwrap(MCPToolDurationInventory.entries.first {
                     $0.toolName == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)

@@ -1939,6 +1939,123 @@ import XCTest
             }
         }
 
+        func testCancelledCodeStructureFencesRetriesUntilLateSettlementAndKeepsReadsUsable() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let provider = MCPCodeStructureSettlementProviderProbe()
+                let manager = fixture.networkManager
+                let windowID = fixture.contextA.window.windowID
+                var cancelledTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.getCodeStructure) {
+                    try await provider.run()
+                }
+
+                do {
+                    let endpoint = try fixture.endpointA()
+                    let arguments: [String: Any] = [
+                        "paths": [fixture.contextA.fileURL.path],
+                        "context_id": fixture.contextA.tabID.uuidString,
+                        "_rawJSON": true
+                    ]
+                    let requestID = endpoint.client.nextRequestIDForTesting()
+                    let activeTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.getCodeStructure,
+                            arguments: arguments
+                        )
+                    }
+                    cancelledTask = activeTask
+                    try await provider.waitUntilEntered(count: 1)
+                    try endpoint.client.sendNotification(
+                        method: "notifications/cancelled",
+                        params: ["requestId": requestID]
+                    )
+
+                    let cancellationFenced = await Self.waitUntil {
+                        await manager.debugCodeStructureSettlementSnapshot(windowID: windowID)
+                            == .init(activeCount: 1, detachedCount: 1)
+                    }
+                    XCTAssertTrue(cancellationFenced)
+                    _ = try? await activeTask.value
+                    cancelledTask = nil
+
+                    let limiterReleased = await Self.waitUntil {
+                        let snapshot = await manager.connectionLimiterSnapshotForTesting(
+                            connectionID: endpoint.connectionID,
+                            lane: .smallRead
+                        )
+                        return snapshot?.activePermitCount == 0
+                    }
+                    XCTAssertTrue(limiterReleased)
+
+                    for _ in 0 ..< 3 {
+                        let busyResponse = try await endpoint.callTool(
+                            name: MCPWindowToolName.getCodeStructure,
+                            arguments: arguments
+                        )
+                        let busyPayload = try Self.toolResultObject(busyResponse)
+                        XCTAssertEqual(
+                            busyPayload["code"] as? String,
+                            "tool_execution_structure_settlement_busy"
+                        )
+                        XCTAssertEqual(
+                            busyPayload["busy_reason"] as? String,
+                            "abandoned_settlement_in_progress"
+                        )
+                    }
+                    let enteredWhileBusy = await provider.enteredCount()
+                    XCTAssertEqual(enteredWhileBusy, 1)
+
+                    let readResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString
+                        ]
+                    )
+                    XCTAssertTrue(try Self.toolResultText(readResponse).contains(fixture.contextA.sentinel))
+
+                    await provider.releaseFirst()
+                    await manager.debugAwaitCodeStructureSettlementDrain(windowID: windowID)
+                    let postSettlementResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.getCodeStructure,
+                        arguments: arguments
+                    )
+                    XCTAssertEqual(
+                        try (Self.toolResultObject(postSettlementResponse)["ordinal"] as? NSNumber)?.intValue,
+                        2
+                    )
+                    let maximumProviderConcurrency = await provider.maximumConcurrentCount()
+                    XCTAssertLessThanOrEqual(
+                        maximumProviderConcurrency,
+                        MCPToolAdmissionPolicy.smallReadPerWindowLimit + 1
+                    )
+
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.getCodeStructure,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await provider.releaseFirst()
+                    cancelledTask?.cancel()
+                    if let cancelledTask { _ = try? await cancelledTask.value }
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.getCodeStructure,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testDetachedCodeStructureTimeoutKeepsConnectionUsableAndDrainsLateProvider() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -2436,11 +2553,16 @@ import XCTest
         private static let synchronizationTimeout: Duration = .seconds(10)
 
         private var count = 0
+        private var activeCount = 0
+        private var maximumActiveCount = 0
         private var firstReleased = false
         private var firstReleaseWaiters: [CheckedContinuation<Void, Never>] = []
 
         func run() async throws -> Value {
             count += 1
+            activeCount += 1
+            maximumActiveCount = max(maximumActiveCount, activeCount)
+            defer { activeCount -= 1 }
             let ordinal = count
             if ordinal == 1, !firstReleased {
                 await withCheckedContinuation { firstReleaseWaiters.append($0) }
@@ -2468,6 +2590,10 @@ import XCTest
 
         func enteredCount() -> Int {
             count
+        }
+
+        func maximumConcurrentCount() -> Int {
+            maximumActiveCount
         }
 
         func releaseFirst() {
