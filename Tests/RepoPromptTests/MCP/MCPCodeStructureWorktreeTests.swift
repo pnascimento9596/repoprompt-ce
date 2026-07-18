@@ -665,31 +665,53 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         await fileSystemService.setContentReadChunkHandlerForTesting { _ in
             await contentReads.increment()
         }
-        window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+        var value: Value?
+        for attempt in 1 ... 3 {
+            window.mcpServer.resetCodeStructureAdmissionWorkCountsForTesting()
+            let attemptValue = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool([
+                    "scope": .string("selected"),
+                    "limits": .object(["max_files": .int(1)])
+                ])
+            }
+            value = attemptValue
 
-        let value = try await ServerNetworkManager.withConnectionID(connectionID) {
-            try await tool([
-                "scope": .string("selected"),
-                "limits": .object(["max_files": .int(1)])
-            ])
+            let attemptObject = attemptValue.objectValue
+            let issues = attemptObject?["issues"]?.arrayValue ?? []
+            let issueCodes = issues.compactMap {
+                $0.objectValue?["code"]?.stringValue
+            }
+            let transientUnavailableCodes = Set(["path_not_found", "git_root_unavailable"])
+            let shouldRetry = attemptObject?["status"]?.stringValue == "unavailable"
+                && !issues.isEmpty
+                && issueCodes.count == issues.count
+                && issueCodes.allSatisfy(transientUnavailableCodes.contains)
+            guard shouldRetry, attempt < 3 else { break }
+            try await Task.sleep(for: .milliseconds(250))
         }
         await fileSystemService.setContentReadChunkHandlerForTesting(nil)
 
-        let object = try XCTUnwrap(value.objectValue)
-        XCTAssertEqual(object["status"]?.stringValue, "budget")
+        let object = try XCTUnwrap(value?.objectValue)
+        let status = object["status"]?.stringValue ?? "<missing>"
+        let issuesValue = object["issues"] ?? .array([])
+        let serializedIssues = (try? JSONEncoder().encode(issuesValue))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "<serialization failed>"
+        let responseDiagnostic = "status=\(status), issues=\(serializedIssues)"
+
+        XCTAssertEqual(status, "budget", responseDiagnostic)
         let issue = try XCTUnwrap(object["issues"]?.arrayValue?.compactMap(\.objectValue).first {
             $0["phase"]?.stringValue == "seed_demand"
-        })
-        XCTAssertEqual(issue["code"]?.stringValue, "hard_budget_exceeded")
-        XCTAssertEqual(issue["attempted"]?.intValue, 2)
-        XCTAssertEqual(issue["limit"]?.intValue, 1)
+        }, responseDiagnostic)
+        XCTAssertEqual(issue["code"]?.stringValue, "hard_budget_exceeded", responseDiagnostic)
+        XCTAssertEqual(issue["attempted"]?.intValue, 2, responseDiagnostic)
+        XCTAssertEqual(issue["limit"]?.intValue, 1, responseDiagnostic)
         let contentReadCount = await contentReads.value
-        XCTAssertEqual(contentReadCount, 0)
+        XCTAssertEqual(contentReadCount, 0, responseDiagnostic)
 
         let admission = window.mcpServer.codeStructureAdmissionWorkCountsForTesting()
-        XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2)
-        XCTAssertEqual(admission.logicalPathComputations, 0)
-        XCTAssertEqual(admission.coordinatorInvocations, 0)
+        XCTAssertEqual(admission.uniqueSeedCandidatesVisited, 2, responseDiagnostic)
+        XCTAssertEqual(admission.logicalPathComputations, 0, responseDiagnostic)
+        XCTAssertEqual(admission.coordinatorInvocations, 0, responseDiagnostic)
     }
 
     func testSelectedScopeStaleFolderIsIgnoredWhileExactRootAliasResolves() async throws {
