@@ -71,13 +71,10 @@ for file in "${shared_mcp_required_files[@]}"; do
   fi
 done
 
-# Exact-snapshot Tree-sitter scanner support must remain narrow and reproducible.
-# Remove this block together with the support target only after validated upstream
-# JavaScript/Python revisions compile their scanner objects in a clean root graph.
+# Tree-sitter uses exact upstream package products plus a narrow scanner linker shim.
 if [[ -e "src/scanner.c" ]]; then
-  fail "retired root src/scanner.c manifest-probe sentinel exists; use the tracked TreeSitterScannerSupport target instead"
+  fail "retired root src/scanner.c manifest-probe sentinel exists"
 fi
-
 tree_sitter_scanner_support_files=(
   "Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h"
   "Sources/TreeSitterScannerSupport/include/tree_sitter/array.h"
@@ -94,7 +91,6 @@ for file in "${tree_sitter_scanner_support_files[@]}"; do
     fail "TreeSitterScannerSupport compatibility file must be tracked or pending addition: $file"
   fi
 done
-
 if [[ -d "Sources/TreeSitterScannerSupport" ]]; then
   unexpected_tree_sitter_scanner_support_files="$(find Sources/TreeSitterScannerSupport -type f \
     ! -path 'Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h' \
@@ -108,27 +104,30 @@ if [[ -d "Sources/TreeSitterScannerSupport" ]]; then
     printf '%s\n' "$unexpected_tree_sitter_scanner_support_files" >&2
   fi
 fi
-
-if [[ -f "ThirdPartyLicenses/tree-sitter/scanner-support.sha256" ]]; then
-  if ! tree_sitter_scanner_support_checksum_output="$(shasum -a 256 -c ThirdPartyLicenses/tree-sitter/scanner-support.sha256 2>&1)"; then
-    fail "TreeSitterScannerSupport compatibility snapshots differ from curated checksums"
-    printf '%s\n' "$tree_sitter_scanner_support_checksum_output" >&2
-  fi
+if ! tree_sitter_scanner_support_checksum_output="$(shasum -a 256 -c ThirdPartyLicenses/tree-sitter/scanner-support.sha256 2>&1)"; then
+  fail "TreeSitterScannerSupport compatibility snapshots differ from curated checksums"
+  printf '%s\n' "$tree_sitter_scanner_support_checksum_output" >&2
 fi
 
-if ! tree_sitter_scanner_support_manifest_output="$(python3 <<'PY'
+if ! tree_sitter_dependency_manifest_output="$(python3 <<'PY'
 import json
 import subprocess
 from pathlib import Path
 
 expected_packages = {
-    "tree-sitter-c": ("https://github.com/tree-sitter/tree-sitter-c", "3efee11f784605d44623d7dadd6cd12a0f73ea92", "TreeSitterC"),
-    "tree-sitter-dart": ("https://github.com/UserNobody14/tree-sitter-dart", "80e23c07b64494f7e21090bb3450223ef0b192f4", "TreeSitterDart"),
-    "tree-sitter-go": ("https://github.com/tree-sitter/tree-sitter-go", "c350fa54d38af725c40d061a602ee3205ef1e072", "TreeSitterGo"),
-    "tree-sitter-java": ("https://github.com/tree-sitter/tree-sitter-java", "e10607b45ff745f5f876bfa3e94fbcc6b44bdc11", "TreeSitterJava"),
-    "tree-sitter-javascript": ("https://github.com/tree-sitter/tree-sitter-javascript", "39798e26b6d4dbcee8e522b8db83f8b2df33a5ea", "TreeSitterJavaScript"),
-    "tree-sitter-python": ("https://github.com/tree-sitter/tree-sitter-python", "c5fca1a186e8e528115196178c28eefa8d86b0b0", "TreeSitterPython"),
-    "tree-sitter-rust": ("https://github.com/tree-sitter/tree-sitter-rust", "2eaf126458a4d6a69401089b6ba78c5e5d6c1ced", "TreeSitterRust"),
+    "tree-sitter-c": ("https://github.com/tree-sitter/tree-sitter-c", "b780e47fc780ddc8da13afa35a3f4ed5c157823d", "TreeSitterC"),
+    "tree-sitter-dart": ("https://github.com/UserNobody14/tree-sitter-dart", "be07cf7118d3dba06236a3f19541685a68209934", "TreeSitterDart"),
+    "tree-sitter-go": ("https://github.com/tree-sitter/tree-sitter-go", "1547678a9da59885853f5f5cc8a99cc203fa2e2c", "TreeSitterGo"),
+    "tree-sitter-java": ("https://github.com/tree-sitter/tree-sitter-java", "94703d5a6bed02b98e438d7cad1136c01a60ba2c", "TreeSitterJava"),
+    "tree-sitter-javascript": ("https://github.com/tree-sitter/tree-sitter-javascript", "44c892e0be055ac465d5eeddae6d3e194424e7de", "TreeSitterJavaScript"),
+    "tree-sitter-python": ("https://github.com/tree-sitter/tree-sitter-python", "293fdc02038ee2bf0e2e206711b69c90ac0d413f", "TreeSitterPython"),
+    "tree-sitter-rust": ("https://github.com/tree-sitter/tree-sitter-rust", "77a3747266f4d621d0757825e6b11edcbf991ca5", "TreeSitterRust"),
+    "tree-sitter-typescript": ("https://github.com/tree-sitter/tree-sitter-typescript", "f975a621f4e7f532fe322e13c4f79495e0a7b2e7", "TreeSitterTypeScript"),
+    "tree-sitter-ruby": ("https://github.com/tree-sitter/tree-sitter-ruby", "71bd32fb7607035768799732addba884a37a6210", "TreeSitterRuby"),
+    "tree-sitter-swift": ("https://github.com/alex-pinkus/tree-sitter-swift", "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5", "TreeSitterSwift"),
+    "tree-sitter-c-sharp": ("https://github.com/tree-sitter/tree-sitter-c-sharp.git", "cac6d5fb595f5811a076336682d5d595ac1c9e85", "TreeSitterCSharp"),
+    "tree-sitter-cpp": ("https://github.com/tree-sitter/tree-sitter-cpp", "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02", "TreeSitterCPP"),
+    "tree-sitter-php": ("https://github.com/provencher/tree-sitter-php", "9d7d6f649297ee01639e759795793cc57698031b", "TreeSitterPHP"),
 }
 errors = []
 manifest_text = Path("Package.swift").read_text()
@@ -150,11 +149,7 @@ if repo_prompt.get("type") != "executable":
     errors.append("RepoPrompt target must remain executable")
 if repo_prompt.get("path") != "Sources/RepoPromptExecutable":
     errors.append("RepoPrompt target must remain the thin Sources/RepoPromptExecutable entry target")
-repo_prompt_by_name_dependencies = [
-    dependency["byName"][0]
-    for dependency in repo_prompt_dependencies
-    if dependency.get("byName")
-]
+repo_prompt_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_dependencies if dependency.get("byName")]
 if len(repo_prompt_dependencies) != 1 or repo_prompt_by_name_dependencies != ["RepoPromptApp"]:
     errors.append("RepoPrompt executable target must depend only on RepoPromptApp")
 if repo_prompt_app.get("type") != "regular":
@@ -166,56 +161,33 @@ workspace_core = targets.get("RepoPromptWorkspaceCore")
 if workspace_core is None:
     errors.append("RepoPromptWorkspaceCore target missing")
 else:
-    if workspace_core.get("type") != "regular":
-        errors.append("RepoPromptWorkspaceCore must remain an internal regular target")
-    if workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore":
-        errors.append("RepoPromptWorkspaceCore target path drifted")
-    if workspace_core.get("dependencies", []):
-        errors.append("RepoPromptWorkspaceCore must not declare target or package dependencies")
-    if workspace_core.get("settings", []):
-        errors.append("RepoPromptWorkspaceCore must not declare compiler settings")
+    if workspace_core.get("type") != "regular": errors.append("RepoPromptWorkspaceCore must remain an internal regular target")
+    if workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore": errors.append("RepoPromptWorkspaceCore target path drifted")
+    if workspace_core.get("dependencies", []): errors.append("RepoPromptWorkspaceCore must not declare target or package dependencies")
+    if workspace_core.get("settings", []): errors.append("RepoPromptWorkspaceCore must not declare compiler settings")
 
 workspace_core_tests = targets.get("RepoPromptWorkspaceCoreTests")
 if workspace_core_tests is None:
     errors.append("RepoPromptWorkspaceCoreTests target missing")
 else:
-    test_dependencies = [
-        dependency["byName"][0]
-        for dependency in workspace_core_tests.get("dependencies", [])
-        if dependency.get("byName")
-    ]
-    if workspace_core_tests.get("type") != "test":
-        errors.append("RepoPromptWorkspaceCoreTests must remain a test target")
-    if workspace_core_tests.get("path") != "Tests/RepoPromptWorkspaceCoreTests":
-        errors.append("RepoPromptWorkspaceCoreTests target path drifted")
+    test_dependencies = [dependency["byName"][0] for dependency in workspace_core_tests.get("dependencies", []) if dependency.get("byName")]
+    if workspace_core_tests.get("type") != "test": errors.append("RepoPromptWorkspaceCoreTests must remain a test target")
+    if workspace_core_tests.get("path") != "Tests/RepoPromptWorkspaceCoreTests": errors.append("RepoPromptWorkspaceCoreTests target path drifted")
     if test_dependencies != ["RepoPromptWorkspaceCore"] or len(workspace_core_tests.get("dependencies", [])) != 1:
         errors.append("RepoPromptWorkspaceCoreTests must depend only on RepoPromptWorkspaceCore")
 
-app_by_name_dependencies = [
-    dependency["byName"][0]
-    for dependency in repo_prompt_app_dependencies
-    if dependency.get("byName")
-]
+app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
 if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
-
 for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "RepoPromptTests"):
-    dependencies = [
-        dependency["byName"][0]
-        for dependency in targets.get(forbidden_consumer, {}).get("dependencies", [])
-        if dependency.get("byName")
-    ]
-    if "RepoPromptWorkspaceCore" in dependencies:
-        errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
-
+    dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
+    if "RepoPromptWorkspaceCore" in dependencies: errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
 for product in package.get("products", []):
-    if "RepoPromptWorkspaceCore" in product.get("targets", []):
-        errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
+    if "RepoPromptWorkspaceCore" in product.get("targets", []): errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
 
 for identity, (url, revision, product) in expected_packages.items():
     manifest_pin = f'.package(url: "{url}", revision: "{revision}")'
-    if manifest_pin not in manifest_text:
-        errors.append(f"Package.swift missing exact pin: {identity} {revision}")
+    if manifest_pin not in manifest_text: errors.append(f"Package.swift missing exact pin: {identity} {revision}")
     pin = resolved_pins.get(identity)
     if pin is None:
         errors.append(f"Package.resolved missing pin: {identity}")
@@ -224,34 +196,69 @@ for identity, (url, revision, product) in expected_packages.items():
     if (product, identity) not in repo_prompt_app_products:
         errors.append(f"RepoPromptApp missing upstream grammar product dependency: {product} ({identity})")
 
+wrapper = resolved_pins.get("swifttreesitter", {})
+if '.package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0")' not in manifest_text:
+    errors.append("Package.swift must pin SwiftTreeSitter exactly to 0.10.0")
+if wrapper.get("state", {}).get("version") != "0.10.0" or wrapper.get("state", {}).get("revision") != "f97df585296977d8fcaf644cbde567151d1367b8":
+    errors.append("SwiftTreeSitter resolved version/revision drifted")
+if ("SwiftTreeSitter", "SwiftTreeSitter") not in repo_prompt_app_products:
+    errors.append("RepoPromptApp missing direct SwiftTreeSitter product dependency")
+
+runtime = resolved_pins.get("tree-sitter", {})
+if runtime.get("location") != "https://github.com/tree-sitter/tree-sitter" or runtime.get("state", {}).get("version") != "0.25.10" or runtime.get("state", {}).get("revision") != "da6fe9beb4f7f67beb75914ca8e0d48ae48d6406":
+    errors.append("Tree-sitter runtime must resolve exactly to 0.25.10 / da6fe9beb4f7f67beb75914ca8e0d48ae48d6406")
+
+neon = resolved_pins.get("neon", {})
+if '.package(url: "https://github.com/ChimeHQ/Neon.git", revision: "07a325403534f4759c814aff0a58ac69144a524c")' not in manifest_text:
+    errors.append("Package.swift must retain the SwiftTreeSitter-0.10-compatible Neon revision")
+if neon.get("state", {}).get("revision") != "07a325403534f4759c814aff0a58ac69144a524c":
+    errors.append("Neon resolved revision drifted")
+
 support = targets.get("TreeSitterScannerSupport")
 if support is None:
     errors.append("TreeSitterScannerSupport target missing")
 else:
     if support.get("path") != "Sources/TreeSitterScannerSupport":
         errors.append("TreeSitterScannerSupport target path drifted")
-    expected_sources = ["src/javascript/scanner.c", "src/python/scanner.c"]
-    if sorted(support.get("sources", [])) != expected_sources:
+    if sorted(support.get("sources", [])) != ["src/javascript/scanner.c", "src/python/scanner.c"]:
         errors.append("TreeSitterScannerSupport sources must remain exactly JavaScript/Python scanner.c")
-if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in repo_prompt_app_dependencies):
-    errors.append("RepoPromptApp must directly depend on TreeSitterScannerSupport")
+if app_by_name_dependencies.count("TreeSitterScannerSupport") != 1:
+    errors.append("RepoPromptApp must directly depend exactly once on TreeSitterScannerSupport")
+
+syntax_source = Path("Sources/RepoPrompt/Infrastructure/SyntaxParsing/SyntaxManager.swift").read_text()
+required_imports = {
+    "SwiftTreeSitter", "TreeSitterC", "TreeSitterCPP", "TreeSitterCSharp", "TreeSitterDart",
+    "TreeSitterGo", "TreeSitterJava", "TreeSitterJavaScript", "TreeSitterPHP", "TreeSitterPython",
+    "TreeSitterRuby", "TreeSitterRust", "TreeSitterSwift", "TreeSitterTSX", "TreeSitterTypeScript",
+}
+for module in sorted(required_imports):
+    if f"import {module}\n" not in syntax_source: errors.append(f"SyntaxManager missing direct grammar/wrapper module import: {module}")
+bridging_header = Path("Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").read_text()
+if "tree_sitter_" in bridging_header or "TSLanguage" in bridging_header:
+    errors.append("bridging header must not redeclare Tree-sitter grammar APIs")
 
 if errors:
     raise SystemExit("\n".join(errors))
 PY
 )"; then
-  fail "TreeSitter grammar pin/product or scanner-support manifest contract drifted"
-  printf '%s\n' "$tree_sitter_scanner_support_manifest_output" >&2
+  fail "Tree-sitter dependency, product, or scanner-support contract drifted"
+  printf '%s\n' "$tree_sitter_dependency_manifest_output" >&2
 fi
 
 retired_tree_sitter_grammar_dirs=(
   "Sources/RepoPromptTreeSitterCGrammar"
+  "Sources/RepoPromptTreeSitterCSharpGrammar"
+  "Sources/RepoPromptTreeSitterCPPGrammar"
   "Sources/RepoPromptTreeSitterDartGrammar"
   "Sources/RepoPromptTreeSitterGoGrammar"
   "Sources/RepoPromptTreeSitterJavaGrammar"
   "Sources/RepoPromptTreeSitterJavaScriptGrammar"
+  "Sources/RepoPromptTreeSitterPHPGrammar"
   "Sources/RepoPromptTreeSitterPythonGrammar"
+  "Sources/RepoPromptTreeSitterRubyGrammar"
   "Sources/RepoPromptTreeSitterRustGrammar"
+  "Sources/RepoPromptTreeSitterSwiftGrammar"
+  "Sources/RepoPromptTreeSitterTypeScriptGrammar"
 )
 for dir in "${retired_tree_sitter_grammar_dirs[@]}"; do
   if [[ -e "$dir" ]]; then

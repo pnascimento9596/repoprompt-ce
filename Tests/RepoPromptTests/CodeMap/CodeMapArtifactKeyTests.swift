@@ -4,6 +4,62 @@ import Foundation
 import XCTest
 
 final class CodeMapArtifactKeyTests: XCTestCase {
+    func testConcurrentAllLanguageBuildsAndQueryInitializationAreDeterministic() async throws {
+        let samples: [LanguageType: String] = [
+            .swift: "struct Sample {}",
+            .js: "class Sample {}",
+            .c_sharp: "class Sample {}",
+            .python: "class Sample:\n    pass",
+            .c: "int sample(void) { return 0; }",
+            .rust: "fn sample() {}",
+            .cpp: "class Sample {};",
+            .go: "package sample\nfunc run() {}",
+            .java: "class Sample {}",
+            .dart: "class Sample {}",
+            .ts: "class Sample {}",
+            .tsx: "const Sample = () => <div />;",
+            .php: "<?php class Sample {}",
+            .ruby: "class Sample\nend"
+        ]
+        let manager = SyntaxManager()
+        let repetitions = 8
+        var concurrentResults: [LanguageType: [String]] = [:]
+
+        try await withThrowingTaskGroup(of: (LanguageType, String).self) { group in
+            for language in LanguageType.allCases {
+                let content = try XCTUnwrap(samples[language])
+                for _ in 0 ..< repetitions {
+                    group.addTask {
+                        let outcome = try CodeMapSyntaxArtifactBuilder.build(
+                            source: CodeMapFixtureRunner.makeSourceSnapshot(content: content),
+                            language: language,
+                            syntaxManager: manager
+                        )
+                        return try (language, Self.canonicalOutcome(outcome))
+                    }
+                }
+            }
+
+            for try await (language, outcome) in group {
+                concurrentResults[language, default: []].append(outcome)
+            }
+        }
+
+        XCTAssertEqual(Set(samples.keys), Set(LanguageType.allCases))
+        for language in LanguageType.allCases {
+            let outcomes = try XCTUnwrap(concurrentResults[language])
+            XCTAssertEqual(outcomes.count, repetitions, language.rawValue)
+            XCTAssertEqual(Set(outcomes).count, 1, language.rawValue)
+
+            let serialOutcome = try CodeMapSyntaxArtifactBuilder.build(
+                source: CodeMapFixtureRunner.makeSourceSnapshot(content: XCTUnwrap(samples[language])),
+                language: language,
+                syntaxManager: manager
+            )
+            XCTAssertEqual(outcomes.first, try Self.canonicalOutcome(serialOutcome), language.rawValue)
+        }
+    }
+
     func testLanguageRegistryCoversEveryLanguageAndUsesExactRegisteredQueryBytes() throws {
         let expected = expectedRegistrations()
         let packageManifest = try String(contentsOf: packageManifestURL(), encoding: .utf8)
@@ -333,63 +389,69 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         query: String
     )
 
+    private static func canonicalOutcome(_ outcome: CodeMapSyntaxArtifactOutcome) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try XCTUnwrap(String(data: encoder.encode(outcome), encoding: .utf8))
+    }
+
     private func expectedRegistrations() -> [LanguageType: ExpectedRegistration] {
         [
             .swift: (
                 .swift, "https://github.com/alex-pinkus/tree-sitter-swift",
-                "9253825dd2570430b53fa128cbb40cb62498e75d", swiftCodeMapQuery
+                "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5", swiftCodeMapQuery
             ),
             .js: (
                 .javascript, "https://github.com/tree-sitter/tree-sitter-javascript",
-                "39798e26b6d4dbcee8e522b8db83f8b2df33a5ea", javascriptCodeMapQuery
+                "44c892e0be055ac465d5eeddae6d3e194424e7de", javascriptCodeMapQuery
             ),
             .c_sharp: (
                 .cSharp, "https://github.com/tree-sitter/tree-sitter-c-sharp.git",
-                "b27b091bfdc5f16d0ef76421ea5609c82a57dff0", csharpCodeMapQuery
+                "cac6d5fb595f5811a076336682d5d595ac1c9e85", csharpCodeMapQuery
             ),
             .python: (
                 .python, "https://github.com/tree-sitter/tree-sitter-python",
-                "c5fca1a186e8e528115196178c28eefa8d86b0b0", pythonCodeMapQuery
+                "293fdc02038ee2bf0e2e206711b69c90ac0d413f", pythonCodeMapQuery
             ),
             .c: (
                 .c, "https://github.com/tree-sitter/tree-sitter-c",
-                "3efee11f784605d44623d7dadd6cd12a0f73ea92", cCodeMapQuery
+                "b780e47fc780ddc8da13afa35a3f4ed5c157823d", cCodeMapQuery
             ),
             .rust: (
                 .rust, "https://github.com/tree-sitter/tree-sitter-rust",
-                "2eaf126458a4d6a69401089b6ba78c5e5d6c1ced", rustCodeMapQuery
+                "77a3747266f4d621d0757825e6b11edcbf991ca5", rustCodeMapQuery
             ),
             .cpp: (
                 .cpp, "https://github.com/tree-sitter/tree-sitter-cpp",
-                "e5cea0ec884c5c3d2d1e41a741a66ce13da4d945", cppCodeMapQuery
+                "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02", cppCodeMapQuery
             ),
             .go: (
                 .go, "https://github.com/tree-sitter/tree-sitter-go",
-                "c350fa54d38af725c40d061a602ee3205ef1e072", goCodeMapQuery
+                "1547678a9da59885853f5f5cc8a99cc203fa2e2c", goCodeMapQuery
             ),
             .java: (
                 .java, "https://github.com/tree-sitter/tree-sitter-java",
-                "e10607b45ff745f5f876bfa3e94fbcc6b44bdc11", javaCodeMapQuery
+                "94703d5a6bed02b98e438d7cad1136c01a60ba2c", javaCodeMapQuery
             ),
             .dart: (
                 .dart, "https://github.com/UserNobody14/tree-sitter-dart",
-                "80e23c07b64494f7e21090bb3450223ef0b192f4", dartCodeMapQuery
+                "be07cf7118d3dba06236a3f19541685a68209934", dartCodeMapQuery
             ),
             .ts: (
                 .typescript, "https://github.com/tree-sitter/tree-sitter-typescript",
-                "75b3874edb2dc714fb1fd77a32013d0f8699989f", typeScriptCodeMapQuery
+                "f975a621f4e7f532fe322e13c4f79495e0a7b2e7", typeScriptCodeMapQuery
             ),
             .tsx: (
                 .tsx, "https://github.com/tree-sitter/tree-sitter-typescript",
-                "75b3874edb2dc714fb1fd77a32013d0f8699989f", typeScriptCodeMapQuery
+                "f975a621f4e7f532fe322e13c4f79495e0a7b2e7", typeScriptCodeMapQuery
             ),
             .php: (
                 .php, "https://github.com/provencher/tree-sitter-php",
-                "0a99deca13c4af1fb9adcb03c958bfc9f4c740a9", phpCodeMapQuery
+                "9d7d6f649297ee01639e759795793cc57698031b", phpCodeMapQuery
             ),
             .ruby: (
                 .ruby, "https://github.com/tree-sitter/tree-sitter-ruby",
-                "7a010836b74351855148818d5cb8170dc4df8e6a", rubyCodeMapQuery
+                "71bd32fb7607035768799732addba884a37a6210", rubyCodeMapQuery
             )
         ]
     }

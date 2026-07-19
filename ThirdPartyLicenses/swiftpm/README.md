@@ -16,7 +16,7 @@ also preserves the license for the compiled llhttp-derived C target.
 
 Tree-sitter grammar packages and `SwiftTreeSitter` use the separately curated
 [`../tree-sitter/`](../tree-sitter/) bundle. That bundle includes the linked
-grammar snapshots, wrapper license, embedded runtime license, and ICU subset
+grammar snapshots, wrapper license, resolved runtime license, and ICU subset
 notice. Its own `SHA256SUMS` file protects the complete curated bundle.
 
 [`SHA256SUMS`](SHA256SUMS) records checksums for the copied notice files. Run:

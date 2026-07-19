@@ -9,13 +9,17 @@ import CryptoKit
 import Foundation
 import SwiftTreeSitter
 import TreeSitterC
+import TreeSitterCPP
+import TreeSitterCSharp
 import TreeSitterDart
 import TreeSitterGo
 import TreeSitterJava
 import TreeSitterJavaScript
+import TreeSitterPHP
 import TreeSitterPython
 import TreeSitterRuby
 import TreeSitterRust
+import TreeSitterSwift
 import TreeSitterTSX
 import TreeSitterTypeScript
 
@@ -68,7 +72,7 @@ protocol CodeMapSyntaxQuerying {
     func codeMap(content: String, language: LanguageType) throws -> CodeMapSyntaxQueryOutcome
 }
 
-final class SyntaxManager: CodeMapSyntaxQuerying {
+final class SyntaxManager: CodeMapSyntaxQuerying, @unchecked Sendable {
     static let shared = SyntaxManager()
 
     private enum CodeMapQueryLookupStatus {
@@ -116,115 +120,124 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
                 CodeMapLanguageRecipe(
                     stableLanguageID: .swift,
                     displayName: "Swift",
-                    makeLanguage: { tree_sitter_swift().map(Language.init(language:)) },
-                    grammarRevision: "9253825dd2570430b53fa128cbb40cb62498e75d",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_swift()) },
+                    grammarRevision: "31d17fe7e818a2048c808b5c6fdc2dc792f4f5b5",
                     queryText: swiftCodeMapQuery
                 )
             case .js:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .javascript,
                     displayName: "JavaScript",
-                    makeLanguage: { tree_sitter_javascript().map(Language.init(language:)) },
-                    grammarRevision: "39798e26b6d4dbcee8e522b8db83f8b2df33a5ea",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_javascript()) },
+                    grammarRevision: "44c892e0be055ac465d5eeddae6d3e194424e7de",
                     queryText: javascriptCodeMapQuery
                 )
             case .c_sharp:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .cSharp,
                     displayName: "C#",
-                    makeLanguage: { tree_sitter_c_sharp().map(Language.init(language:)) },
-                    grammarRevision: "b27b091bfdc5f16d0ef76421ea5609c82a57dff0",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_c_sharp()) },
+                    grammarRevision: "cac6d5fb595f5811a076336682d5d595ac1c9e85",
                     queryText: csharpCodeMapQuery
                 )
             case .python:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .python,
                     displayName: "Python",
-                    makeLanguage: { tree_sitter_python().map(Language.init(language:)) },
-                    grammarRevision: "c5fca1a186e8e528115196178c28eefa8d86b0b0",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_python()) },
+                    grammarRevision: "293fdc02038ee2bf0e2e206711b69c90ac0d413f",
                     queryText: pythonCodeMapQuery
                 )
             case .c:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .c,
                     displayName: "C",
-                    makeLanguage: { tree_sitter_c().map(Language.init(language:)) },
-                    grammarRevision: "3efee11f784605d44623d7dadd6cd12a0f73ea92",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_c()) },
+                    grammarRevision: "b780e47fc780ddc8da13afa35a3f4ed5c157823d",
                     queryText: cCodeMapQuery
                 )
             case .rust:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .rust,
                     displayName: "Rust",
-                    makeLanguage: { tree_sitter_rust().map(Language.init(language:)) },
-                    grammarRevision: "2eaf126458a4d6a69401089b6ba78c5e5d6c1ced",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_rust()) },
+                    grammarRevision: "77a3747266f4d621d0757825e6b11edcbf991ca5",
                     queryText: rustCodeMapQuery
                 )
             case .cpp:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .cpp,
                     displayName: "C++",
-                    makeLanguage: { tree_sitter_cpp().map(Language.init(language:)) },
-                    grammarRevision: "e5cea0ec884c5c3d2d1e41a741a66ce13da4d945",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_cpp()) },
+                    grammarRevision: "f41e1a044c8a84ea9fa8577fdd2eab92ec96de02",
                     queryText: cppCodeMapQuery
                 )
             case .go:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .go,
                     displayName: "Go",
-                    makeLanguage: { tree_sitter_go().map(Language.init(language:)) },
-                    grammarRevision: "c350fa54d38af725c40d061a602ee3205ef1e072",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_go()) },
+                    grammarRevision: "1547678a9da59885853f5f5cc8a99cc203fa2e2c",
                     queryText: goCodeMapQuery
                 )
             case .java:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .java,
                     displayName: "Java",
-                    makeLanguage: { tree_sitter_java().map(Language.init(language:)) },
-                    grammarRevision: "e10607b45ff745f5f876bfa3e94fbcc6b44bdc11",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_java()) },
+                    grammarRevision: "94703d5a6bed02b98e438d7cad1136c01a60ba2c",
                     queryText: javaCodeMapQuery
                 )
             case .dart:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .dart,
                     displayName: "Dart",
-                    makeLanguage: { tree_sitter_dart().map(Language.init(language:)) },
-                    grammarRevision: "80e23c07b64494f7e21090bb3450223ef0b192f4",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_dart()) },
+                    grammarRevision: "be07cf7118d3dba06236a3f19541685a68209934",
                     queryText: dartCodeMapQuery
                 )
             case .ts:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .typescript,
                     displayName: "TypeScript",
-                    makeLanguage: { tree_sitter_typescript().map(Language.init(language:)) },
-                    grammarRevision: "75b3874edb2dc714fb1fd77a32013d0f8699989f",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_typescript()) },
+                    grammarRevision: "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
                     queryText: typeScriptCodeMapQuery
                 )
             case .tsx:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .tsx,
                     displayName: "TSX",
-                    makeLanguage: { tree_sitter_tsx().map(Language.init(language:)) },
-                    grammarRevision: "75b3874edb2dc714fb1fd77a32013d0f8699989f",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_tsx()) },
+                    grammarRevision: "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
                     queryText: typeScriptCodeMapQuery
                 )
             case .php:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .php,
                     displayName: "PHP",
-                    makeLanguage: { tree_sitter_php().map(Language.init(language:)) },
-                    grammarRevision: "0a99deca13c4af1fb9adcb03c958bfc9f4c740a9",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_php()) },
+                    grammarRevision: "9d7d6f649297ee01639e759795793cc57698031b",
                     queryText: phpCodeMapQuery
                 )
             case .ruby:
                 CodeMapLanguageRecipe(
                     stableLanguageID: .ruby,
                     displayName: "Ruby",
-                    makeLanguage: { tree_sitter_ruby().map(Language.init(language:)) },
-                    grammarRevision: "7a010836b74351855148818d5cb8170dc4df8e6a",
+                    makeLanguage: { wrapGrammarLanguage(tree_sitter_ruby()) },
+                    grammarRevision: "71bd32fb7607035768799732addba884a37a6210",
                     queryText: rubyCodeMapQuery
                 )
             }
+        }
+
+        private static func wrapGrammarLanguage(_ pointer: UnsafePointer<some Any>?) -> Language? {
+            guard let pointer else { return nil }
+            return Language(language: OpaquePointer(pointer))
+        }
+
+        private static func wrapGrammarLanguage(_ pointer: OpaquePointer?) -> Language? {
+            pointer.map(Language.init(language:))
         }
 
         static func lookup(for languageType: LanguageType) throws -> RegisteredCodeMapLanguageDescriptor {
@@ -399,23 +412,14 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
     /// Compatibility view derived from the authoritative registered query bytes.
     let codeMapQueries: [LanguageType: String]
 
-    /// Cache for language configurations. Highlight queries are intentionally not stored here;
-    /// use highlightQuery(for:language:) so they compile lazily outside codemap startup.
+    /// Cache for language configurations. SwiftTreeSitter's Language and Query values are immutable
+    /// and Sendable; only mutation of this dictionary requires synchronization.
+    private let languageConfigCacheLock = NSLock()
     private var languageConfigs: [LanguageType: LanguageConfiguration] = [:]
-
-    /// Serializes SwiftTreeSitter language/parser/query work. These wrappers own C pointers and
-    /// are shared through cached LanguageConfiguration/Query values, so keep their access one-at-a-time.
-    private let treeSitterExecutionLock = NSRecursiveLock()
 
     // Highlight queries are compiled lazily on first highlight use so codemap startup avoids highlight query work.
     private let highlightQueryCacheLock = NSLock()
     private var highlightQueryResults: [LanguageType: Result<Query, Error>] = [:]
-
-    private func withTreeSitterExecution<T>(_ operation: () throws -> T) rethrows -> T {
-        treeSitterExecutionLock.lock()
-        defer { treeSitterExecutionLock.unlock() }
-        return try operation()
-    }
 
     /// Returns a reason if the provided content should skip Tree-sitter parsing.
     func parsingOversizeReason(for content: String) -> ParseOversizeReason? {
@@ -546,7 +550,7 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             }
         }
 
-        withTreeSitterExecution {
+        languageConfigCacheLock.withLock {
             for languageType in Set(optimizedQueries.keys).union(codeMapQueries.keys).sorted() {
                 if collectPerf { startupStats.warmCacheLanguageCount += 1 }
                 if languageConfigs[languageType] == nil,
@@ -559,26 +563,20 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
     }
 
     /// Returns the LanguageConfiguration for a given file extension, or nil if unsupported.
-    /// Do not use the returned SwiftTreeSitter wrappers for parser/query execution outside SyntaxManager's gate.
     func languageConfig(forFileExtension ext: String) -> LanguageConfiguration? {
-        withTreeSitterExecution {
-            languageConfigUnlocked(forFileExtension: ext)
-        }
-    }
-
-    /// Returns the LanguageConfiguration while the Tree-sitter execution lock is already held.
-    private func languageConfigUnlocked(forFileExtension ext: String) -> LanguageConfiguration? {
         guard let language = language(forFileExtension: ext) else { return nil }
-        return languageConfigUnlocked(for: language)
+        return languageConfig(for: language)
     }
 
-    private func languageConfigUnlocked(for language: LanguageType) -> LanguageConfiguration? {
-        if let config = languageConfigs[language] { return config }
-        if let newConfig = createLanguageConfig(for: language) {
-            languageConfigs[language] = newConfig
-            return newConfig
+    private func languageConfig(for language: LanguageType) -> LanguageConfiguration? {
+        languageConfigCacheLock.withLock {
+            if let config = languageConfigs[language] { return config }
+            if let newConfig = createLanguageConfig(for: language) {
+                languageConfigs[language] = newConfig
+                return newConfig
+            }
+            return nil
         }
-        return nil
     }
 
     func language(forFileExtension fileExtension: String) -> LanguageType? {
@@ -586,18 +584,16 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
     }
 
     func codeMapPipelineDescriptor(for languageType: LanguageType) throws -> CodeMapLanguagePipelineDescriptor {
-        try withTreeSitterExecution {
-            let descriptor = try Self.RegisteredCodeMapLanguageStore.lookup(for: languageType)
-            guard let abiVersion = UInt32(exactly: descriptor.language.ABIVersion), abiVersion > 0 else {
-                throw CodeMapCanonicalIdentityError.invalidValue(field: "tree-sitter-abi")
-            }
-            return CodeMapLanguagePipelineDescriptor(
-                stableLanguageID: descriptor.stableLanguageID,
-                grammarRevision: descriptor.grammarRevision,
-                treeSitterABIVersion: abiVersion,
-                queryBytes: descriptor.queryBytes
-            )
+        let descriptor = try Self.RegisteredCodeMapLanguageStore.lookup(for: languageType)
+        guard let abiVersion = UInt32(exactly: descriptor.language.ABIVersion), abiVersion > 0 else {
+            throw CodeMapCanonicalIdentityError.invalidValue(field: "tree-sitter-abi")
         }
+        return CodeMapLanguagePipelineDescriptor(
+            stableLanguageID: descriptor.stableLanguageID,
+            grammarRevision: descriptor.grammarRevision,
+            treeSitterABIVersion: abiVersion,
+            queryBytes: descriptor.queryBytes
+        )
     }
 
     func pipelineIdentity(
@@ -690,12 +686,10 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             return nil
         }
 
-        return try withTreeSitterExecution {
-            guard let config = languageConfigUnlocked(forFileExtension: fileExtension) else { return nil }
-            let parser = Parser()
-            try parser.setLanguage(config.language)
-            return parser.parse(content)
-        }
+        guard let config = languageConfig(forFileExtension: fileExtension) else { return nil }
+        let parser = Parser()
+        try parser.setLanguage(config.language)
+        return parser.parse(content)
     }
 
     /// Runs the highlight query for a given file's content.
@@ -711,23 +705,21 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             return []
         }
 
-        return try withTreeSitterExecution {
-            guard let config = languageConfigUnlocked(forFileExtension: fileExtension) else { return [] }
-            let parser = Parser()
-            try parser.setLanguage(config.language)
+        guard let config = languageConfig(forFileExtension: fileExtension) else { return [] }
+        let parser = Parser()
+        try parser.setLanguage(config.language)
 
-            guard let tree = parser.parse(content),
-                  let root = tree.rootNode
-            else {
-                return []
-            }
-            guard let highlightLookup = try highlightQuery(for: langType, language: config.language) else {
-                return []
-            }
-
-            let cursor = highlightLookup.query.execute(node: root, in: tree)
-            return cursor.highlights()
+        guard let tree = parser.parse(content),
+              let root = tree.rootNode
+        else {
+            return []
         }
+        guard let highlightLookup = try highlightQuery(for: langType, language: config.language) else {
+            return []
+        }
+
+        let cursor = highlightLookup.query.execute(node: root, in: tree)
+        return cursor.highlights()
     }
 
     private func highlightQuery(for languageType: LanguageType, language: Language) throws -> HighlightQueryLookupResult? {
@@ -853,86 +845,84 @@ final class SyntaxManager: CodeMapSyntaxQuerying {
             return .oversize(Self.artifactOversizeReason(reason))
         }
 
-        return try withTreeSitterExecution {
-            let configLookupStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-            let config = languageConfigUnlocked(for: language)
-            if let configLookupStart {
-                syntaxPerf.languageLookupDuration += CodeMapPerfRuntime.durationSince(configLookupStart)
-            }
-            guard let config else {
-                if collectSyntaxPerf { syntaxPerf.unsupported += 1 }
-                if missingConfigurationReturnsEmptyCaptures {
-                    return .captures([])
-                }
-                throw Self.missingCodeMapQueryError(for: language)
-            }
-
-            let parserCreateStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-            let parser = Parser()
-            if let parserCreateStart {
-                syntaxPerf.parserCreateDuration += CodeMapPerfRuntime.durationSince(parserCreateStart)
-                syntaxPerf.parserCreates += 1
-            }
-
-            do {
-                let setLanguageStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-                defer {
-                    if let setLanguageStart {
-                        syntaxPerf.setLanguageDuration += CodeMapPerfRuntime.durationSince(setLanguageStart)
-                    }
-                }
-                try parser.setLanguage(config.language)
-            }
-
-            let parseStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-            let tree = parser.parse(content)
-            if let parseStart {
-                syntaxPerf.parseDuration += CodeMapPerfRuntime.durationSince(parseStart)
-            }
-            guard let tree else {
-                if collectSyntaxPerf { syntaxPerf.parseNilTree += 1 }
-                return .parseFailed(.parserReturnedNilTree)
-            }
-            guard let root = tree.rootNode else {
-                if collectSyntaxPerf { syntaxPerf.parseNilRoot += 1 }
-                return .parseFailed(.parserReturnedNilRoot)
-            }
-
-            let query: Query
-            do {
-                let queryLookupStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-                defer {
-                    if let queryLookupStart {
-                        syntaxPerf.codeMapQueryLookupDuration += CodeMapPerfRuntime.durationSince(queryLookupStart)
-                    }
-                }
-                let lookup = try codeMapQuery(for: language, language: config.language)
-                if collectSyntaxPerf {
-                    switch lookup.status {
-                    case .precomputedHit:
-                        syntaxPerf.codeMapQueryCacheHits += 1
-                    case .fallbackCompile:
-                        syntaxPerf.codeMapQueryCacheMisses += 1
-                    }
-                }
-                query = lookup.query
-            }
-
-            let queryExecuteStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-            let cursor = query.execute(node: root, in: tree)
-            if let queryExecuteStart {
-                syntaxPerf.queryExecuteDuration += CodeMapPerfRuntime.durationSince(queryExecuteStart)
-                syntaxPerf.queryExecutes += 1
-            }
-
-            let materializationStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
-            let captures = cursor.highlights()
-            if let materializationStart {
-                syntaxPerf.captureMaterializationDuration += CodeMapPerfRuntime.durationSince(materializationStart)
-                syntaxPerf.captures += captures.count
-            }
-            return .captures(captures)
+        let configLookupStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+        let config = languageConfig(for: language)
+        if let configLookupStart {
+            syntaxPerf.languageLookupDuration += CodeMapPerfRuntime.durationSince(configLookupStart)
         }
+        guard let config else {
+            if collectSyntaxPerf { syntaxPerf.unsupported += 1 }
+            if missingConfigurationReturnsEmptyCaptures {
+                return .captures([])
+            }
+            throw Self.missingCodeMapQueryError(for: language)
+        }
+
+        let parserCreateStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+        let parser = Parser()
+        if let parserCreateStart {
+            syntaxPerf.parserCreateDuration += CodeMapPerfRuntime.durationSince(parserCreateStart)
+            syntaxPerf.parserCreates += 1
+        }
+
+        do {
+            let setLanguageStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+            defer {
+                if let setLanguageStart {
+                    syntaxPerf.setLanguageDuration += CodeMapPerfRuntime.durationSince(setLanguageStart)
+                }
+            }
+            try parser.setLanguage(config.language)
+        }
+
+        let parseStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+        let tree = parser.parse(content)
+        if let parseStart {
+            syntaxPerf.parseDuration += CodeMapPerfRuntime.durationSince(parseStart)
+        }
+        guard let tree else {
+            if collectSyntaxPerf { syntaxPerf.parseNilTree += 1 }
+            return .parseFailed(.parserReturnedNilTree)
+        }
+        guard let root = tree.rootNode else {
+            if collectSyntaxPerf { syntaxPerf.parseNilRoot += 1 }
+            return .parseFailed(.parserReturnedNilRoot)
+        }
+
+        let query: Query
+        do {
+            let queryLookupStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+            defer {
+                if let queryLookupStart {
+                    syntaxPerf.codeMapQueryLookupDuration += CodeMapPerfRuntime.durationSince(queryLookupStart)
+                }
+            }
+            let lookup = try codeMapQuery(for: language, language: config.language)
+            if collectSyntaxPerf {
+                switch lookup.status {
+                case .precomputedHit:
+                    syntaxPerf.codeMapQueryCacheHits += 1
+                case .fallbackCompile:
+                    syntaxPerf.codeMapQueryCacheMisses += 1
+                }
+            }
+            query = lookup.query
+        }
+
+        let queryExecuteStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+        let cursor = query.execute(node: root, in: tree)
+        if let queryExecuteStart {
+            syntaxPerf.queryExecuteDuration += CodeMapPerfRuntime.durationSince(queryExecuteStart)
+            syntaxPerf.queryExecutes += 1
+        }
+
+        let materializationStart = collectSyntaxPerf ? CodeMapPerfRuntime.currentTime() : nil
+        let captures = cursor.highlights()
+        if let materializationStart {
+            syntaxPerf.captureMaterializationDuration += CodeMapPerfRuntime.durationSince(materializationStart)
+            syntaxPerf.captures += captures.count
+        }
+        return .captures(captures)
     }
 
     private static func artifactOversizeReason(_ reason: ParseOversizeReason) -> CodeMapSyntaxOversizeReason {
