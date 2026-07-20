@@ -216,7 +216,7 @@ struct CodeMapArtifactBuildCoordinatorPolicy: Equatable {
         maximumTotalWaiterCount: Int = 512,
         maximumWaitersPerFlight: Int = 64,
         maximumQueuedBuildCount: Int = 128,
-        maximumConcurrentBuildCount: Int = 1,
+        maximumConcurrentBuildCount: Int = FileSystemService.codeMapArtifactBuildBulkPermitLimit,
         maximumLocatorIdentitiesPerFlight: Int = 16,
         maximumRetainedInputByteCount: Int = 128 * 1024 * 1024,
         maximumPendingHookEventCount: Int = 256,
