@@ -144,6 +144,13 @@ repo_prompt_app_products = {
     for dependency in repo_prompt_app_dependencies
     if "product" in dependency
 }
+repo_prompt_code_map_core = targets.get("RepoPromptCodeMapCore", {})
+repo_prompt_code_map_core_dependencies = repo_prompt_code_map_core.get("dependencies", [])
+repo_prompt_code_map_core_products = {
+    (dependency["product"][0], dependency["product"][1])
+    for dependency in repo_prompt_code_map_core_dependencies
+    if "product" in dependency
+}
 
 if repo_prompt.get("type") != "executable":
     errors.append("RepoPrompt target must remain executable")
@@ -193,8 +200,8 @@ for identity, (url, revision, product) in expected_packages.items():
         errors.append(f"Package.resolved missing pin: {identity}")
     elif pin.get("location") != url or pin.get("state", {}).get("revision") != revision:
         errors.append(f"Package.resolved pin drift: {identity}")
-    if (product, identity) not in repo_prompt_app_products:
-        errors.append(f"RepoPromptApp missing upstream grammar product dependency: {product} ({identity})")
+    if (product, identity) not in repo_prompt_code_map_core_products:
+        errors.append(f"RepoPromptCodeMapCore missing upstream grammar product dependency: {product} ({identity})")
 
 wrapper = resolved_pins.get("swifttreesitter", {})
 if '.package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0")' not in manifest_text:
@@ -202,7 +209,9 @@ if '.package(url: "https://github.com/ChimeHQ/SwiftTreeSitter", exact: "0.10.0")
 if wrapper.get("state", {}).get("version") != "0.10.0" or wrapper.get("state", {}).get("revision") != "f97df585296977d8fcaf644cbde567151d1367b8":
     errors.append("SwiftTreeSitter resolved version/revision drifted")
 if ("SwiftTreeSitter", "SwiftTreeSitter") not in repo_prompt_app_products:
-    errors.append("RepoPromptApp missing direct SwiftTreeSitter product dependency")
+    errors.append("RepoPromptApp missing direct SwiftTreeSitter product dependency for highlighting")
+if ("SwiftTreeSitter", "SwiftTreeSitter") not in repo_prompt_code_map_core_products:
+    errors.append("RepoPromptCodeMapCore missing direct SwiftTreeSitter product dependency")
 
 runtime = resolved_pins.get("tree-sitter", {})
 if runtime.get("location") != "https://github.com/tree-sitter/tree-sitter" or runtime.get("state", {}).get("version") != "0.25.10" or runtime.get("state", {}).get("revision") != "da6fe9beb4f7f67beb75914ca8e0d48ae48d6406":
@@ -222,17 +231,41 @@ else:
         errors.append("TreeSitterScannerSupport target path drifted")
     if sorted(support.get("sources", [])) != ["src/javascript/scanner.c", "src/python/scanner.c"]:
         errors.append("TreeSitterScannerSupport sources must remain exactly JavaScript/Python scanner.c")
-if app_by_name_dependencies.count("TreeSitterScannerSupport") != 1:
-    errors.append("RepoPromptApp must directly depend exactly once on TreeSitterScannerSupport")
+core_by_name_dependencies = [
+    dependency["byName"][0]
+    for dependency in repo_prompt_code_map_core_dependencies
+    if dependency.get("byName")
+]
+if core_by_name_dependencies.count("TreeSitterScannerSupport") != 1:
+    errors.append("RepoPromptCodeMapCore must directly depend exactly once on TreeSitterScannerSupport")
+if app_by_name_dependencies.count("TreeSitterScannerSupport") != 0:
+    errors.append("RepoPromptApp must not directly depend on TreeSitterScannerSupport")
+if app_by_name_dependencies.count("RepoPromptCodeMapCore") != 1:
+    errors.append("RepoPromptApp must depend exactly once on RepoPromptCodeMapCore")
+
+code_map_core_tests = targets.get("RepoPromptCodeMapCoreTests", {})
+core_test_dependencies = [
+    dependency["byName"][0]
+    for dependency in code_map_core_tests.get("dependencies", [])
+    if dependency.get("byName")
+]
+if code_map_core_tests.get("path") != "Tests/RepoPromptCodeMapCoreTests":
+    errors.append("RepoPromptCodeMapCoreTests target path drifted")
+if core_test_dependencies != ["RepoPromptCodeMapCore"]:
+    errors.append("RepoPromptCodeMapCoreTests must depend only on RepoPromptCodeMapCore")
 
 syntax_source = Path("Sources/RepoPrompt/Infrastructure/SyntaxParsing/SyntaxManager.swift").read_text()
-required_imports = {
+core_syntax_source = Path("Sources/RepoPromptCodeMapCore/CodeMapSyntaxEngine.swift").read_text()
+if "import SwiftTreeSitter\n" not in syntax_source:
+    errors.append("SyntaxManager must retain direct SwiftTreeSitter import for highlighting")
+required_core_imports = {
     "SwiftTreeSitter", "TreeSitterC", "TreeSitterCPP", "TreeSitterCSharp", "TreeSitterDart",
     "TreeSitterGo", "TreeSitterJava", "TreeSitterJavaScript", "TreeSitterPHP", "TreeSitterPython",
     "TreeSitterRuby", "TreeSitterRust", "TreeSitterSwift", "TreeSitterTSX", "TreeSitterTypeScript",
 }
-for module in sorted(required_imports):
-    if f"import {module}\n" not in syntax_source: errors.append(f"SyntaxManager missing direct grammar/wrapper module import: {module}")
+for module in sorted(required_core_imports):
+    if f"import {module}\n" not in core_syntax_source:
+        errors.append(f"CodeMapSyntaxEngine missing direct grammar/wrapper module import: {module}")
 bridging_header = Path("Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").read_text()
 if "tree_sitter_" in bridging_header or "TSLanguage" in bridging_header:
     errors.append("bridging header must not redeclare Tree-sitter grammar APIs")
@@ -414,6 +447,7 @@ allowed_tracked_docs=(
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
   "docs/mcp-progress.md"
   "docs/migrations/swift-6-2-concurrency-migration-2026-07-18.md"
+  "docs/migrations/swift-6-2-concurrency/migration-ledger.md"
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"

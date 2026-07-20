@@ -27,6 +27,9 @@ import Foundation
 /// The main static struct that holds all regex patterns and
 /// top-level “matchAny…” methods for variables & functions.
 enum LanguageTypeExtractor {
+    // SAFETY: These immutable standard-library Regex values are initialized once
+    // and used only through nonmutating matching. Their type-erased outputs do
+    // not currently carry Sendable conformance.
     // MARK: - Swift Patterns
 
     /// Now allows optional `<...>` generics right after function name.
@@ -84,7 +87,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - C# Patterns
 
-    static let cSharpVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cSharpVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected|internal)?\s*
@@ -95,7 +98,7 @@ enum LanguageTypeExtractor {
     \s+(\**[A-Za-z_]\w*)
     """#)
 
-    static let cSharpFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cSharpFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected|internal)?\s*
@@ -110,7 +113,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Java
 
-    static let javaVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let javaVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected)?\s*
@@ -121,7 +124,7 @@ enum LanguageTypeExtractor {
     \s+([A-Za-z_]\w*)
     """#)
 
-    static let javaFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let javaFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:public|private|protected)?\s*
@@ -136,7 +139,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Dart
 
-    static let dartVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let dartVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:
@@ -149,7 +152,7 @@ enum LanguageTypeExtractor {
     )
     """#)
 
-    static let dartFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let dartFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^\s*
     (?:
@@ -162,7 +165,7 @@ enum LanguageTypeExtractor {
     .*$
     """#)
 
-    static let dartFactoryRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let dartFactoryRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^\s*
     factory\s+
@@ -172,7 +175,7 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
-    static let dartGetterSetterRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let dartGetterSetterRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^\s*
     (?:([A-Za-z_][A-Za-z0-9_<>\?]+)\s+)?   # group(1) => optional return type
@@ -183,7 +186,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - C
 
-    static let cVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:extern|static|register)?\s*
@@ -193,7 +196,7 @@ enum LanguageTypeExtractor {
     \s+([A-Za-z_]\w*)
     """#)
 
-    static let cFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:extern|static)?\s*
@@ -208,7 +211,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - C++ (leading-return + trailing-return)
 
-    static let cppVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cppVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:extern|static|register|thread_local)?\s*
@@ -220,7 +223,7 @@ enum LanguageTypeExtractor {
     \s+([A-Za-z_]\w*)
     """#)
 
-    static let cppFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cppFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:template\s*<[^>]*>\s*)?
@@ -233,7 +236,7 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
-    static let cppConstructorRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cppConstructorRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^\s*
     (?:template\s*<[^>]*>\s*)?
@@ -244,7 +247,7 @@ enum LanguageTypeExtractor {
     \)
     """#)
 
-    static let cppTrailingReturnFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let cppTrailingReturnFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:template\s*<[^>]*>\s*)?
@@ -263,12 +266,12 @@ enum LanguageTypeExtractor {
 
     /// Python variable: `name: Type`
     /// Output: (wholeMatch, varName, typeName)
-    static let pythonVariableRegex: Regex<(Substring, Substring, Substring)> =
+    nonisolated(unsafe) static let pythonVariableRegex: Regex<(Substring, Substring, Substring)> =
         #/^([A-Za-z_]\w*)\s*:\s*([A-Za-z_][A-Za-z0-9_\.\[\]\|]*)/#
 
     /// Python function: `(async )?def name(params)( -> returnType)?:`
     /// Output: (wholeMatch, funcName, paramList, returnType?)
-    static let pythonFunctionRegex: Regex<(Substring, Substring, Substring, Substring?)> =
+    nonisolated(unsafe) static let pythonFunctionRegex: Regex<(Substring, Substring, Substring, Substring?)> =
         #/^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)(?:\s*->\s*([A-Za-z_][A-Za-z0-9_\.\[\]\|\,\(\)\{\}\s]*))?\s*:.*$/#
 
     // MARK: - JavaScript/TypeScript (basic patterns)
@@ -433,7 +436,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Go
 
-    static let goVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let goVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:var|const)\s+
@@ -444,7 +447,7 @@ enum LanguageTypeExtractor {
     (?:\s*=\s*[^;]+)?
     """#)
 
-    static let goFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let goFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     func\s+
@@ -463,7 +466,7 @@ enum LanguageTypeExtractor {
 
     // MARK: - Rust
 
-    static let rustVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let rustVariableRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     let\s+(?:mut\s+)?
@@ -474,7 +477,7 @@ enum LanguageTypeExtractor {
     (?:\s*=\s*[^;]+)?
     """#)
 
-    static let rustFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
+    nonisolated(unsafe) static let rustFunctionRegex: Regex<AnyRegexOutput> = try! Regex(#"""
     (?xm)
     ^
     (?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?
@@ -494,23 +497,23 @@ enum LanguageTypeExtractor {
 
     /// C-style parameter decorators to remove (out, ref, in, const, etc.)
     /// Output: (wholeMatch, decorator)
-    private static let cStyleDecoratorRegex: Regex<(Substring, Substring)> = #/\b(out|ref|in|const|volatile|mutable|inout|__owned|__borrowed)\b/#
+    private nonisolated(unsafe) static let cStyleDecoratorRegex: Regex<(Substring, Substring)> = #/\b(out|ref|in|const|volatile|mutable|inout|__owned|__borrowed)\b/#
 
     /// Match last whitespace-separated word (for separating type from name)
     /// Output: wholeMatch only
-    private static let lastWordSeparatorRegex: Regex<Substring> = #/\s+[^\s]+$/#
+    private nonisolated(unsafe) static let lastWordSeparatorRegex: Regex<Substring> = #/\s+[^\s]+$/#
 
     /// Swift parameter decorators to remove (inout, __owned, etc.)
     /// Output: (wholeMatch, decorator)
-    private static let swiftDecoratorRegex: Regex<(Substring, Substring)> = #/\b(inout|__owned|__shared|__borrowed)\b/#
+    private nonisolated(unsafe) static let swiftDecoratorRegex: Regex<(Substring, Substring)> = #/\b(inout|__owned|__shared|__borrowed)\b/#
 
     /// Rust parameter decorators to remove (mut, ref)
     /// Output: (wholeMatch, decorator)
-    private static let rustDecoratorRegex: Regex<(Substring, Substring)> = #/\b(mut|ref)\b/#
+    private nonisolated(unsafe) static let rustDecoratorRegex: Regex<(Substring, Substring)> = #/\b(mut|ref)\b/#
 
     /// Multiple whitespace to normalize to single space
     /// Output: wholeMatch only
-    private static let multiWhitespaceRegex: Regex<Substring> = #/\s+/#
+    private nonisolated(unsafe) static let multiWhitespaceRegex: Regex<Substring> = #/\s+/#
 
     private static func normalizeWhitespaceRun(_ text: String) -> String {
         var out = ""
@@ -539,7 +542,7 @@ enum LanguageTypeExtractor {
     static func matchAnyVariableLine(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerfStats? = nil
+        stats: CodeMapPerformanceCollector? = nil
     ) -> [String: String]? {
         stats?.lteMatchAnyVariableCalls += 1
         let start = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
@@ -985,7 +988,7 @@ enum LanguageTypeExtractor {
         normalizeWhitespaceRun(line)
     }
 
-    fileprivate static func extractTSReturnType(from signature: String, stats: CodeMapPerfStats? = nil) -> String? {
+    fileprivate static func extractTSReturnType(from signature: String, stats: CodeMapPerformanceCollector? = nil) -> String? {
         let trimmed = normalizeTSLine(signature)
         guard !trimmed.isEmpty else { return nil }
         let hasFunctionKeyword = trimmed.range(of: #"\bfunction\b"#, options: .regularExpression) != nil
@@ -1089,7 +1092,7 @@ enum LanguageTypeExtractor {
     static func matchAnyFunctionLineParsed(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerfStats? = nil
+        stats: CodeMapPerformanceCollector? = nil
     ) -> FunctionLineMatch? {
         stats?.lteMatchAnyFunctionCalls += 1
         let start = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
@@ -1294,7 +1297,7 @@ enum LanguageTypeExtractor {
     static func matchAnyFunctionLine(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerfStats? = nil
+        stats: CodeMapPerformanceCollector? = nil
     ) -> [String: String]? {
         if !(language == .ts || language == .tsx) {
             stats?.lteMatchAnyFunctionCalls += 1
@@ -2114,7 +2117,7 @@ extension LanguageTypeExtractor {
             LanguageTypeExtractor.extractTSTypeAliasRHS(from: line)
         }
 
-        static func extractReturnType(from signature: String, stats: CodeMapPerfStats? = nil) -> String? {
+        static func extractReturnType(from signature: String, stats: CodeMapPerformanceCollector? = nil) -> String? {
             LanguageTypeExtractor.extractTSReturnType(from: signature, stats: stats)
         }
 

@@ -114,7 +114,7 @@ enum TypeCleaner {
         from rawType: String,
         language: LanguageType,
         cache: inout [TypeCleanerCacheKey: [String]],
-        stats: CodeMapPerfStats? = nil
+        stats: CodeMapPerformanceCollector? = nil
     ) -> [String] {
         extractBaseTypesCached(from: rawType, language: language, cache: &cache, stats: stats)
     }
@@ -123,9 +123,9 @@ enum TypeCleaner {
         from rawType: String,
         language: LanguageType,
         cache: inout [TypeCleanerCacheKey: [String]],
-        stats: CodeMapPerfStats? = nil
+        stats: CodeMapPerformanceCollector? = nil
     ) -> [String] {
-        let activeStats = CodeMapPerfRuntime.activeStats(stats)
+        let activeStats = stats
         let key = TypeCleanerCacheKey(language: language, raw: rawType)
         activeStats?.typeCleanerExtractCalls += 1
         if let cached = cache[key] {
@@ -150,7 +150,7 @@ enum TypeCleaner {
     private static func recordTypeCleanerLanguage(
         _ language: LanguageType,
         duration: TimeInterval,
-        stats: CodeMapPerfStats
+        stats: CodeMapPerformanceCollector
     ) {
         switch language {
         case .swift:
@@ -174,7 +174,7 @@ enum TypeCleaner {
     private static func recordTypeCleanerPhase(
         _ phase: TypeCleanerPhase,
         duration: TimeInterval,
-        stats: CodeMapPerfStats
+        stats: CodeMapPerformanceCollector
     ) {
         switch phase {
         case .preclean:
@@ -318,7 +318,7 @@ enum TypeCleaner {
         _ rawType: String,
         language: LanguageType,
         cache: inout [TypeCleanerCacheKey: [String]],
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> [String] {
         let precleanStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
         var type = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -513,7 +513,7 @@ enum TypeCleaner {
         _ rawType: String,
         language: LanguageType,
         cache: inout [TypeCleanerCacheKey: [String]],
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> [String] {
         let precleanStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
         var trimmed = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1039,7 +1039,7 @@ enum TypeCleaner {
         _ extracted: [String],
         language: LanguageType,
         cache: inout [TypeCleanerCacheKey: [String]],
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> [String] {
         let filterStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
         defer {
@@ -1268,7 +1268,7 @@ enum TypeCleaner {
         from typeName: String,
         language: LanguageType,
         cache: inout [TypeCleanerCacheKey: [String]],
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> [String] {
         let objectLiteralStart = stats == nil ? 0 : CFAbsoluteTimeGetCurrent()
         defer {

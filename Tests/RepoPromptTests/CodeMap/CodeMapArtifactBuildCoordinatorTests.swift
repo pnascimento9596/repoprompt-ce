@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import XCTest
 
 final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
@@ -484,6 +485,12 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
             return .readyNoSymbols
         }
         await assertTransientFailure { try await buildCoordinator.resolve(request(buildInput)) }
+        switch try await fixture.artifactStore.lookup(key: buildInput.artifactKey) {
+        case .miss:
+            break
+        case .hit:
+            XCTFail("Transient build failures must not insert an artifact into the store.")
+        }
         let buildRetry = try await buildCoordinator.resolve(request(buildInput))
         XCTAssertNotNil(ready(buildRetry))
 

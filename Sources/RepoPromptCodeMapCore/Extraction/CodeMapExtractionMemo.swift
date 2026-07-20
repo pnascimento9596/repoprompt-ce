@@ -34,7 +34,7 @@ struct CodeMapExtractionMemo {
     mutating func jstsSignature(
         from line: String,
         context: JSTSSignatureContext,
-        perfStats: CodeMapPerfStats?,
+        perfStats: CodeMapPerformanceCollector?,
         perfOptions: CodeMapPerfOptions
     ) -> String {
         let key = JSTSKey(contextRaw: Self.rawContext(context), line: line)
@@ -56,7 +56,7 @@ struct CodeMapExtractionMemo {
     mutating func matchFunctionLine(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> [String: String]? {
         let key = LanguageLineKey(language: language, line: line)
         if let cached = functionDictByKey[key] {
@@ -72,7 +72,7 @@ struct CodeMapExtractionMemo {
     mutating func matchFunctionLineParsed(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> LanguageTypeExtractor.FunctionLineMatch? {
         let key = LanguageLineKey(language: language, line: line)
         if let cached = functionParsedByKey[key] {
@@ -88,7 +88,7 @@ struct CodeMapExtractionMemo {
     mutating func matchVariableLine(
         _ line: String,
         language: LanguageType,
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> [String: String]? {
         let key = LanguageLineKey(language: language, line: line)
         if let cached = variableDictByKey[key] {
@@ -103,7 +103,7 @@ struct CodeMapExtractionMemo {
 
     mutating func tsReturnType(
         from signature: String,
-        stats: CodeMapPerfStats?
+        stats: CodeMapPerformanceCollector?
     ) -> String? {
         if let cached = tsReturnTypeByLine[signature] {
             stats?.extractionMemoTSFastPathHits += 1
@@ -115,7 +115,7 @@ struct CodeMapExtractionMemo {
         return result
     }
 
-    mutating func tsTypeAnnotation(from line: String, stats: CodeMapPerfStats?) -> String? {
+    mutating func tsTypeAnnotation(from line: String, stats: CodeMapPerformanceCollector?) -> String? {
         if let cached = tsTypeAnnotationByLine[line] {
             stats?.extractionMemoTSFastPathHits += 1
             return Self.unwrap(cached)
@@ -126,7 +126,7 @@ struct CodeMapExtractionMemo {
         return result
     }
 
-    mutating func tsTypeAliasRHS(from line: String, stats: CodeMapPerfStats?) -> String? {
+    mutating func tsTypeAliasRHS(from line: String, stats: CodeMapPerformanceCollector?) -> String? {
         if let cached = tsTypeAliasRHSByLine[line] {
             stats?.extractionMemoTSFastPathHits += 1
             return Self.unwrap(cached)

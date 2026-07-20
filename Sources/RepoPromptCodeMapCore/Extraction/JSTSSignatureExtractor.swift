@@ -31,7 +31,7 @@ enum JSTSSignatureExtractor {
     static func extract(
         from line: String,
         context: JSTSSignatureContext,
-        perfStats: CodeMapPerfStats? = nil,
+        perfStats: CodeMapPerformanceCollector? = nil,
         perfOptions: CodeMapPerfOptions = .disabled
     ) -> String {
         if perfOptions.collectCounters {

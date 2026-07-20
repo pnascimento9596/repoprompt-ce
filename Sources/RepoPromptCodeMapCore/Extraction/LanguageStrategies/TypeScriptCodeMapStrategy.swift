@@ -158,11 +158,11 @@ enum TypeScriptCodeMapStrategy {
         globalVariables: inout [VariableInfo],
         referencedTypes: inout ReferencedTypesAccumulator,
         extractionMemo: inout CodeMapExtractionMemo,
-        perfStats: CodeMapPerfStats? = nil,
+		perfStats: CodeMapPerformanceCollector? = nil,
         perfOptions: CodeMapPerfOptions = .disabled
     ) -> Bool {
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
-        let activePerfOptions = CodeMapPerfRuntime.activeOptions(perfOptions)
+		let activePerfStats = perfStats
+		let activePerfOptions = perfOptions
 
         switch cap.name {
 		// MARK: TS Class Members
@@ -325,7 +325,7 @@ enum TypeScriptCodeMapStrategy {
 
     private static func isBetter(_ candidate: NSRange, than current: NSRange) -> Bool {
         if candidate.length != current.length {
-            return candidate.length < current.length
+			return candidate.length < current.length
         }
         return candidate.location < current.location
     }
@@ -359,9 +359,9 @@ enum TypeScriptCodeMapStrategy {
         language: LanguageType,
         referencedTypes: inout ReferencedTypesAccumulator,
         extractionMemo: inout CodeMapExtractionMemo,
-        perfStats: CodeMapPerfStats? = nil
+		perfStats: CodeMapPerformanceCollector? = nil
     ) -> (name: String, parameters: [ParameterInfo], returnType: String?) {
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
+		let activePerfStats = perfStats
         guard let match = extractionMemo.matchFunctionLineParsed(line, language: language, stats: activePerfStats) else {
             return (fallbackName, [], nil)
         }
@@ -390,9 +390,9 @@ enum TypeScriptCodeMapStrategy {
         language: LanguageType,
         referencedTypes: inout ReferencedTypesAccumulator,
         extractionMemo: inout CodeMapExtractionMemo,
-        perfStats: CodeMapPerfStats? = nil
+		perfStats: CodeMapPerformanceCollector? = nil
     ) -> String? {
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
+		let activePerfStats = perfStats
         if language == .ts || language == .tsx {
             if let typeName = extractionMemo.tsTypeAnnotation(from: line, stats: activePerfStats) {
                 activePerfStats?.tsTypeAnnotationFastPathHits += 1
@@ -414,11 +414,11 @@ enum TypeScriptCodeMapStrategy {
         _ line: String,
         context: JSTSSignatureContext,
         extractionMemo: inout CodeMapExtractionMemo,
-        perfStats: CodeMapPerfStats? = nil,
+		perfStats: CodeMapPerformanceCollector? = nil,
         perfOptions: CodeMapPerfOptions = .disabled
     ) -> String {
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
-        let activePerfOptions = CodeMapPerfRuntime.activeOptions(perfOptions)
+		let activePerfStats = perfStats
+		let activePerfOptions = perfOptions
         let extracted = extractionMemo.jstsSignature(
             from: line,
             context: context,
@@ -489,7 +489,7 @@ enum TypeScriptCodeMapStrategy {
             case "=":
                 if angleDepth == 0, parenDepth == 0, braceDepth == 0, squareDepth == 0 {
                     let next = input.index(after: i)
-                    if next < input.endIndex {
+					if next < input.endIndex {
                         let nextChar = input[next]
                         if nextChar == ">" || nextChar == "=" {
                             i = next

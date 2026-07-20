@@ -47,10 +47,11 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
     "RepoPromptShared",
-    "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
+    "RepoPromptC", "CSwiftPCRE2",
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
     .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
@@ -58,19 +59,6 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "Markdown", package: "swift-markdown"),
     .product(name: "MCP", package: "swift-sdk"),
     .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
-    .product(name: "TreeSitterC", package: "tree-sitter-c"),
-    .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
-    .product(name: "TreeSitterGo", package: "tree-sitter-go"),
-    .product(name: "TreeSitterJava", package: "tree-sitter-java"),
-    .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
-    .product(name: "TreeSitterPython", package: "tree-sitter-python"),
-    .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
-    .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
-    .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
-    .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
-    .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
-    .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
-    .product(name: "TreeSitterPHP", package: "tree-sitter-php"),
     .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
     .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
     .product(name: "Neon", package: "Neon"),
@@ -92,6 +80,7 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
+    "RepoPromptCodeMapCore",
     "RepoPromptMCP",
     "RepoPromptShared"
 ]
@@ -142,6 +131,31 @@ let package = Package(
             swiftSettings: swift5CompleteConcurrencyChecking
         ),
         .target(
+            name: "RepoPromptCodeMapCore",
+            dependencies: [
+                "RepoPromptRegexCore",
+                "TreeSitterScannerSupport",
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
+                .product(name: "TreeSitterC", package: "tree-sitter-c"),
+                .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
+                .product(name: "TreeSitterGo", package: "tree-sitter-go"),
+                .product(name: "TreeSitterJava", package: "tree-sitter-java"),
+                .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
+                .product(name: "TreeSitterPython", package: "tree-sitter-python"),
+                .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
+                .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
+                .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
+                .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
+                .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
+                .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
+                .product(name: "TreeSitterPHP", package: "tree-sitter-php")
+            ],
+            path: "Sources/RepoPromptCodeMapCore",
+            swiftSettings: swift5CompleteConcurrencyChecking + [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .target(
             name: "RepoPromptApp",
             dependencies: repoPromptAppDependencies,
             path: "Sources/RepoPrompt",
@@ -176,13 +190,21 @@ let package = Package(
             swiftSettings: swift5CompleteConcurrencyChecking
         ),
         .testTarget(
+            name: "RepoPromptCodeMapCoreTests",
+            dependencies: ["RepoPromptCodeMapCore"],
+            path: "Tests/RepoPromptCodeMapCoreTests",
+            resources: [
+                .copy("Fixtures"),
+                .copy("Goldens")
+            ],
+            swiftSettings: swift5CompleteConcurrencyChecking + [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .testTarget(
             name: "RepoPromptTests",
             dependencies: repoPromptTestDependencies,
             path: "Tests/RepoPromptTests",
-            resources: [
-                .copy("CodeMap/Fixtures"),
-                .copy("CodeMap/Goldens")
-            ],
             swiftSettings: repoPromptTestSwiftSettings
         )
     ],

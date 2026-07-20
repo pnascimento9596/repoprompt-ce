@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-enum CodeMapCanonicalIdentityError: Error, Equatable {
+package enum CodeMapCanonicalIdentityError: Error, Equatable, Sendable {
     case inputTooLarge
     case truncated(field: String)
     case invalidDomain
@@ -19,30 +19,36 @@ enum CodeMapCanonicalIdentityError: Error, Equatable {
     case nonCanonicalEncoding
 }
 
-struct CodeMapSHA256Digest: Hashable {
-    static let byteCount = 32
+package struct CodeMapSHA256Digest: Hashable, Sendable {
+    package static let byteCount = 32
 
-    let bytes: Data
+    package let bytes: Data
 
-    init(bytes: Data) throws {
+    package init(bytes: Data) throws {
         guard bytes.count == Self.byteCount else {
             throw CodeMapCanonicalIdentityError.invalidValue(field: "sha256")
         }
         self.bytes = bytes
     }
 
-    var lowercaseHex: String {
+    package var lowercaseHex: String {
         bytes.map { String(format: "%02x", $0) }.joined()
     }
 }
 
-struct CodeMapSemanticVersion: Hashable {
-    let major: UInt32
-    let minor: UInt32
-    let patch: UInt32
+package struct CodeMapSemanticVersion: Hashable, Sendable {
+    package let major: UInt32
+    package let minor: UInt32
+    package let patch: UInt32
+
+    package init(major: UInt32, minor: UInt32, patch: UInt32) {
+        self.major = major
+        self.minor = minor
+        self.patch = patch
+    }
 }
 
-enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable {
+package enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable, Sendable {
     case swift
     case javascript
     case cSharp = "c-sharp"
@@ -59,27 +65,37 @@ enum CodeMapPipelineLanguageID: String, CaseIterable, Hashable {
     case ruby
 }
 
-struct CodeMapPipelineNamedLimit: Hashable {
-    let name: String
-    let value: UInt64
+package struct CodeMapPipelineNamedLimit: Hashable, Sendable {
+    package let name: String
+    package let value: UInt64
+
+    package init(name: String, value: UInt64) {
+        self.name = name
+        self.value = value
+    }
 }
 
-struct CodeMapPipelineNamedFlag: Hashable {
-    let name: String
-    let enabled: Bool
+package struct CodeMapPipelineNamedFlag: Hashable, Sendable {
+    package let name: String
+    package let enabled: Bool
+
+    package init(name: String, enabled: Bool) {
+        self.name = name
+        self.enabled = enabled
+    }
 }
 
-struct CodeMapPipelineIdentity: Hashable {
-    static let domain = "codemap-pipeline-identity-v1"
+package struct CodeMapPipelineIdentity: Hashable, Sendable {
+    package static let domain = "codemap-pipeline-identity-v1"
 
-    static let requiredLimitNames = [
+    package static let requiredLimitNames = [
         "jsts-max-appended-continuation-lines",
         "parse-line-count",
         "parse-utf16-code-units",
         "parse-utf8-bytes"
     ]
 
-    static let requiredFlagNames = [
+    package static let requiredFlagNames = [
         "filename-main-class-shaping",
         "jsts-signature-extraction",
         "lightweight-extraction",
@@ -91,19 +107,19 @@ struct CodeMapPipelineIdentity: Hashable {
     private static let maximumCanonicalByteCount = 16 * 1024
     private static let maximumStableIdentifierByteCount = 64
 
-    let languageID: CodeMapPipelineLanguageID
-    let decoderPolicy: CodeMapSourceDecoderPolicy
-    let grammarRevision: String
-    let treeSitterABIVersion: UInt32
-    let codeMapQuerySHA256: CodeMapSHA256Digest
-    let extractorVersion: CodeMapSemanticVersion
-    let generatorVersion: CodeMapSemanticVersion
-    let artifactSchemaVersion: UInt32
-    let oversizeParsePolicyVersion: UInt32
-    let limits: [CodeMapPipelineNamedLimit]
-    let flags: [CodeMapPipelineNamedFlag]
+    package let languageID: CodeMapPipelineLanguageID
+    package let decoderPolicy: CodeMapSourceDecoderPolicy
+    package let grammarRevision: String
+    package let treeSitterABIVersion: UInt32
+    package let codeMapQuerySHA256: CodeMapSHA256Digest
+    package let extractorVersion: CodeMapSemanticVersion
+    package let generatorVersion: CodeMapSemanticVersion
+    package let artifactSchemaVersion: UInt32
+    package let oversizeParsePolicyVersion: UInt32
+    package let limits: [CodeMapPipelineNamedLimit]
+    package let flags: [CodeMapPipelineNamedFlag]
 
-    init(
+    package init(
         languageID: CodeMapPipelineLanguageID,
         decoderPolicy: CodeMapSourceDecoderPolicy,
         grammarRevision: String,
@@ -148,7 +164,7 @@ struct CodeMapPipelineIdentity: Hashable {
         self.flags = try Self.validatedFlags(flags)
     }
 
-    init(canonicalBytes: Data) throws {
+    package init(canonicalBytes: Data) throws {
         guard canonicalBytes.count <= Self.maximumCanonicalByteCount else {
             throw CodeMapCanonicalIdentityError.inputTooLarge
         }
@@ -211,7 +227,7 @@ struct CodeMapPipelineIdentity: Hashable {
         }
     }
 
-    var canonicalBytes: Data {
+    package var canonicalBytes: Data {
         var writer = CodeMapCanonicalWriter()
         writer.appendDomain(Self.domain)
         writer.appendString(languageID.rawValue)
@@ -277,16 +293,19 @@ struct CodeMapPipelineIdentity: Hashable {
     }
 }
 
-struct CodeMapArtifactKey: Hashable {
-    static let domain = "codemap-artifact-key-v1"
+package struct CodeMapArtifactKey: Hashable, Sendable {
+    package static let domain = "codemap-artifact-key-v1"
 
     private static let maximumCanonicalByteCount = 32 * 1024
 
-    let rawSHA256: CodeMapRawSourceDigest
-    let rawByteCount: UInt64
-    let pipelineIdentity: CodeMapPipelineIdentity
+    package let rawSHA256: CodeMapRawSourceDigest
+    package let rawByteCount: UInt64
+    package let pipelineIdentity: CodeMapPipelineIdentity
 
-    init(source: CodeMapSourceSnapshot, pipelineIdentity: CodeMapPipelineIdentity) throws {
+    package init(
+        source: CodeMapCoreSourceSnapshot,
+        pipelineIdentity: CodeMapPipelineIdentity
+    ) throws {
         guard source.decoderPolicy == pipelineIdentity.decoderPolicy else {
             throw CodeMapCanonicalIdentityError.invalidValue(field: "decoder-policy-mismatch")
         }
@@ -300,7 +319,7 @@ struct CodeMapArtifactKey: Hashable {
         )
     }
 
-    init(
+    package init(
         rawSHA256: CodeMapRawSourceDigest,
         rawByteCount: UInt64,
         pipelineIdentity: CodeMapPipelineIdentity
@@ -310,7 +329,7 @@ struct CodeMapArtifactKey: Hashable {
         self.pipelineIdentity = pipelineIdentity
     }
 
-    init(canonicalBytes: Data) throws {
+    package init(canonicalBytes: Data) throws {
         guard canonicalBytes.count <= Self.maximumCanonicalByteCount else {
             throw CodeMapCanonicalIdentityError.inputTooLarge
         }
@@ -340,7 +359,7 @@ struct CodeMapArtifactKey: Hashable {
         }
     }
 
-    var canonicalBytes: Data {
+    package var canonicalBytes: Data {
         let pipelineBytes = pipelineIdentity.canonicalBytes
         precondition(pipelineBytes.count <= Int(UInt32.max))
         var writer = CodeMapCanonicalWriter()
@@ -352,15 +371,15 @@ struct CodeMapArtifactKey: Hashable {
         return writer.data
     }
 
-    var storageDigest: CodeMapSHA256Digest {
+    package var storageDigest: CodeMapSHA256Digest {
         try! CodeMapSHA256Digest(bytes: Data(SHA256.hash(data: canonicalBytes)))
     }
 
-    var storageDigestHex: String {
+    package var storageDigestHex: String {
         storageDigest.lowercaseHex
     }
 
-    var shard: String {
+    package var shard: String {
         String(storageDigestHex.prefix(2))
     }
 }

@@ -57,7 +57,7 @@ enum SwiftCodeMapStrategy {
         _ category: SwiftStrategyAttributionCategory,
         duration: TimeInterval,
         count: Int = 1,
-        perfStats: CodeMapPerfStats?
+		perfStats: CodeMapPerformanceCollector?
     ) {
         guard let perfStats else { return }
         switch category {
@@ -260,9 +260,9 @@ enum SwiftCodeMapStrategy {
         globalVariables: inout [VariableInfo],
         referencedTypes: inout ReferencedTypesAccumulator,
         captureDeclaration: (NSRange, Character) -> String,
-        perfStats: CodeMapPerfStats? = nil
+		perfStats: CodeMapPerformanceCollector? = nil
     ) -> Bool {
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
+		let activePerfStats = perfStats
         let perfEnabled = activePerfStats != nil
 
         switch cap.name {
@@ -765,7 +765,7 @@ enum SwiftCodeMapStrategy {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func extractSwiftReturnType(from signature: String, perfStats: CodeMapPerfStats? = nil) -> String? {
+	private static func extractSwiftReturnType(from signature: String, perfStats: CodeMapPerformanceCollector? = nil) -> String? {
         if let fast = SwiftSignatureParser.extractReturnType(from: signature) {
             perfStats?.swiftReturnTypeFastPathHits += 1
             return fast
@@ -779,7 +779,7 @@ enum SwiftCodeMapStrategy {
         return nil
     }
 
-    private static func extractSwiftPropertyType(from declaration: String, perfStats: CodeMapPerfStats? = nil) -> String? {
+	private static func extractSwiftPropertyType(from declaration: String, perfStats: CodeMapPerformanceCollector? = nil) -> String? {
         if let match = LanguageTypeExtractor.matchAnyVariableLine(declaration, language: .swift, stats: perfStats),
            let propType = match["type"],
            !propType.isEmpty
@@ -792,7 +792,7 @@ enum SwiftCodeMapStrategy {
     private static func extractSwiftPropertyDeclaration(
         from identifierRange: NSRange,
         index: CodeMapCaptureIndex,
-        nsContent: NSString,
+		nsContent: NSString,
         fallback: () -> String
     ) -> String {
         let declCap = index.smallestCapture(

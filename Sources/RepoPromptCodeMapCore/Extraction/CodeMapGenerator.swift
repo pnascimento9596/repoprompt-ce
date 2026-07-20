@@ -72,7 +72,7 @@ struct CodeMapGenerator {
     private static func recordCaptureLoopLineAdvance(
         duration: TimeInterval,
         collectCounters: Bool,
-        perfStats: CodeMapPerfStats?
+        perfStats: CodeMapPerformanceCollector?
     ) {
         guard let perfStats else { return }
         perfStats.captureLoopLineAdvanceDuration += duration
@@ -85,7 +85,7 @@ struct CodeMapGenerator {
         category: CaptureLoopAttributionCategory,
         duration: TimeInterval,
         collectCounters: Bool,
-        perfStats: CodeMapPerfStats?
+        perfStats: CodeMapPerformanceCollector?
     ) {
         guard let perfStats else { return }
         switch category {
@@ -138,7 +138,7 @@ struct CodeMapGenerator {
         category: FallbackFunctionAttributionCategory,
         duration: TimeInterval,
         collectCounters: Bool,
-        perfStats: CodeMapPerfStats?
+        perfStats: CodeMapPerformanceCollector?
     ) {
         guard let perfStats else { return }
         switch category {
@@ -296,7 +296,7 @@ struct CodeMapGenerator {
         content: String,
         language: LanguageType,
         perfOptions: CodeMapPerfOptions = .disabled,
-        perfStats: CodeMapPerfStats? = nil
+        perfStats: CodeMapPerformanceCollector? = nil
     ) -> CodeMapSyntaxArtifact? {
         let output = extractCodeMap(
             from: namedRanges,
@@ -323,12 +323,12 @@ struct CodeMapGenerator {
         language supportedLanguage: LanguageType,
         terminator: Character,
         perfOptions: CodeMapPerfOptions,
-        perfStats: CodeMapPerfStats?
+        perfStats: CodeMapPerformanceCollector?
     ) -> GenerationOutput {
         // ------------------------------------------------------------------
         // 0) Early setup & helpers
         // ------------------------------------------------------------------
-        let isLightweightLang = SyntaxManager.isLightweight(language: supportedLanguage)
+        let isLightweightLang = CodeMapSyntaxEngine.isLightweight(language: supportedLanguage)
 
         // BUG FIX #1: Split TS/TSX from JS for proper routing
         let isTSLike = (supportedLanguage == .ts || supportedLanguage == .tsx)
@@ -351,8 +351,8 @@ struct CodeMapGenerator {
         let contentLength = nsContent.length
         var lineCache = LineCache(nsContent: nsContent, boundaries: boundaries, contentLength: contentLength)
         var extractionMemo = CodeMapExtractionMemo()
-        let activePerfOptions = CodeMapPerfRuntime.activeOptions(perfOptions)
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
+        let activePerfOptions = perfOptions
+        let activePerfStats = perfStats
         let perfEnabled = activePerfOptions.enabled
         let perfCollectCounters = activePerfOptions.collectCounters
 
@@ -2088,11 +2088,11 @@ struct CodeMapGenerator {
         terminator: Character,
         jsTsContext: JSTSSignatureContext? = nil,
         returnRawJSTS: Bool = false,
-        perfStats: CodeMapPerfStats? = nil,
+        perfStats: CodeMapPerformanceCollector? = nil,
         perfOptions: CodeMapPerfOptions = .disabled
     ) -> String {
-        let activePerfOptions = CodeMapPerfRuntime.activeOptions(perfOptions)
-        let activePerfStats = CodeMapPerfRuntime.activeStats(perfStats)
+        let activePerfOptions = perfOptions
+        let activePerfStats = perfStats
         let perfEnabled = activePerfOptions.enabled
         let perfCollectCounters = activePerfOptions.collectCounters
         if perfCollectCounters {

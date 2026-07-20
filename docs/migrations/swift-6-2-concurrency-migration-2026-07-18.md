@@ -2,6 +2,8 @@
 
 ## Goal
 
+Living implementation evidence is recorded in [`swift-6-2-concurrency/migration-ledger.md`](swift-6-2-concurrency/migration-ledger.md).
+
 Move RepoPrompt CE’s root and provider packages from Swift 5 language mode to Swift 6.2 concurrency safety through target-scoped, behavior-preserving phases. First isolate the deterministic CodeMap parsing/extraction pipeline into an internal headless target so it can be validated and migrated without pulling CAS, Git authority, workspace seeding, or app presentation across the boundary.
 
 ## Background

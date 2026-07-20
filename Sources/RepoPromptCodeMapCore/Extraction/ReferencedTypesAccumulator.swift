@@ -12,10 +12,10 @@ struct ReferencedTypesAccumulator {
     private(set) var types: Set<String> = []
     private var cache: [TypeCleaner.TypeCleanerCacheKey: [String]] = [:]
     private var rawInsertCount = 0
-    private let stats: CodeMapPerfStats?
+    private let stats: CodeMapPerformanceCollector?
     private let perfOptions: CodeMapPerfOptions
 
-    init(language: LanguageType, stats: CodeMapPerfStats? = nil, perfOptions: CodeMapPerfOptions = .disabled) {
+    init(language: LanguageType, stats: CodeMapPerformanceCollector? = nil, perfOptions: CodeMapPerfOptions = .disabled) {
         self.language = language
         self.stats = stats
         self.perfOptions = perfOptions
@@ -23,8 +23,8 @@ struct ReferencedTypesAccumulator {
 
     mutating func insert(rawType: String?) {
         guard let raw = rawType?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
-        let activePerfOptions = CodeMapPerfRuntime.activeOptions(perfOptions)
-        let activeStats = CodeMapPerfRuntime.activeStats(stats)
+        let activePerfOptions = perfOptions
+        let activeStats = stats
         let perfEnabled = activePerfOptions.enabled
         let perfCollectCounters = activePerfOptions.collectCounters
         rawInsertCount += 1

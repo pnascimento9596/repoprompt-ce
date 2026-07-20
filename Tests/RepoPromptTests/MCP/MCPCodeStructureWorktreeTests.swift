@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
 import RepoPromptShared
 import XCTest
 

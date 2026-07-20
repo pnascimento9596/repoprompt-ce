@@ -2,63 +2,115 @@ import Foundation
 
 // MARK: - Source-derived symbol values
 
-struct InterfaceInfo: Codable, Equatable {
-    let name: String
-    var properties: [PropertyInfo] = []
-    var methods: [FunctionInfo] = []
+package struct InterfaceInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package var properties: [PropertyInfo]
+    package var methods: [FunctionInfo]
+
+    package init(name: String, properties: [PropertyInfo] = [], methods: [FunctionInfo] = []) {
+        self.name = name
+        self.properties = properties
+        self.methods = methods
+    }
 }
 
-struct TypeAliasInfo: Codable, Equatable {
-    let name: String
-    let definitionLine: String
+package struct TypeAliasInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package let definitionLine: String
+
+    package init(name: String, definitionLine: String) {
+        self.name = name
+        self.definitionLine = definitionLine
+    }
 }
 
-struct ClassInfo: Codable, Equatable {
-    let name: String
-    var methods: [FunctionInfo]
-    var properties: [PropertyInfo]
+package struct ClassInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package var methods: [FunctionInfo]
+    package var properties: [PropertyInfo]
+
+    package init(name: String, methods: [FunctionInfo], properties: [PropertyInfo]) {
+        self.name = name
+        self.methods = methods
+        self.properties = properties
+    }
 }
 
-struct FunctionInfo: Codable, Equatable {
-    let name: String
-    var parameters: [ParameterInfo]
-    var returnType: String?
-    let definitionLine: String
-    let lineNumber: Int?
+package struct FunctionInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package var parameters: [ParameterInfo]
+    package var returnType: String?
+    package let definitionLine: String
+    package let lineNumber: Int?
+
+    package init(
+        name: String,
+        parameters: [ParameterInfo],
+        returnType: String?,
+        definitionLine: String,
+        lineNumber: Int?
+    ) {
+        self.name = name
+        self.parameters = parameters
+        self.returnType = returnType
+        self.definitionLine = definitionLine
+        self.lineNumber = lineNumber
+    }
 }
 
-struct ParameterInfo: Codable, Equatable {
-    let externalName: String?
-    let localName: String
-    var typeName: String?
+package struct ParameterInfo: Codable, Equatable, Sendable {
+    package let externalName: String?
+    package let localName: String
+    package var typeName: String?
+
+    package init(externalName: String?, localName: String, typeName: String?) {
+        self.externalName = externalName
+        self.localName = localName
+        self.typeName = typeName
+    }
 }
 
-struct PropertyInfo: Codable, Equatable {
-    let name: String
-    let typeName: String?
+package struct PropertyInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package let typeName: String?
+
+    package init(name: String, typeName: String?) {
+        self.name = name
+        self.typeName = typeName
+    }
 }
 
-struct VariableInfo: Codable, Equatable {
-    let name: String
-    let typeName: String?
-    let definitionLine: String
+package struct VariableInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package let typeName: String?
+    package let definitionLine: String
+
+    package init(name: String, typeName: String?, definitionLine: String) {
+        self.name = name
+        self.typeName = typeName
+        self.definitionLine = definitionLine
+    }
 }
 
-struct EnumInfo: Codable, Equatable {
-    let name: String
-    var cases: [String]
+package struct EnumInfo: Codable, Equatable, Sendable {
+    package let name: String
+    package var cases: [String]
+
+    package init(name: String, cases: [String]) {
+        self.name = name
+        self.cases = cases
+    }
 }
 
 // MARK: - Shared path-free formatting
 
-struct CodeMapAPIContentSummary {
-    let apiDescription: String
-    let apiTokenCount: Int
-    let definedTypeNames: Set<String>
+package struct CodeMapAPIContentSummary: Sendable {
+    package let apiDescription: String
+    package let definedTypeNames: Set<String>
 }
 
-enum CodeMapAPIContentFormatter {
-    static func summarize(
+package enum CodeMapAPIContentFormatter {
+    package static func summarize(
         classes: [ClassInfo],
         interfaces: [InterfaceInfo],
         aliases: [TypeAliasInfo],
@@ -179,41 +231,35 @@ enum CodeMapAPIContentFormatter {
             .union(enums.map(\.name))
         return CodeMapAPIContentSummary(
             apiDescription: apiDescription,
-            apiTokenCount: TokenCalculationService.estimateTokens(for: apiDescription),
             definedTypeNames: definedTypeNames
         )
-    }
-
-    static func pathAndImportsBlock(displayPath: String, imports: [String]) -> String {
-        (["File: \(displayPath)", "Imports:"] + imports.map { "  - \($0)" }).joined(separator: "\n")
     }
 }
 
 // MARK: - Immutable path-free artifact
 
-struct CodeMapSyntaxArtifact: Codable, Equatable {
-    let imports: [String]
-    let exports: [String]
-    let classes: [ClassInfo]
-    let interfaces: [InterfaceInfo]
-    let aliases: [TypeAliasInfo]
-    let literalUnions: [String]
-    let functions: [FunctionInfo]
-    let enums: [EnumInfo]
-    let globalVars: [VariableInfo]
-    let macros: [String]
-    let referencedTypes: [String]
+package struct CodeMapSyntaxArtifact: Codable, Equatable, Sendable {
+    package let imports: [String]
+    package let exports: [String]
+    package let classes: [ClassInfo]
+    package let interfaces: [InterfaceInfo]
+    package let aliases: [TypeAliasInfo]
+    package let literalUnions: [String]
+    package let functions: [FunctionInfo]
+    package let enums: [EnumInfo]
+    package let globalVars: [VariableInfo]
+    package let macros: [String]
+    package let referencedTypes: [String]
 
-    let apiDescription: String
-    let apiTokenCount: Int
-    let definedTypeNames: Set<String>
+    package let apiDescription: String
+    package let definedTypeNames: Set<String>
 
     private enum CodingKeys: String, CodingKey {
         case imports, exports, classes, interfaces, aliases, literalUnions,
              functions, enums, globalVars, macros, referencedTypes
     }
 
-    init(
+    package init(
         imports: [String],
         exports: [String] = [],
         classes: [ClassInfo],
@@ -250,11 +296,10 @@ struct CodeMapSyntaxArtifact: Codable, Equatable {
             macros: macros
         )
         apiDescription = summary.apiDescription
-        apiTokenCount = summary.apiTokenCount
         definedTypeNames = summary.definedTypeNames
     }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(
             imports: container.decode([String].self, forKey: .imports),
@@ -272,7 +317,7 @@ struct CodeMapSyntaxArtifact: Codable, Equatable {
     }
 }
 
-enum CodeMapSyntaxOversizeReason: Codable, Equatable {
+package enum CodeMapSyntaxOversizeReason: Codable, Equatable, Sendable {
     case utf8Bytes(actual: Int, limit: Int)
     case utf16Units(actual: Int, limit: Int)
     case lines(actual: Int, limit: Int)
@@ -280,7 +325,7 @@ enum CodeMapSyntaxOversizeReason: Codable, Equatable {
     private enum CodingKeys: String, CodingKey { case kind, actual, limit }
     private enum Kind: String, Codable { case utf8Bytes, utf16Units, lines }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let actual = try container.decode(Int.self, forKey: .actual)
         let limit = try container.decode(Int.self, forKey: .limit)
@@ -291,7 +336,7 @@ enum CodeMapSyntaxOversizeReason: Codable, Equatable {
         }
     }
 
-    func encode(to encoder: Encoder) throws {
+    package func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case let .utf8Bytes(actual, limit):
@@ -310,12 +355,12 @@ enum CodeMapSyntaxOversizeReason: Codable, Equatable {
     }
 }
 
-enum CodeMapSyntaxParseFailure: String, Codable, Equatable {
+package enum CodeMapSyntaxParseFailure: String, Codable, Equatable, Sendable {
     case parserReturnedNilTree
     case parserReturnedNilRoot
 }
 
-enum CodeMapSyntaxArtifactOutcome: Codable, Equatable {
+package enum CodeMapSyntaxArtifactOutcome: Codable, Equatable, Sendable {
     case ready(CodeMapSyntaxArtifact)
     case readyNoSymbols
     case oversize(CodeMapSyntaxOversizeReason)
@@ -325,7 +370,7 @@ enum CodeMapSyntaxArtifactOutcome: Codable, Equatable {
     private enum CodingKeys: String, CodingKey { case kind, artifact, reason, failure }
     private enum Kind: String, Codable { case ready, readyNoSymbols, oversize, decodeFailed, parseFailed }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Kind.self, forKey: .kind) {
         case .ready:
@@ -341,7 +386,7 @@ enum CodeMapSyntaxArtifactOutcome: Codable, Equatable {
         }
     }
 
-    func encode(to encoder: Encoder) throws {
+    package func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case let .ready(artifact):

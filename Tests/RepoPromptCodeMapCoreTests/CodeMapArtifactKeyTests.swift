@@ -1,6 +1,6 @@
 import CryptoKit
 import Foundation
-@testable import RepoPromptApp
+@testable import RepoPromptCodeMapCore
 import XCTest
 
 final class CodeMapArtifactKeyTests: XCTestCase {
@@ -21,7 +21,7 @@ final class CodeMapArtifactKeyTests: XCTestCase {
             .php: "<?php class Sample {}",
             .ruby: "class Sample\nend"
         ]
-        let manager = SyntaxManager()
+        let manager = CodeMapSyntaxEngine()
         let repetitions = 8
         var concurrentResults: [LanguageType: [String]] = [:]
 
@@ -33,7 +33,7 @@ final class CodeMapArtifactKeyTests: XCTestCase {
                         let outcome = try CodeMapSyntaxArtifactBuilder.build(
                             source: CodeMapFixtureRunner.makeSourceSnapshot(content: content),
                             language: language,
-                            syntaxManager: manager
+                            syntaxEngine: manager
                         )
                         return try (language, Self.canonicalOutcome(outcome))
                     }
@@ -54,7 +54,7 @@ final class CodeMapArtifactKeyTests: XCTestCase {
             let serialOutcome = try CodeMapSyntaxArtifactBuilder.build(
                 source: CodeMapFixtureRunner.makeSourceSnapshot(content: XCTUnwrap(samples[language])),
                 language: language,
-                syntaxManager: manager
+                syntaxEngine: manager
             )
             XCTAssertEqual(outcomes.first, try Self.canonicalOutcome(serialOutcome), language.rawValue)
         }
@@ -63,38 +63,38 @@ final class CodeMapArtifactKeyTests: XCTestCase {
     func testLanguageRegistryCoversEveryLanguageAndUsesExactRegisteredQueryBytes() throws {
         let expected = expectedRegistrations()
         let packageManifest = try String(contentsOf: packageManifestURL(), encoding: .utf8)
-        let manager = SyntaxManager()
+        let manager = CodeMapSyntaxEngine()
         var stableIDs = Set<CodeMapPipelineLanguageID>()
 
         XCTAssertEqual(Set(expected.keys), Set(LanguageType.allCases))
         for language in LanguageType.allCases {
-            try XCTContext.runActivity(named: language.rawValue) { _ in
-                let registration = try XCTUnwrap(expected[language])
-                let descriptor = try manager.codeMapPipelineDescriptor(for: language)
-                let identity = try manager.pipelineIdentity(for: language, decoderPolicy: .workspaceAutomaticV1)
+            let registration = try XCTUnwrap(expected[language])
+            let descriptor = try manager.codeMapPipelineDescriptor(for: language)
+            let identity = try manager.pipelineIdentity(for: language, decoderPolicy: .workspaceAutomaticV1)
 
-                XCTAssertEqual(descriptor.stableLanguageID, registration.stableID)
-                XCTAssertTrue(stableIDs.insert(descriptor.stableLanguageID).inserted)
-                XCTAssertEqual(descriptor.grammarRevision, registration.revision)
-                XCTAssertTrue(
-                    packageManifest.contains(
-                        ".package(url: \"\(registration.packageURL)\", revision: \"\(registration.revision)\")"
-                    )
-                )
-                XCTAssertEqual(descriptor.queryBytes, Data(registration.query.utf8))
-                XCTAssertGreaterThan(descriptor.treeSitterABIVersion, 0)
-                XCTAssertEqual(identity.languageID, descriptor.stableLanguageID)
-                XCTAssertEqual(identity.grammarRevision, descriptor.grammarRevision)
-                XCTAssertEqual(identity.treeSitterABIVersion, descriptor.treeSitterABIVersion)
-                XCTAssertEqual(
-                    identity.codeMapQuerySHA256.bytes,
-                    Data(SHA256.hash(data: Data(registration.query.utf8)))
-                )
-                XCTAssertEqual(identity.limits, referenceLimits())
-                XCTAssertEqual(identity.flags, referenceFlags(for: registration.stableID).map { name, value in
-                    CodeMapPipelineNamedFlag(name: name, enabled: value == 1)
-                })
-            }
+            XCTAssertEqual(descriptor.stableLanguageID, registration.stableID, language.rawValue)
+            XCTAssertTrue(stableIDs.insert(descriptor.stableLanguageID).inserted, language.rawValue)
+            XCTAssertEqual(descriptor.grammarRevision, registration.revision, language.rawValue)
+            XCTAssertTrue(
+                packageManifest.contains(
+                    ".package(url: \"\(registration.packageURL)\", revision: \"\(registration.revision)\")"
+                ),
+                language.rawValue
+            )
+            XCTAssertEqual(descriptor.queryBytes, Data(registration.query.utf8), language.rawValue)
+            XCTAssertGreaterThan(descriptor.treeSitterABIVersion, 0, language.rawValue)
+            XCTAssertEqual(identity.languageID, descriptor.stableLanguageID, language.rawValue)
+            XCTAssertEqual(identity.grammarRevision, descriptor.grammarRevision, language.rawValue)
+            XCTAssertEqual(identity.treeSitterABIVersion, descriptor.treeSitterABIVersion, language.rawValue)
+            XCTAssertEqual(
+                identity.codeMapQuerySHA256.bytes,
+                Data(SHA256.hash(data: Data(registration.query.utf8))),
+                language.rawValue
+            )
+            XCTAssertEqual(identity.limits, referenceLimits(), language.rawValue)
+            XCTAssertEqual(identity.flags, referenceFlags(for: registration.stableID).map { name, value in
+                CodeMapPipelineNamedFlag(name: name, enabled: value == 1)
+            }, language.rawValue)
         }
 
         let ts = try manager.codeMapPipelineDescriptor(for: .ts)
@@ -105,15 +105,15 @@ final class CodeMapArtifactKeyTests: XCTestCase {
     }
 
     func testCanonicalPipelineAndKeyMatchIndependentReferenceEncoder() throws {
-        let identity = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
+        let identity = try CodeMapSyntaxEngine().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
         let referencePipeline = referencePipelineBytes(identity)
 
         XCTAssertEqual(identity.canonicalBytes, referencePipeline)
         XCTAssertEqual(try CodeMapPipelineIdentity(canonicalBytes: referencePipeline), identity)
         XCTAssertEqual(try CodeMapPipelineIdentity(canonicalBytes: referencePipeline).canonicalBytes, referencePipeline)
 
-        let source = makeSource(data: Data(SwiftFixtureSource.emptyStruct("ReferenceEncoder", trailingNewline: false).utf8))
-        let key = try CodeMapArtifactKey(source: source, pipelineIdentity: identity)
+        let source = makeSource(data: Data("struct ReferenceEncoder {}".utf8))
+        let key = try makeKey(source: source, pipelineIdentity: identity)
         let referenceKey = referenceKeyBytes(
             rawDigest: source.rawSHA256.bytes,
             rawByteCount: UInt64(source.rawByteCount),
@@ -168,11 +168,11 @@ final class CodeMapArtifactKeyTests: XCTestCase {
                 data: Data("decoder mismatch".utf8),
                 decoderPolicy: .testOnlyMismatch
             )
-            let identity = try SyntaxManager().pipelineIdentity(
+            let identity = try CodeMapSyntaxEngine().pipelineIdentity(
                 for: .swift,
                 decoderPolicy: .workspaceAutomaticV1
             )
-            XCTAssertThrowsError(try CodeMapArtifactKey(source: source, pipelineIdentity: identity)) {
+            XCTAssertThrowsError(try makeKey(source: source, pipelineIdentity: identity)) {
                 XCTAssertEqual(
                     $0 as? CodeMapCanonicalIdentityError,
                     .invalidValue(field: "decoder-policy-mismatch")
@@ -181,31 +181,10 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         }
     #endif
 
-    func testKeyUsesRawSnapshotProvenanceWithoutRereadOrValidationIdentity() throws {
-        let identity = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
-        let utf8 = Data("same text".utf8)
-        var utf16 = Data([0xFF, 0xFE])
-        try utf16.append(XCTUnwrap("same text".data(using: .utf16LittleEndian)))
-
-        let first = makeSource(data: utf8, fingerprintSeed: 1)
-        let repeated = makeSource(data: utf8, fingerprintSeed: 999)
-        let alternateEncoding = makeSource(data: utf16, fingerprintSeed: 1)
-        let firstKey = try CodeMapArtifactKey(source: first, pipelineIdentity: identity)
-        let repeatedKey = try CodeMapArtifactKey(source: repeated, pipelineIdentity: identity)
-        let alternateKey = try CodeMapArtifactKey(source: alternateEncoding, pipelineIdentity: identity)
-
-        XCTAssertEqual(firstKey, repeatedKey)
-        XCTAssertEqual(firstKey.storageDigest, repeatedKey.storageDigest)
-        XCTAssertNotEqual(firstKey, alternateKey)
-        XCTAssertNotEqual(firstKey.rawSHA256, alternateKey.rawSHA256)
-        XCTAssertNotEqual(firstKey.rawByteCount, alternateKey.rawByteCount)
-        XCTAssertEqual(decodedText(first), decodedText(alternateEncoding))
-    }
-
     func testEveryPipelineComponentLimitAndFlagChangesCanonicalKey() throws {
-        let baseline = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
+        let baseline = try CodeMapSyntaxEngine().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
         let source = makeSource(data: Data("func componentMutation() {}".utf8))
-        let baselineKey = try CodeMapArtifactKey(source: source, pipelineIdentity: baseline)
+        let baselineKey = try makeKey(source: source, pipelineIdentity: baseline)
         var mutations: [(String, CodeMapPipelineIdentity)] = []
 
         try mutations.append(("language", copyIdentity(baseline, languageID: .python)))
@@ -241,12 +220,10 @@ final class CodeMapArtifactKeyTests: XCTestCase {
         }
 
         for (name, mutation) in mutations {
-            try XCTContext.runActivity(named: name) { _ in
-                let key = try CodeMapArtifactKey(source: source, pipelineIdentity: mutation)
-                XCTAssertNotEqual(mutation.canonicalBytes, baseline.canonicalBytes)
-                XCTAssertNotEqual(key.canonicalBytes, baselineKey.canonicalBytes)
-                XCTAssertNotEqual(key.storageDigest, baselineKey.storageDigest)
-            }
+            let key = try makeKey(source: source, pipelineIdentity: mutation)
+            XCTAssertNotEqual(mutation.canonicalBytes, baseline.canonicalBytes, name)
+            XCTAssertNotEqual(key.canonicalBytes, baselineKey.canonicalBytes, name)
+            XCTAssertNotEqual(key.storageDigest, baselineKey.storageDigest, name)
         }
 
         let alternateDecoderBytes = referencePipelineBytes(baseline, decoderPolicyID: "workspace-automatic-v2")
@@ -273,7 +250,7 @@ final class CodeMapArtifactKeyTests: XCTestCase {
     }
 
     func testStrictPipelineDecoderRejectsNoncanonicalAndMalformedInputs() throws {
-        let identity = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
+        let identity = try CodeMapSyntaxEngine().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
         let canonical = identity.canonicalBytes
 
         for byteCount in 0 ..< canonical.count {
@@ -345,9 +322,9 @@ final class CodeMapArtifactKeyTests: XCTestCase {
     }
 
     func testStrictKeyDecoderRejectsNoncanonicalFraming() throws {
-        let identity = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
+        let identity = try CodeMapSyntaxEngine().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
         let source = makeSource(data: Data("let framing = true".utf8))
-        let canonical = try CodeMapArtifactKey(source: source, pipelineIdentity: identity).canonicalBytes
+        let canonical = try makeKey(source: source, pipelineIdentity: identity).canonicalBytes
 
         for byteCount in 0 ..< canonical.count {
             XCTAssertThrowsError(try CodeMapArtifactKey(canonicalBytes: canonical.prefix(byteCount)))
@@ -368,8 +345,8 @@ final class CodeMapArtifactKeyTests: XCTestCase {
     func testStorageDigestAndShardAreIdentityFreeDigestOnlyNames() throws {
         let sentinel = "/private/root/WORKTREE-SESSION-source.swift"
         let source = makeSource(data: Data(sentinel.utf8))
-        let identity = try SyntaxManager().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
-        let key = try CodeMapArtifactKey(source: source, pipelineIdentity: identity)
+        let identity = try CodeMapSyntaxEngine().pipelineIdentity(for: .swift, decoderPolicy: .workspaceAutomaticV1)
+        let key = try makeKey(source: source, pipelineIdentity: identity)
 
         XCTAssertEqual(key.storageDigestHex.count, 64)
         XCTAssertTrue(key.storageDigestHex.allSatisfy { $0.isNumber || ("a" ... "f").contains($0) })
@@ -620,36 +597,31 @@ final class CodeMapArtifactKeyTests: XCTestCase {
 
     private func makeSource(
         data: Data,
-        fingerprintSeed: Int64 = 1,
         decoderPolicy: CodeMapSourceDecoderPolicy = .workspaceAutomaticV1
-    ) -> CodeMapSourceSnapshot {
-        let fingerprint = FileContentFingerprint(
-            deviceID: UInt64(fingerprintSeed),
-            fileNumber: UInt64(fingerprintSeed + 1),
-            byteSize: Int64(data.count),
-            modificationSeconds: fingerprintSeed + 2,
-            modificationNanoseconds: fingerprintSeed + 3,
-            statusChangeSeconds: fingerprintSeed + 4,
-            statusChangeNanoseconds: fingerprintSeed + 5
-        )
-        return CodeMapSourceSnapshot(
-            validatedContent: ValidatedRawFileContentSnapshot(
-                data: data,
-                modificationDate: Date(timeIntervalSince1970: TimeInterval(fingerprintSeed + 2)),
-                fingerprint: fingerprint
-            ),
-            decoderPolicy: decoderPolicy
+    ) -> CodeMapCoreSourceSnapshot {
+        let text = String(data: data, encoding: .utf8) ?? ""
+        return CodeMapCoreSourceSnapshot(
+            rawByteCount: data.count,
+            rawSHA256: CodeMapRawSourceDigest(bytes: Data(SHA256.hash(data: data))),
+            decoderPolicy: decoderPolicy,
+            decodeResult: .decoded(
+                CodeMapDecodedSource(
+                    text: text,
+                    detectedEncodingRawValue: String.Encoding.utf8.rawValue
+                )
+            )
         )
     }
 
-    private func decodedText(_ snapshot: CodeMapSourceSnapshot) -> String? {
-        guard case let .decoded(decoded) = snapshot.decodeResult else { return nil }
-        return decoded.text
+    private func makeKey(
+        source: CodeMapCoreSourceSnapshot,
+        pipelineIdentity: CodeMapPipelineIdentity
+    ) throws -> CodeMapArtifactKey {
+        try CodeMapArtifactKey(source: source, pipelineIdentity: pipelineIdentity)
     }
 
     private func packageManifestURL() -> URL {
         URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
