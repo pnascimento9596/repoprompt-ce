@@ -535,7 +535,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             planModelName: planModelName,
                             workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
-                            progressReporter: progressReporter
+                            progressReporter: progressReporter,
+                            activityReporter: activityReporter
                         )
                     }
                 }

@@ -1183,6 +1183,8 @@ actor ServerNetworkManager {
         let reason: String?
         let createdAt: Date
         let ttl: TimeInterval
+        /// Run-owned policies are consumed or explicitly revoked at settlement, never by age alone.
+        let prunesOnlyAfterSettlement: Bool
         // Tab context for Context Builder agents
         let tabID: UUID?
         let runID: UUID?
@@ -4269,7 +4271,9 @@ actor ServerNetworkManager {
         let now = Date()
         var removedCount = 0
         for (clientID, policies) in pendingPoliciesByClient {
-            let filtered = policies.filter { now.timeIntervalSince($0.createdAt) < $0.ttl }
+            let filtered = policies.filter {
+                $0.prunesOnlyAfterSettlement || now.timeIntervalSince($0.createdAt) < $0.ttl
+            }
             if filtered.isEmpty {
                 pendingPoliciesByClient.removeValue(forKey: clientID)
                 removedCount += policies.count
@@ -5701,6 +5705,7 @@ actor ServerNetworkManager {
         connectionIDBySessionToken.removeAll()
         sessionTokenBindingGeneration.removeAll()
         transportTerminalConnections.removeAll()
+        signalRoutingOwnershipLossBeforeReset()
         resetInMemoryRoutingCachesForRestart()
         for (connectionID, _) in connectionsToStop {
             terminalRecordClaimsByConnectionID.removeValue(forKey: connectionID)
@@ -5754,6 +5759,16 @@ actor ServerNetworkManager {
             }
         }
         emitDashboardUpdate()
+    }
+
+    /// Resolve parked indefinite routing waits before their policy/PID ownership is erased.
+    private func signalRoutingOwnershipLossBeforeReset() {
+        let pendingRunIDs = pendingPoliciesByClient.values
+            .flatMap { $0.compactMap(\.runID) }
+        let ownedRunIDs = Set(pendingRunIDs).union(runPolicyStateByRunID.keys)
+        for runID in ownedRunIDs {
+            MCPRoutingWaiter.signalFailed(runID)
+        }
     }
 
     private func resetInMemoryRoutingCachesForRestart() {
@@ -6558,6 +6573,8 @@ actor ServerNetworkManager {
             connectionLog("Cancelled \(cancelledToolCount) active tool execution(s) owned by disconnected connection \(id)")
         }
 
+        let finalResponseDeliverySnapshot =
+            await connections[id]?.responseDeliverySnapshot() ?? responseDeliverySnapshot
         let didDetachContextBuilderContext = await Self.finishReadFileAutoSelectionAndRemoveTabContext(
             connectionID: id,
             clientName: cleanupClientName,
@@ -6565,7 +6582,7 @@ actor ServerNetworkManager {
             contextBuilderRunID: cleanupRunPurpose == .discoverRun ? cleanupRunID : nil,
             detachContextBuilderRunID: detachContextBuilderRunID,
             closeContext: context,
-            responseDeliverySnapshot: responseDeliverySnapshot
+            responseDeliverySnapshot: finalResponseDeliverySnapshot
         )
         #if DEBUG
             if cleanupRunPurpose == .discoverRun, let cleanupRunID {
@@ -7192,7 +7209,8 @@ actor ServerNetworkManager {
         purpose: MCPRunPurpose = .unknown,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
-        requiresExpectedAgentPID: Bool = false
+        requiresExpectedAgentPID: Bool = false,
+        prunesOnlyAfterSettlement: Bool = false
     ) async {
         let storageKey = Self.clientStorageKey(clientName)
         pruneExpiredPolicies(for: clientName)
@@ -7205,6 +7223,7 @@ actor ServerNetworkManager {
             reason: reason,
             createdAt: Date(),
             ttl: ttl,
+            prunesOnlyAfterSettlement: prunesOnlyAfterSettlement,
             tabID: tabID,
             runID: runID,
             additionalTools: additionalTools,
@@ -9800,7 +9819,9 @@ actor ServerNetworkManager {
         let now = Date()
         for key in keys {
             guard var queue = pendingPoliciesByClient[key], !queue.isEmpty else { continue }
-            queue.removeAll { now.timeIntervalSince($0.createdAt) > $0.ttl }
+            queue.removeAll {
+                !$0.prunesOnlyAfterSettlement && now.timeIntervalSince($0.createdAt) > $0.ttl
+            }
             if queue.isEmpty {
                 pendingPoliciesByClient.removeValue(forKey: key)
             } else {

@@ -10,6 +10,8 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             .childConnectionObserved,
             .waitingForRouting,
             .routingConfirmed,
+            .waitingForProviderStreamEvent,
+            .providerStreamActive,
             .routingTimeoutBeforeConnection,
             .routingTimeoutAfterConnection,
             .readFileAutoSelectionFinish,
@@ -30,7 +32,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         ])
         XCTAssertEqual(
             ContextBuilderMCPProgressPhase.allCases.map(\.stage),
-            Array(repeating: "discovering", count: 13)
+            Array(repeating: "discovering", count: 15)
                 + ["processing"]
                 + Array(repeating: "generating", count: 8)
         )
@@ -263,6 +265,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             defer { viewModel.installRunTestHooks(nil) }
 
             let recorder = ContextBuilderProgressPhaseRecorder()
+            let sessionRetentionRecorder = ContextBuilderSessionRetentionRecorder()
             let reply = try await viewModel.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: composition.oracleViewModel,
@@ -274,6 +277,21 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 reviewGitContext: .automaticOnly(),
                 progressReporter: { phase in
                     await recorder.record(phase)
+                },
+                activityReporter: { phase, _ in
+                    guard phase == .streaming || phase == .messageFinalization else { return }
+                    let isPinned: Bool? = await MainActor.run {
+                        guard let session = composition.oracleViewModel.sessions.first(where: {
+                            $0.agentModeSessionID == agentModeSessionID &&
+                                $0.agentModeRunID == agentModeRunID
+                        }) else {
+                            return nil
+                        }
+                        return composition.oracleViewModel.isSessionPinnedForTesting(session.id)
+                    }
+                    if let isPinned {
+                        await sessionRetentionRecorder.record(isPinned)
+                    }
                 }
             )
 
@@ -284,6 +302,10 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             )
             XCTAssertEqual(createdSession.agentModeSessionID, agentModeSessionID)
             XCTAssertEqual(createdSession.agentModeRunID, agentModeRunID)
+            let retentionObservations = await sessionRetentionRecorder.snapshot()
+            XCTAssertFalse(retentionObservations.isEmpty)
+            XCTAssertTrue(retentionObservations.allSatisfy(\.self))
+            XCTAssertFalse(composition.oracleViewModel.isSessionPinnedForTesting(reply.chatId))
             let phases = await recorder.snapshot()
             XCTAssertEqual(phases, [
                 .modelResolution,
@@ -302,7 +324,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
     @MainActor
     func testContextBuilderToolProviderReportsPhasesAndSkipsSelectionIngressBarrier() async throws {
         #if DEBUG
-            let provider = ContextBuilderImmediateCompletionProvider()
+            let provider = ContextBuilderImmediateCompletionProvider(
+                emitRepoPromptToolCall: true
+            )
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState { _, _, _ in provider }
@@ -458,20 +482,38 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let startupMessages = stages
                 .filter { $0.stage == "discovering" }
                 .map(\.message)
-            let expectedStartupMarkers = [
+            let requiredStartupMarkers = [
                 ContextBuilderMCPProgressPhase.providerProcessStarting.displayName,
-                ContextBuilderMCPProgressPhase.waitingForChildConnection.displayName,
-                ContextBuilderMCPProgressPhase.childConnectionObserved.displayName,
-                ContextBuilderMCPProgressPhase.waitingForRouting.displayName,
-                ContextBuilderMCPProgressPhase.routingConfirmed.displayName
+                ContextBuilderMCPProgressPhase.routingConfirmed.displayName,
+                ContextBuilderMCPProgressPhase.waitingForProviderStreamEvent.displayName,
+                ContextBuilderMCPProgressPhase.providerStreamActive.displayName
             ]
-            let startupIndexes = try expectedStartupMarkers.map { marker in
+            let startupIndexes = try requiredStartupMarkers.map { marker in
                 try XCTUnwrap(
                     startupMessages.firstIndex { $0.contains("\(marker) started") },
                     "Missing production-lineage startup phase: \(marker)"
                 )
             }
             XCTAssertEqual(startupIndexes, startupIndexes.sorted())
+
+            let routingConfirmedIndex = startupIndexes[1]
+            for optionalRoutingMarker in [
+                ContextBuilderMCPProgressPhase.waitingForChildConnection.displayName,
+                ContextBuilderMCPProgressPhase.childConnectionObserved.displayName,
+                ContextBuilderMCPProgressPhase.waitingForRouting.displayName
+            ] {
+                if let index = startupMessages.firstIndex(where: {
+                    $0.contains("\(optionalRoutingMarker) started")
+                }) {
+                    XCTAssertLessThan(index, routingConfirmedIndex)
+                }
+            }
+            XCTAssertTrue(startupMessages.contains {
+                $0.contains("First discovery provider event received: tool_call")
+            })
+            XCTAssertTrue(startupMessages.contains {
+                $0.contains("First nested RepoPrompt MCP tool request observed: file_search")
+            })
 
             let runFinalizationCompleted = try XCTUnwrap(stages.firstIndex {
                 $0.message.contains(
@@ -1307,9 +1349,14 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
 
 private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProvider {
     private let discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder?
+    private let emitRepoPromptToolCall: Bool
 
-    init(discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder? = nil) {
+    init(
+        discoveryInputRecorder: ContextBuilderDiscoveryInputRecorder? = nil,
+        emitRepoPromptToolCall: Bool = false
+    ) {
         self.discoveryInputRecorder = discoveryInputRecorder
+        self.emitRepoPromptToolCall = emitRepoPromptToolCall
     }
 
     func streamAgentMessage(
@@ -1318,6 +1365,13 @@ private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProv
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         await discoveryInputRecorder?.record(message.userMessage)
         let stream = AsyncThrowingStream<AIStreamResult, Error> { continuation in
+            if emitRepoPromptToolCall {
+                continuation.yield(AIStreamResult(
+                    type: "tool_call",
+                    text: nil,
+                    toolName: "mcp__RepoPromptCE__file_search"
+                ))
+            }
             continuation.yield(AIStreamResult(type: "content", text: "Discovery complete"))
             continuation.finish()
         }
@@ -1774,5 +1828,17 @@ private actor ContextBuilderProgressPhaseRecorder {
 
     func snapshot() -> [ContextBuilderMCPProgressPhase] {
         phases
+    }
+}
+
+private actor ContextBuilderSessionRetentionRecorder {
+    private var observations: [Bool] = []
+
+    func record(_ isPinned: Bool) {
+        observations.append(isPinned)
+    }
+
+    func snapshot() -> [Bool] {
+        observations
     }
 }

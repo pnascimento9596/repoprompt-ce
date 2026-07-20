@@ -359,6 +359,7 @@ actor MCPBootstrapLease {
     private enum RoutingWaitSelection {
         case absolute(timeoutMs: Int)
         case adaptive(MCPRoutingWaitPolicy)
+        case indefinite
     }
 
     /// Legacy compatibility API. The Boolean wrapper retains one absolute deadline and
@@ -375,7 +376,7 @@ actor MCPBootstrapLease {
         return outcome.routed
     }
 
-    /// Typed adaptive API used by Context Builder.
+    /// Typed adaptive API retained for callers that require bounded readiness.
     func releaseWhenRouted(
         waitPolicy: MCPRoutingWaitPolicy,
         progressReporter: MCPBootstrapRoutingProgressReporter? = nil
@@ -384,6 +385,31 @@ actor MCPBootstrapLease {
             selection: .adaptive(waitPolicy),
             progressReporter: progressReporter
         )
+    }
+
+    /// Waits until routing commits, ownership is lost, or the caller cancels. Elapsed time is not terminal.
+    func releaseWhenRoutedIndefinitely(
+        progressReporter: MCPBootstrapRoutingProgressReporter? = nil
+    ) async -> MCPRoutingWaitOutcome {
+        await releaseRouting(
+            selection: .indefinite,
+            progressReporter: progressReporter
+        )
+    }
+
+    /// Returns a routing terminal signal that may have arrived before the waiter task enrolled.
+    func currentRoutingTerminalOutcome() async -> MCPRoutingWaitOutcome? {
+        await MCPRoutingWaiter.currentTerminalOutcome(runID: spec.runID)
+    }
+
+    /// Resolves a provider-boundary race through the same route authority used by bounded waits.
+    /// Re-signaling a confirmed route prevents notification lag from parking the indefinite waiter.
+    func resolveRouteAuthorityAtProviderCompletion() async -> MCPRunRouteAuthorityDecision {
+        let decision = await routeAuthorityResolver(spec)
+        if decision == .committed {
+            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+        }
+        return decision
     }
 
     private func releaseRouting(
@@ -405,8 +431,16 @@ actor MCPBootstrapLease {
         case let .adaptive(policy):
             timeoutMs = 0
             waitPolicy = policy
+        case .indefinite:
+            timeoutMs = 0
+            waitPolicy = nil
         }
 
+        if case .indefinite = selection {
+            // PID-owned policies already released the gate during acquire. This also prevents
+            // legacy ownership from parking the process-global gate for an unbounded wait.
+            await releaseOwnedGate(reason: "indefinite_route_wait")
+        }
         let ownedGateBeforeWait = ownsGate
         let progressLifecycle = progressReporter.map {
             MCPBootstrapRoutingProgressLifecycle(reporter: $0)
@@ -813,7 +847,8 @@ actor MCPBootstrapLease {
             purpose: spec.purpose,
             taskLabelKind: spec.taskLabelKind,
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: spec.requiresExpectedAgentPID
+            requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
+            prunesOnlyAfterSettlement: spec.purpose == .discoverRun
         )
     }
 

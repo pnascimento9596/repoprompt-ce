@@ -159,6 +159,11 @@ struct ContextBuilderMCPRunConfiguration {
 
 @MainActor
 final class ContextBuilderRunRecord {
+    enum ProviderActivity {
+        case firstEvent(type: String)
+        case firstRepoPromptTool(name: String)
+    }
+
     struct TeardownPayload {
         let provider: HeadlessAgentProvider?
         let executionTask: Task<Void, Never>?
@@ -172,6 +177,7 @@ final class ContextBuilderRunRecord {
     let agentKind: AgentProviderKind
     let modelRaw: String
     let progressReporter: ContextBuilderMCPProgressReporter?
+    let activityReporter: ContextBuilderMCPActivityReporter?
     let workspaceContext: ContextBuilderWorkspaceContext?
     let mcpConfiguration: ContextBuilderMCPRunConfiguration?
 
@@ -193,6 +199,10 @@ final class ContextBuilderRunRecord {
     private(set) var teardownFinishedAt: Date?
     private(set) var providerDisposalFinished = false
     private(set) var executionTaskFinished = false
+    private var didBeginProviderStreamProgress = false
+    private var didReportRoutingConfirmed = false
+    private var didObserveProviderEventAfterRouting = false
+    private var didObserveRepoPromptToolAfterRouting = false
 
     init(
         runID: UUID,
@@ -206,7 +216,8 @@ final class ContextBuilderRunRecord {
         mcpConfiguration: ContextBuilderMCPRunConfiguration? = nil,
         continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>? = nil,
         restoreConfiguration: (() -> Void)? = nil,
-        progressReporter: ContextBuilderMCPProgressReporter? = nil
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) {
         self.runID = runID
         self.tabID = tabID
@@ -220,10 +231,68 @@ final class ContextBuilderRunRecord {
         self.continuation = continuation
         self.restoreConfiguration = restoreConfiguration
         self.progressReporter = progressReporter
+        self.activityReporter = activityReporter
     }
 
     func reportProgress(_ phase: ContextBuilderMCPProgressPhase) async {
         await progressReporter?(phase)
+    }
+
+    func reportRoutingProgress(_ phase: ContextBuilderMCPProgressPhase) async {
+        guard !didBeginProviderStreamProgress else { return }
+        if phase == .routingConfirmed {
+            didReportRoutingConfirmed = true
+        }
+        await reportProgress(phase)
+    }
+
+    func beginProviderStreamProgress() async {
+        guard !didBeginProviderStreamProgress else { return }
+        didBeginProviderStreamProgress = true
+        if !didReportRoutingConfirmed {
+            didReportRoutingConfirmed = true
+            await reportProgress(.routingConfirmed)
+        }
+        await reportProgress(.waitingForProviderStreamEvent)
+    }
+
+    func captureProviderActivity(_ result: AIStreamResult) -> [ProviderActivity] {
+        var activity: [ProviderActivity] = []
+        if !didObserveProviderEventAfterRouting {
+            didObserveProviderEventAfterRouting = true
+            activity.append(.firstEvent(type: result.type))
+        }
+        if !didObserveRepoPromptToolAfterRouting,
+           result.type == "tool_call",
+           let toolName = result.toolName,
+           MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(toolName)
+        {
+            didObserveRepoPromptToolAfterRouting = true
+            activity.append(
+                .firstRepoPromptTool(
+                    name: MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
+                )
+            )
+        }
+        return activity
+    }
+
+    func reportProviderActivity(_ activity: [ProviderActivity]) async {
+        for item in activity {
+            switch item {
+            case let .firstEvent(type):
+                await reportProgress(.providerStreamActive)
+                await activityReporter?(
+                    .providerStreamActive,
+                    "First discovery provider event received: \(type)"
+                )
+            case let .firstRepoPromptTool(name):
+                await activityReporter?(
+                    .providerStreamActive,
+                    "First nested RepoPrompt MCP tool request observed: \(name)"
+                )
+            }
+        }
     }
 
     var isTerminal: Bool {

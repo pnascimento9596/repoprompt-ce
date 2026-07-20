@@ -6,6 +6,8 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
     case childConnectionObserved = "child_connection_observed"
     case waitingForRouting = "waiting_for_routing"
     case routingConfirmed = "routing_confirmed"
+    case waitingForProviderStreamEvent = "waiting_for_provider_stream_event"
+    case providerStreamActive = "provider_stream_active"
     case routingTimeoutBeforeConnection = "routing_timeout_before_connection"
     case routingTimeoutAfterConnection = "routing_timeout_after_connection"
     case readFileAutoSelectionFinish = "read_file_auto_selection_finish"
@@ -31,6 +33,8 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
              .childConnectionObserved,
              .waitingForRouting,
              .routingConfirmed,
+             .waitingForProviderStreamEvent,
+             .providerStreamActive,
              .routingTimeoutBeforeConnection,
              .routingTimeoutAfterConnection,
              .childConnectionTermination,
@@ -66,6 +70,10 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
             "child MCP routing wait"
         case .routingConfirmed:
             "child MCP routing confirmation"
+        case .waitingForProviderStreamEvent:
+            "discovery provider first-event wait"
+        case .providerStreamActive:
+            "discovery provider stream activity"
         case .routingTimeoutBeforeConnection:
             "routing timeout before child connection observation"
         case .routingTimeoutAfterConnection:
@@ -112,6 +120,8 @@ enum ContextBuilderMCPProgressPhase: String, CaseIterable {
              .childConnectionObserved,
              .waitingForRouting,
              .routingConfirmed,
+             .waitingForProviderStreamEvent,
+             .providerStreamActive,
              .routingTimeoutBeforeConnection,
              .routingTimeoutAfterConnection:
             nil

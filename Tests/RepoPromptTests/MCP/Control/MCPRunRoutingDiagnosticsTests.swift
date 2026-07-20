@@ -442,6 +442,11 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             XCTAssertEqual(continuationCount, 2, "nonpositive legacy timeouts must not resolve immediately")
             XCTAssertTrue(clock.activeDeadlines().isEmpty)
 
+            clock.advance(by: .seconds(60))
+            let continuationCountAfterMinute = await waiter.debugContinuationCount(runID: runID)
+            XCTAssertEqual(continuationCountAfterMinute, 2)
+            XCTAssertTrue(clock.activeDeadlines().isEmpty)
+
             cancelledWaiter.cancel()
             let cancelledOutcome = await cancelledWaiter.value
             XCTAssertEqual(cancelledOutcome, .cancelled)
