@@ -37,6 +37,7 @@ enum CodeMapFixtureRunner {
     ]
 
     static let expandedLanguageFixtureRelativePaths = [
+        "cs/smoke.cs",
         "dart/smoke.dart",
         "java/smoke.java",
         "js/smoke.js",

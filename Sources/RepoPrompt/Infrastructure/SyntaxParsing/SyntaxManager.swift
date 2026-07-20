@@ -188,6 +188,16 @@ final class SyntaxManager: @unchecked Sendable {
         return parser.parse(content)
     }
 
+    func compileHighlightQuery(for languageType: LanguageType) throws {
+        guard let queryText = optimizedQueries[languageType],
+              let data = queryText.data(using: .utf8)
+        else {
+            return
+        }
+        let descriptor = try CodeMapSyntaxEngine.shared.grammarDescriptor(for: languageType)
+        _ = try Query(language: descriptor.language, data: data)
+    }
+
     func highlight(content: String, fileExtension: String) throws -> [NamedRange] {
         guard CodeMapSyntaxEngine.exceededLineCount(in: content.utf8, limit: 5000) == nil else {
             return []
