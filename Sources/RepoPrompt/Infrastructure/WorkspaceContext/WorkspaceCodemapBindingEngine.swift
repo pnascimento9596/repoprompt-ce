@@ -1726,6 +1726,43 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
+    func currentProjectionSnapshot(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapCurrentProjectionSnapshot {
+        guard case .eligible? = roots[rootEpoch] else {
+            return .unavailable(reason: .rootNotRegistered)
+        }
+        guard let job = projectionJobs[rootEpoch] else {
+            return .unavailable(reason: .jobNotScheduled)
+        }
+        guard projectionJobAuthorityIsCurrent(job) else {
+            return .nonCurrent
+        }
+        guard job.phase == .complete else {
+            return .pending(
+                phase: job.phase,
+                progress: job.progress,
+                retry: job.retry,
+                budget: job.budget
+            )
+        }
+        guard let proof = job.coverageProof,
+              let completedUptimeNanoseconds = job.coverageCompletedUptimeNanoseconds,
+              let generation = job.generation,
+              generation == proof.generation,
+              proof.generation.rootEpoch == rootEpoch,
+              proof.generation.catalogToken.catalogGeneration == job.catalogGeneration,
+              proof.generation.catalogToken.ingressGeneration == job.ingressGeneration,
+              projectionJobIsCurrent(job)
+        else {
+            return .nonCurrent
+        }
+        return .authoritativeComplete(
+            proof: proof,
+            completedUptimeNanoseconds: completedUptimeNanoseconds
+        )
+    }
+
     func accounting() -> WorkspaceCodemapBindingEngineAccounting {
         expireProjectionDemands()
         var eligible = 0

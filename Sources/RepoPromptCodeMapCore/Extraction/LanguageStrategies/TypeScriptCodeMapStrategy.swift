@@ -28,6 +28,7 @@ enum TypeScriptCodeMapStrategy {
     /// Context built during the pre-pass phase
     struct Context {
         var containerBoundaries: [ContainerBoundary] = []
+        var functionDefinitionRanges: Set<NSRange> = []
     }
 
     // MARK: - Pre-pass: Build Container Boundaries
@@ -40,6 +41,9 @@ enum TypeScriptCodeMapStrategy {
     ) -> Context {
         var ctx = Context()
         let nsContent = content as NSString
+        ctx.functionDefinitionRanges = Set(
+            index.captures(named: "function.definition").map(\.range)
+        )
 
         func mapNamesToSmallestContainingDecl(
             nameCaps: [NamedRange],
@@ -48,19 +52,19 @@ enum TypeScriptCodeMapStrategy {
             var mapping: [NSRange: String] = [:]
             guard !nameCaps.isEmpty, !declCaps.isEmpty else { return mapping }
 
-            let sortedDecls = declCaps.sorted { $0.range.location < $1.range.location }
-            let sortedNames = nameCaps.sorted { $0.range.location < $1.range.location }
+            let orderedDecls = declCaps
+            let orderedNames = nameCaps
 
             var stack: [NamedRange] = []
             var declIndex = 0
 
-            for nameCap in sortedNames {
+            for nameCap in orderedNames {
                 let name = nsContent.substring(with: nameCap.range)
 
-                while declIndex < sortedDecls.count,
-                      sortedDecls[declIndex].range.location <= nameCap.range.location
+                while declIndex < orderedDecls.count,
+                      orderedDecls[declIndex].range.location <= nameCap.range.location
                 {
-                    stack.append(sortedDecls[declIndex])
+                    stack.append(orderedDecls[declIndex])
                     declIndex += 1
                 }
 
@@ -77,7 +81,7 @@ enum TypeScriptCodeMapStrategy {
 
                 // Fallback scan (should be rare if ranges are nested)
                 var bestDecl: NamedRange? = nil
-                for decl in sortedDecls where rangeContains(decl.range, nameCap.range) {
+                for decl in orderedDecls where rangeContains(decl.range, nameCap.range) {
                     if bestDecl == nil || decl.range.length < bestDecl!.range.length {
                         bestDecl = decl
                     }
@@ -165,10 +169,22 @@ enum TypeScriptCodeMapStrategy {
 		let activePerfOptions = perfOptions
 
         switch cap.name {
+        case "variable.global":
+            if context.functionDefinitionRanges.contains(cap.range) {
+                activePerfStats?.tsDuplicateFunctionVariableSuppressions += 1
+                return true
+            }
+            return false
+
 		// MARK: TS Class Members
 
         case "method":
             // TS class methods - use range-based containment
+            guard let enclosingClass = enclosingContainer(
+                for: cap.range,
+                in: context.containerBoundaries,
+                kind: .class
+            ) else { return false }
             let methodName = nsContent.substring(with: cap.range)
             let fullLine = getTrimmedLine(cap.range)
             let signatureLine = normalizeSignatureLine(fullLine, context: .functionLike, extractionMemo: &extractionMemo, perfStats: activePerfStats, perfOptions: activePerfOptions)
@@ -176,7 +192,7 @@ enum TypeScriptCodeMapStrategy {
             let parsed = parseFunctionInfo(effectiveLine, fallbackName: methodName, language: language, referencedTypes: &referencedTypes, extractionMemo: &extractionMemo, perfStats: activePerfStats)
 
             // Find enclosing class by range containment
-            if let enclosingClass = enclosingContainer(for: cap.range, in: context.containerBoundaries, kind: .class) {
+            do {
                 ensureClassEntry(enclosingClass, classesByLine: &classesByLine)
                 let fnInfo = FunctionInfo(
                     name: parsed.name,
@@ -195,13 +211,18 @@ enum TypeScriptCodeMapStrategy {
 
         case "variable.field":
             // TS class fields - use range-based containment
+            guard let enclosingClass = enclosingContainer(
+                for: cap.range,
+                in: context.containerBoundaries,
+                kind: .class
+            ) else { return false }
             let fullLine = getTrimmedLine(cap.range)
             let signatureLine = normalizeSignatureLine(fullLine, context: .statementLike, extractionMemo: &extractionMemo, perfStats: activePerfStats, perfOptions: activePerfOptions)
             let effectiveLine = stripTSInitializer(signatureLine.isEmpty ? fullLine : signatureLine)
             let propType = parsePropertyType(effectiveLine, language: language, referencedTypes: &referencedTypes, extractionMemo: &extractionMemo, perfStats: activePerfStats)
 
             // Find enclosing class by range containment
-            if let enclosingClass = enclosingContainer(for: cap.range, in: context.containerBoundaries, kind: .class) {
+            do {
                 let propInfo = PropertyInfo(name: effectiveLine, typeName: propType)
                 ensureClassEntry(enclosingClass, classesByLine: &classesByLine)
                 if !classesByLine[enclosingClass.startLine]!.properties.contains(where: { $0.name == effectiveLine }) {
@@ -214,13 +235,18 @@ enum TypeScriptCodeMapStrategy {
 
         case "method_signature":
             // TS interface method - use range-based containment
+            guard let enclosingIface = enclosingContainer(
+                for: cap.range,
+                in: context.containerBoundaries,
+                kind: .interface
+            ) else { return false }
             let methodName = nsContent.substring(with: cap.range)
             let fullLine = getTrimmedLine(cap.range)
             let signatureLine = normalizeSignatureLine(fullLine, context: .functionLike, extractionMemo: &extractionMemo, perfStats: activePerfStats, perfOptions: activePerfOptions)
             let effectiveLine = signatureLine.isEmpty ? fullLine : signatureLine
             let parsed = parseFunctionInfo(effectiveLine, fallbackName: methodName, language: language, referencedTypes: &referencedTypes, extractionMemo: &extractionMemo, perfStats: activePerfStats)
 
-            if let enclosingIface = enclosingContainer(for: cap.range, in: context.containerBoundaries, kind: .interface) {
+            do {
                 let fnInfo = FunctionInfo(
                     name: parsed.name,
                     parameters: parsed.parameters,
@@ -237,12 +263,17 @@ enum TypeScriptCodeMapStrategy {
 
         case "property_signature":
             // TS interface property - use range-based containment
+            guard let enclosingIface = enclosingContainer(
+                for: cap.range,
+                in: context.containerBoundaries,
+                kind: .interface
+            ) else { return false }
             let fullLine = getTrimmedLine(cap.range)
             let signatureLine = normalizeSignatureLine(fullLine, context: .statementLike, extractionMemo: &extractionMemo, perfStats: activePerfStats, perfOptions: activePerfOptions)
             let effectiveLine = stripTSInitializer(signatureLine.isEmpty ? fullLine : signatureLine)
             let propType = parsePropertyType(effectiveLine, language: language, referencedTypes: &referencedTypes, extractionMemo: &extractionMemo, perfStats: activePerfStats)
 
-            if let enclosingIface = enclosingContainer(for: cap.range, in: context.containerBoundaries, kind: .interface) {
+            do {
                 // Use fullLine for the name to capture the full property signature
                 let propInfo = PropertyInfo(name: effectiveLine, typeName: propType)
                 ensureInterfaceEntry(enclosingIface, interfaceBoundaries: &interfaceBoundaries)
@@ -254,6 +285,11 @@ enum TypeScriptCodeMapStrategy {
 
         case "call_signature", "construct_signature", "index_signature":
             // TS interface signatures - use range-based containment
+            guard let enclosingIface = enclosingContainer(
+                for: cap.range,
+                in: context.containerBoundaries,
+                kind: .interface
+            ) else { return false }
             let fullLine = getTrimmedLine(cap.range)
             let signatureLine = normalizeSignatureLine(fullLine, context: .functionLike, extractionMemo: &extractionMemo, perfStats: activePerfStats, perfOptions: activePerfOptions)
             let effectiveLine = signatureLine.isEmpty ? fullLine : signatureLine
@@ -269,7 +305,7 @@ enum TypeScriptCodeMapStrategy {
             }
             let parsed = parseFunctionInfo(effectiveLine, fallbackName: fallbackName, language: language, referencedTypes: &referencedTypes, extractionMemo: &extractionMemo, perfStats: activePerfStats)
 
-            if let enclosingIface = enclosingContainer(for: cap.range, in: context.containerBoundaries, kind: .interface) {
+            do {
                 let fnInfo = FunctionInfo(
                     name: parsed.name,
                     parameters: parsed.parameters,
