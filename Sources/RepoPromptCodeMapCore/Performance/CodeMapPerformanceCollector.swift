@@ -96,6 +96,11 @@ package final class CodeMapPerformanceCollector {
     package var swiftSignatureNormalizationOutputUTF8ByteCount = 0
     package var swiftStrategyFunctionNameLookupCount = 0
     package var swiftStrategyParameterExtractionCount = 0
+    package var swiftParameterTypeDirectCaptureCount = 0
+    package var swiftParameterTypeFallbackParserCount = 0
+    package var swiftParameterTypeASCIIFastPathCount = 0
+    package var swiftParameterTypeUnicodeLegacyFallbackCount = 0
+    package var swiftParameterTypeInputUTF8ByteCount = 0
     package var swiftStrategyReturnTypeExtractionCount = 0
     package var swiftStrategyPropertyDeclarationCount = 0
     package var swiftStrategyPropertyTypeExtractionCount = 0
@@ -209,6 +214,8 @@ package final class CodeMapPerformanceCollector {
     package var swiftSignatureNormalizationDuration: TimeInterval = 0
     package var swiftStrategyFunctionNameLookupDuration: TimeInterval = 0
     package var swiftStrategyParameterExtractionDuration: TimeInterval = 0
+    package var swiftParameterTypeResolutionDuration: TimeInterval = 0
+    package var swiftParameterTypeLegacyFallbackDuration: TimeInterval = 0
     package var swiftStrategyReturnTypeExtractionDuration: TimeInterval = 0
     package var swiftStrategyPropertyDeclarationDuration: TimeInterval = 0
     package var swiftPropertyDeclarationLookupDuration: TimeInterval = 0

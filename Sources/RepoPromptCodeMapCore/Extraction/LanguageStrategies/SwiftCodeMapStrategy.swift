@@ -904,10 +904,19 @@ enum SwiftCodeMapStrategy {
                 local = nsContent.substring(with: locCap.range)
             }
             let paramText = nsContent.substring(with: paramNode.range)
+            let parameterTypeResolutionStart = performanceCollector == nil ? 0 : CFAbsoluteTimeGetCurrent()
             if let typeCap = index.firstCapture(named: "swift.param.type", containedIn: paramNode.range) {
+                performanceCollector?.swiftParameterTypeDirectCaptureCount += 1
                 type = nsContent.substring(with: typeCap.range)
-            } else if let parsedType = extractSwiftParamType(from: paramText) {
+            } else if let parsedType = extractSwiftParamType(
+                from: paramText,
+                performanceCollector: performanceCollector
+            ) {
                 type = parsedType
+            }
+            if let performanceCollector {
+                performanceCollector.swiftParameterTypeResolutionDuration +=
+                    CFAbsoluteTimeGetCurrent() - parameterTypeResolutionStart
             }
 
             if let localName = local {
@@ -1014,7 +1023,56 @@ enum SwiftCodeMapStrategy {
         return end
     }
 
-    private static func extractSwiftParamType(from paramText: String) -> String? {
+    static func extractSwiftParamType(
+        from paramText: String,
+        performanceCollector: CodeMapPerformanceCollector? = nil
+    ) -> String? {
+        var inputUTF8ByteCount = 0
+        var containsNonASCII = false
+        for byte in paramText.utf8 {
+            inputUTF8ByteCount += 1
+            if byte >= 0x80 {
+                containsNonASCII = true
+            }
+        }
+
+        performanceCollector?.swiftParameterTypeFallbackParserCount += 1
+        performanceCollector?.swiftParameterTypeInputUTF8ByteCount += inputUTF8ByteCount
+
+        if containsNonASCII {
+            performanceCollector?.swiftParameterTypeUnicodeLegacyFallbackCount += 1
+            let legacyStart = performanceCollector == nil ? 0 : CFAbsoluteTimeGetCurrent()
+            let result = extractSwiftParamTypeLegacy(from: paramText)
+            if let performanceCollector {
+                performanceCollector.swiftParameterTypeLegacyFallbackDuration +=
+                    CFAbsoluteTimeGetCurrent() - legacyStart
+            }
+            return result
+        }
+
+        performanceCollector?.swiftParameterTypeASCIIFastPathCount += 1
+        let utf8 = paramText.utf8
+        guard let colonIndex = firstTopLevelASCIISwiftDelimiter(
+            0x3A,
+            in: utf8,
+            from: utf8.startIndex
+        ) else { return nil }
+        let afterColonStart = utf8.index(after: colonIndex)
+        let afterColon: Substring
+        if let equalIndex = firstTopLevelASCIISwiftDelimiter(
+            0x3D,
+            in: utf8,
+            from: afterColonStart
+        ) {
+            afterColon = paramText[afterColonStart ..< equalIndex]
+        } else {
+            afterColon = paramText[afterColonStart...]
+        }
+        let trimmed = afterColon.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func extractSwiftParamTypeLegacy(from paramText: String) -> String? {
         let parameter = paramText[...]
         guard let colonIndex = firstTopLevelSwiftDelimiter(":", in: parameter) else { return nil }
         var afterColon = parameter[parameter.index(after: colonIndex)...]
@@ -1023,6 +1081,95 @@ enum SwiftCodeMapStrategy {
         }
         let trimmed = afterColon.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func firstTopLevelASCIISwiftDelimiter(
+        _ target: UInt8,
+        in utf8: String.UTF8View,
+        from startIndex: String.UTF8View.Index
+    ) -> String.UTF8View.Index? {
+        var delimiterStack: [UInt8] = []
+        var stringDelimiter: (pounds: Int, quotes: Int)?
+        var index = startIndex
+
+        while index < utf8.endIndex {
+            if let activeStringDelimiter = stringDelimiter {
+                if utf8[index] == 0x5C, activeStringDelimiter.pounds == 0 {
+                    index = utf8.index(after: index)
+                    if index < utf8.endIndex {
+                        index = utf8.index(after: index)
+                    }
+                    continue
+                }
+
+                var terminatorEnd = index
+                var isTerminator = true
+                for _ in 0 ..< activeStringDelimiter.quotes {
+                    guard terminatorEnd < utf8.endIndex, utf8[terminatorEnd] == 0x22 else {
+                        isTerminator = false
+                        break
+                    }
+                    terminatorEnd = utf8.index(after: terminatorEnd)
+                }
+                if isTerminator {
+                    for _ in 0 ..< activeStringDelimiter.pounds {
+                        guard terminatorEnd < utf8.endIndex, utf8[terminatorEnd] == 0x23 else {
+                            isTerminator = false
+                            break
+                        }
+                        terminatorEnd = utf8.index(after: terminatorEnd)
+                    }
+                }
+                if isTerminator {
+                    index = terminatorEnd
+                    stringDelimiter = nil
+                    continue
+                }
+
+                index = utf8.index(after: index)
+                continue
+            }
+
+            var quoteIndex = index
+            var poundCount = 0
+            while quoteIndex < utf8.endIndex, utf8[quoteIndex] == 0x23 {
+                poundCount += 1
+                quoteIndex = utf8.index(after: quoteIndex)
+            }
+            if quoteIndex < utf8.endIndex, utf8[quoteIndex] == 0x22 {
+                var openerEnd = utf8.index(after: quoteIndex)
+                var quoteCount = 1
+                if openerEnd < utf8.endIndex, utf8[openerEnd] == 0x22 {
+                    let thirdQuoteIndex = utf8.index(after: openerEnd)
+                    if thirdQuoteIndex < utf8.endIndex, utf8[thirdQuoteIndex] == 0x22 {
+                        quoteCount = 3
+                        openerEnd = utf8.index(after: thirdQuoteIndex)
+                    }
+                }
+                stringDelimiter = (poundCount, quoteCount)
+                index = openerEnd
+                continue
+            }
+
+            let byte = utf8[index]
+            switch byte {
+            case 0x28, 0x5B, 0x7B:
+                delimiterStack.append(byte)
+            case 0x29:
+                if delimiterStack.last == 0x28 { delimiterStack.removeLast() }
+            case 0x5D:
+                if delimiterStack.last == 0x5B { delimiterStack.removeLast() }
+            case 0x7D:
+                if delimiterStack.last == 0x7B { delimiterStack.removeLast() }
+            default:
+                if byte == target, delimiterStack.isEmpty {
+                    return index
+                }
+            }
+            index = utf8.index(after: index)
+        }
+
+        return nil
     }
 
 	private static func firstTopLevelSwiftDelimiter(

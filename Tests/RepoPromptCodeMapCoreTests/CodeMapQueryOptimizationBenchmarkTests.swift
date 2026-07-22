@@ -70,6 +70,27 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
                 collector.swiftSignatureNormalizationOutputUTF8ByteCount,
                 collector.swiftSignatureNormalizationInputUTF8ByteCount
             )
+            XCTAssertEqual(
+                collector.swiftParameterTypeASCIIFastPathCount +
+                    collector.swiftParameterTypeUnicodeLegacyFallbackCount,
+                collector.swiftParameterTypeFallbackParserCount
+            )
+            XCTAssertGreaterThan(
+                collector.swiftParameterTypeDirectCaptureCount +
+                    collector.swiftParameterTypeFallbackParserCount,
+                0
+            )
+            XCTAssertLessThanOrEqual(
+                collector.swiftParameterTypeFallbackParserCount,
+                collector.swiftNestedFunctionContainmentLookupCount
+            )
+            if collector.swiftParameterTypeFallbackParserCount > 0 {
+                XCTAssertGreaterThan(collector.swiftParameterTypeInputUTF8ByteCount, 0)
+            }
+            XCTAssertGreaterThanOrEqual(
+                collector.swiftParameterTypeResolutionDuration,
+                collector.swiftParameterTypeLegacyFallbackDuration
+            )
 
             let evidence = try SwiftCodeMapPipelineBenchmarkSupport.makeEvidence(
                 files: files,
@@ -325,6 +346,125 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         )
     }
 
+    func testSwiftParameterTypeASCIIFastPathMatchesLegacyBehavior() {
+        let cases: [(name: String, input: String, expected: String?)] = [
+            ("simple", "value: Int", "Int"),
+            ("external local", "_ value: Int", "Int"),
+            ("labeled generic", "label value: Result<String, Error>", "Result<String, Error>"),
+            ("nested attribute colon", "@Wrapper(label: \"x:y\") value: Int = 42", "Int"),
+            ("nested default", "value: [String: Int] = [\"x\": 1]", "[String: Int]"),
+            ("tuple", "value: (Int, String)", "(Int, String)"),
+            ("closure default", "handler: (Int) -> Void = { _ in }", "(Int) -> Void"),
+            ("generic function type", "transform: (@escaping (Int) -> Result<String, Error>)?", "(@escaping (Int) -> Result<String, Error>)?"),
+            ("nested collection", "value: [String: (Int, Bool)]", "[String: (Int, Bool)]"),
+            ("raw string", ##"@Wrapper(text: #"x:y="#) value: Int = 42"##, "Int"),
+            ("multi-pound raw string", ###"@Wrapper(text: ##"x:y="##) value: Int"###, "Int"),
+            ("triple string", "@Wrapper(text: \"\"\"x:y=()[]{}\"\"\") value: String", "String"),
+            ("escaped quote", ##"@Wrapper(text: "x\"y:z") value: Int"##, "Int"),
+            ("line comment blindness", "value // note: marker: Int", "marker: Int"),
+            ("block comment colon blindness", "value /* note: marker */: Int", "marker */: Int"),
+            ("block comment equal blindness", "value: Int /* = default */", "Int /*"),
+            ("unmatched closing paren", "value): Int", "Int"),
+            ("unmatched opening paren", "value(: Int", nil),
+            ("mismatched closing bracket", "value]: Int", "Int"),
+            ("unclosed bracket", "value[: Int", nil),
+            ("unterminated string", "\"unterminated: value: Int", nil),
+            ("unterminated raw string", "##\"unterminated: value: Int", nil),
+            ("unterminated triple string", "\"\"\"unterminated: value: Int", nil),
+            ("isolated pound", "# value: Int", "Int"),
+            ("two quotes", "\"\": Int", "Int"),
+            ("missing colon", "value", nil),
+            ("empty type", "value:", nil),
+            ("whitespace type", "value: \t\n\u{000B}\u{000C}\r", nil),
+            ("angle brackets stay untracked", "value: Result<A = B, C>", "Result<A"),
+            ("nested equal", "value: (A = B)", "(A = B)"),
+        ]
+
+        for testCase in cases {
+            let legacy = SwiftCodeMapStrategy.extractSwiftParamTypeLegacy(from: testCase.input)
+            XCTAssertEqual(legacy, testCase.expected, "legacy: \(testCase.name)")
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftParamType(from: testCase.input),
+                legacy,
+                testCase.name
+            )
+        }
+    }
+
+    func testSwiftParameterTypeASCIIFastPathGeneratedEquivalenceAndCounters() {
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".utf8) + [
+            0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x3A, 0x3D, 0x23, 0x22, 0x5C, 0x2F,
+            0x28, 0x29, 0x5B, 0x5D, 0x7B, 0x7D,
+            0x3C, 0x3E, 0x2C, 0x2E, 0x2D, 0x2A,
+        ]
+        let caseCount = 2_000
+        var state: UInt64 = 0x5F93_1049_D4C0_0400
+        var totalUTF8ByteCount = 0
+        let collector = CodeMapPerformanceCollector()
+
+        func nextRandom() -> UInt64 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return state
+        }
+
+        for index in 0 ..< caseCount {
+            let length = Int(nextRandom() % 161)
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(length)
+            for _ in 0 ..< length {
+                bytes.append(alphabet[Int(nextRandom() % UInt64(alphabet.count))])
+            }
+            let input = String(decoding: bytes, as: UTF8.self)
+            totalUTF8ByteCount += input.utf8.count
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftParamType(
+                    from: input,
+                    performanceCollector: collector
+                ),
+                SwiftCodeMapStrategy.extractSwiftParamTypeLegacy(from: input),
+                "generated case \(index): \(String(reflecting: input))"
+            )
+        }
+
+        XCTAssertEqual(collector.swiftParameterTypeFallbackParserCount, caseCount)
+        XCTAssertEqual(collector.swiftParameterTypeASCIIFastPathCount, caseCount)
+        XCTAssertEqual(collector.swiftParameterTypeUnicodeLegacyFallbackCount, 0)
+        XCTAssertEqual(collector.swiftParameterTypeInputUTF8ByteCount, totalUTF8ByteCount)
+    }
+
+    func testSwiftParameterTypeUnicodeAlwaysUsesLegacyFallback() {
+        let inputs = [
+            "café: Type",
+            "value: Café",
+            "value:\u{00A0}Type",
+            "value:\u{2003}Type",
+            "@Wrapper(label: \"🙂:x\") value: Int",
+            "café(: Int",
+        ]
+        let collector = CodeMapPerformanceCollector()
+
+        for input in inputs {
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.extractSwiftParamType(
+                    from: input,
+                    performanceCollector: collector
+                ),
+                SwiftCodeMapStrategy.extractSwiftParamTypeLegacy(from: input),
+                String(reflecting: input)
+            )
+        }
+
+        XCTAssertEqual(collector.swiftParameterTypeFallbackParserCount, inputs.count)
+        XCTAssertEqual(collector.swiftParameterTypeASCIIFastPathCount, 0)
+        XCTAssertEqual(collector.swiftParameterTypeUnicodeLegacyFallbackCount, inputs.count)
+        XCTAssertEqual(
+            collector.swiftParameterTypeInputUTF8ByteCount,
+            inputs.reduce(0) { $0 + $1.utf8.count }
+        )
+        XCTAssertGreaterThanOrEqual(collector.swiftParameterTypeLegacyFallbackDuration, 0)
+    }
+
     func testCaptureIndexCountsMissingNamedBuckets() {
         let collector = CodeMapPerformanceCollector()
         let index = CodeMapCaptureIndex([], performanceCollector: collector)
@@ -540,12 +680,27 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             func wrapped(@Wrapper(label: "x:y") value: Int = 42) {}
         }
         """
-        let artifact = try build(source: source, language: .swift)
+        let collector = CodeMapPerformanceCollector()
+        let artifact = try build(
+            source: source,
+            language: .swift,
+            options: .countersOnly,
+            collector: collector
+        )
         let example = try XCTUnwrap(artifact.classes.first { $0.name == "Example" })
         let wrapped = try XCTUnwrap(example.methods.first { $0.name == "wrapped" })
 
         XCTAssertEqual(wrapped.parameters.map(\.localName), ["value"])
         XCTAssertEqual(wrapped.parameters.map(\.typeName), ["Int"])
+        XCTAssertEqual(collector.swiftParameterTypeDirectCaptureCount, 0)
+        XCTAssertEqual(collector.swiftParameterTypeFallbackParserCount, 1)
+        XCTAssertEqual(collector.swiftParameterTypeASCIIFastPathCount, 1)
+        XCTAssertEqual(collector.swiftParameterTypeUnicodeLegacyFallbackCount, 0)
+        XCTAssertGreaterThan(collector.swiftParameterTypeInputUTF8ByteCount, 0)
+        XCTAssertGreaterThanOrEqual(
+            collector.swiftParameterTypeResolutionDuration,
+            collector.swiftParameterTypeLegacyFallbackDuration
+        )
     }
 
     func testTypeScriptUncontainedMembersFallThroughBeforeExtraction() throws {
