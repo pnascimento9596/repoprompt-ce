@@ -77,7 +77,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 10)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -217,6 +217,20 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(Path(argv[0]).parent.name, "Scripts")
         self.assertEqual(lanes, [])
         self.assertEqual(cwd, repo_root)
+
+    def test_codex_schema_check_delegates_bounded_gate_without_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            registry = conductor.OperationRegistry(repo_root)
+            argv, lanes, cwd, _env, timeout = registry.prepare(
+                {"operation": "codex-schema-check", "args": {}}
+            )
+
+        self.assertEqual(Path(argv[0]).name, Path(sys.executable).name)
+        self.assertEqual(Path(argv[1]).name, "check_codex_app_server_schema.py")
+        self.assertEqual(lanes, [])
+        self.assertEqual(cwd, repo_root)
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
 
     def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
         tmp, state = self.make_state()
