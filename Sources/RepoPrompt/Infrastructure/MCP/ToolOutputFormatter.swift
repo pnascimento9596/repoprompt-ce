@@ -958,17 +958,28 @@ extension ToolOutputFormatter {
     static func formatHistory(args: [String: Value], value: Value) -> [MCP.Tool.Content] {
         guard let object = value.objectValue else { return formatGeneric(value: value) }
         if let error = nonEmpty(object["error"]?.stringValue) {
-            return [.text("## History ❌\n- **Error**: \(error)")]
+            var lines = ["## History \(object["retryable"]?.boolValue == true ? "⚠️" : "❌")"]
+            lines.append("- **Error**: \(error)")
+            if object["retryable"]?.boolValue == true {
+                lines.append("- **Retryable**: yes")
+            }
+            appendHistoryScanMetadata(object, to: &lines)
+            if let suggestion = nonEmpty(object["suggestion"]?.stringValue) {
+                lines.append("- **Next step**: \(suggestion)")
+            }
+            return [.text(lines.joined(separator: "\n"))]
         }
 
         let op = args["op"]?.stringValue ?? "history"
+        let status = object["scan_truncated"]?.boolValue == true ? "⚠️" : statusIcon(success: true)
+        let lowerBoundSuffix = object["totals_are_lower_bounds"]?.boolValue == true ? " (lower bound)" : ""
         var lines: [String] = []
         switch op {
         case "list_sessions":
             let total = object["total_sessions"]?.intValue ?? 0
             let sessions = object["sessions"]?.arrayValue ?? []
-            lines.append("## History Sessions \(statusIcon(success: true))")
-            lines.append("- **Total sessions**: \(total) • **Returned**: \(sessions.count)")
+            lines.append("## History Sessions \(status)")
+            lines.append("- **Total sessions**: \(total)\(lowerBoundSuffix) • **Returned**: \(sessions.count)")
             if total == 0 { lines.append("- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More sessions available**: increase `limit` to return more") }
             if total == 0, nonEmpty(args["touched_file"]?.stringValue) != nil {
@@ -994,8 +1005,8 @@ extension ToolOutputFormatter {
         case "search":
             let total = object["total_matches"]?.intValue ?? 0
             let results = object["results"]?.arrayValue ?? []
-            lines.append("## History Search \(statusIcon(success: true))")
-            lines.append("- **Total matches**: \(total) • **Returned**: \(results.count)")
+            lines.append("## History Search \(status)")
+            lines.append("- **Total matches**: \(total)\(lowerBoundSuffix) • **Returned**: \(results.count)")
             if total == 0 { lines.append("- **Status**: No matching turns found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More matches available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
@@ -1018,8 +1029,8 @@ extension ToolOutputFormatter {
             let totalSessions = object["total_sessions"]?.intValue ?? 0
             let totalDuration = object["total_active_duration_seconds"]?.intValue ?? 0
             let groups = object["groups"]?.arrayValue ?? []
-            lines.append("## History Time \(statusIcon(success: true))")
-            lines.append("- **Total sessions**: \(totalSessions) • **Active duration**: \(totalDuration)s • **Groups**: \(groups.count)")
+            lines.append("## History Time \(status)")
+            lines.append("- **Total sessions**: \(totalSessions)\(lowerBoundSuffix) • **Active duration**: \(totalDuration)s\(lowerBoundSuffix) • **Groups**: \(groups.count)")
             if totalSessions == 0 { lines.append("- **Status**: No matching sessions found") }
             if object["truncated"]?.boolValue == true { lines.append("- **More groups available**: increase `limit` to return more") }
             appendHistoryScanMetadata(object, to: &lines)
@@ -1053,11 +1064,12 @@ extension ToolOutputFormatter {
             let turns = object["turns"]?.arrayValue ?? []
             let targetTurn = args["around_turn"]?.intValue ?? args["turn_start"]?.intValue
             let maxChars = clampedHistoryFormatterMaxChars(args["max_chars"]?.intValue)
-            lines.append("## History Session \(statusIcon(success: true))")
+            lines.append("## History Session \(status)")
             lines.append("- `\(sessionID)` **\(sessionName)** (\(workspaceName))")
             lines.append("- **Turns**: \(start)–\(end) of \(totalTurns)")
             if let targetTurn { lines.append("- **Target turn**: \(targetTurn)") }
             if object["truncated"]?.boolValue == true { lines.append("- **Truncated**: yes") }
+            appendHistoryScanMetadata(object, to: &lines)
 
             let orderedTurns = turns.sorted { lhs, rhs in
                 let leftIndex = lhs.objectValue?["turn_index"]?.intValue ?? Int.max
@@ -1103,6 +1115,12 @@ extension ToolOutputFormatter {
         default:
             return formatGeneric(value: value)
         }
+        if object["scan_truncated"]?.boolValue == true {
+            let advice = op == "get_session"
+                ? "Retry the same `get_session` request; the lookup/result was not authoritative."
+                : "Retry with a narrower `workspace`, `session_id`, or date scope where supported."
+            lines.append("- **Next step**: \(advice)")
+        }
         var formatted = lines.joined(separator: "\n")
         if op == "get_session" {
             let maxChars = clampedHistoryFormatterMaxChars(args["max_chars"]?.intValue)
@@ -1122,6 +1140,25 @@ extension ToolOutputFormatter {
 
     private static func appendHistoryScanMetadata(_ object: [String: Value], to lines: inout [String]) {
         if let scanned = object["sessions_scanned"]?.intValue { lines.append("- **Sessions scanned**: \(scanned)\(object["scan_truncated"]?.boolValue == true ? " (scan truncated)" : "")") }
+        let scanDiagnostics = object["scan_diagnostics"]?.arrayValue?.compactMap { value -> String? in
+            guard let diagnostic = value.objectValue,
+                  let kind = diagnostic["kind"]?.stringValue,
+                  let consumed = diagnostic["consumed"]?.intValue,
+                  let limit = diagnostic["limit"]?.intValue,
+                  let unit = diagnostic["unit"]?.stringValue
+            else { return nil }
+            if kind == "diagnostic_count" {
+                return "+\(consumed) additional diagnostic groups omitted"
+            }
+            let phase = diagnostic["phase"]?.stringValue.map { " during \($0)" } ?? ""
+            let retry = diagnostic["retryable"]?.boolValue == true ? "; retryable" : ""
+            let count = diagnostic["count"]?.intValue ?? 1
+            let repeated = count > 1 ? " ×\(count)" : ""
+            return "\(kind): \(consumed)/\(limit) \(unit)\(phase)\(retry)\(repeated)"
+        } ?? []
+        if !scanDiagnostics.isEmpty {
+            lines.append("- **Scan budget**: \(scanDiagnostics.joined(separator: "; "))")
+        }
         let skipped = object["skipped_workspaces"]?.arrayValue?.compactMap(\.stringValue) ?? []
         if !skipped.isEmpty {
             lines.append(historySkippedWorkspacesSummary(skipped))

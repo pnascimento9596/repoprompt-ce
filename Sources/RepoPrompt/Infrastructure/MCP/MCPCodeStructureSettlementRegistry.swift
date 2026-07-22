@@ -1,20 +1,55 @@
 import Foundation
 
-/// Grants at most one same-window `get_code_structure` call permission to detach after
-/// watchdog cleanup grace. A concurrent call remains legal but uses force-disconnect.
-/// Once the eligible call actually detaches, later structure calls receive typed busy
-/// until the generation-safe slot settles.
+/// Owns same-window `get_code_structure` settlement state outside ordinary lane accounting.
+///
+/// Every admitted provider receives an invocation-scoped lease. Completion, cleanup-grace
+/// expiry, and external cancellation transition that lease under this registry's single lock.
+/// Once any lease becomes detaching, detached, abandoned, or force-disconnecting, later calls
+/// receive typed busy until every unsettled lease clears.
 final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
-    enum Admission {
-        case detachEligible(Slot)
-        case forceDisconnect
-        case busy
+    enum BusyReason: Equatable {
+        case detached
+        case abandoned
+        case settling
     }
 
-    enum CompletionDisposition: Equatable {
+    enum Admission {
+        case admitted(Slot)
+        case busy(BusyReason)
+    }
+
+    enum CompletionDirective: Equatable {
+        case deliver
+        case deferred
+        case settleDetached
+        case settleAbandoned
+        case settleForceDisconnected
         case ignored
-        case reserved
-        case detached
+    }
+
+    enum GraceExpiryDirective: Equatable {
+        case detach
+        case forceDisconnect
+        case settled
+    }
+
+    enum DetachActivationDirective: Equatable {
+        case activated
+        case settled(MCPToolExecutionSettlement)
+        case notActivated
+    }
+
+    enum CancellationDirective: Equatable {
+        case abandoned(MCPToolExecutionSettlement?)
+        case alreadyDetached
+        case forceDisconnect(MCPToolExecutionSettlement?)
+        case settled
+    }
+
+    enum EarlyExitDisposition: Equatable {
+        case released
+        case retained
+        case alreadySettled
     }
 
     struct Snapshot: Equatable {
@@ -24,7 +59,7 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
 
     final class Slot: @unchecked Sendable {
         let windowID: Int
-        let generation: UInt64
+        let leaseID: UUID
         let connectionID: UUID
         let invocationID: UUID
 
@@ -33,47 +68,87 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         fileprivate init(
             registry: MCPCodeStructureSettlementRegistry,
             windowID: Int,
-            generation: UInt64,
+            leaseID: UUID,
             connectionID: UUID,
             invocationID: UUID
         ) {
             self.registry = registry
             self.windowID = windowID
-            self.generation = generation
+            self.leaseID = leaseID
             self.connectionID = connectionID
             self.invocationID = invocationID
         }
 
-        @discardableResult
-        func markDetached() -> Bool {
-            registry?.markDetached(windowID: windowID, generation: generation) ?? false
+        func recordCompletion(_ settlement: MCPToolExecutionSettlement) -> CompletionDirective {
+            registry?.recordCompletion(
+                windowID: windowID,
+                leaseID: leaseID,
+                invocationID: invocationID,
+                settlement: settlement
+            ) ?? .ignored
+        }
+
+        func resolveGraceExpiry() -> GraceExpiryDirective {
+            registry?.resolveGraceExpiry(
+                windowID: windowID,
+                leaseID: leaseID,
+                invocationID: invocationID
+            ) ?? .settled
+        }
+
+        func activateDetach() -> DetachActivationDirective {
+            registry?.activateDetach(
+                windowID: windowID,
+                leaseID: leaseID,
+                invocationID: invocationID
+            ) ?? .notActivated
+        }
+
+        func cancel() -> CancellationDirective {
+            registry?.cancel(
+                windowID: windowID,
+                leaseID: leaseID,
+                invocationID: invocationID
+            ) ?? .settled
         }
 
         @discardableResult
-        func complete() -> CompletionDisposition {
-            registry?.complete(windowID: windowID, generation: generation) ?? .ignored
+        func closeBeforeExecutionExit() -> EarlyExitDisposition {
+            registry?.closeBeforeExecutionExit(
+                windowID: windowID,
+                leaseID: leaseID,
+                invocationID: invocationID
+            ) ?? .alreadySettled
         }
 
         deinit {
-            _ = complete()
+            #if DEBUG
+                registry?.assertLeaseReleased(
+                    windowID: windowID,
+                    leaseID: leaseID,
+                    invocationID: invocationID
+                )
+            #endif
         }
     }
 
-    private enum State: Equatable {
+    fileprivate enum State: Equatable {
         case reserved
+        case detaching(MCPToolExecutionSettlement?)
         case detached
+        case abandoned
+        case forceDisconnecting
     }
 
     private struct Entry {
-        let generation: UInt64
+        let leaseID: UUID
         let connectionID: UUID
         let invocationID: UUID
         var state: State
     }
 
     private let lock = NSLock()
-    private var nextGeneration: UInt64 = 1
-    private var entriesByWindowID: [Int: Entry] = [:]
+    private var entriesByWindowID: [Int: [UUID: Entry]] = [:]
     private var drainWaitersByWindowID: [Int: [CheckedContinuation<Void, Never>]] = [:]
 
     func admit(
@@ -82,30 +157,22 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         invocationID: UUID
     ) -> Admission {
         lock.withLock {
-            if let entry = entriesByWindowID[windowID] {
-                switch entry.state {
-                case .reserved:
-                    return .forceDisconnect
-                case .detached:
-                    return .busy
-                }
+            let entries = entriesByWindowID[windowID, default: [:]]
+            if entries.values.contains(where: \.state.blocksAdmission) {
+                return .busy(Self.busyReason(for: entries.values))
             }
 
-            let generation = nextGeneration
-            nextGeneration &+= 1
-            if nextGeneration == 0 {
-                nextGeneration = 1
-            }
-            entriesByWindowID[windowID] = Entry(
-                generation: generation,
+            let leaseID = UUID()
+            entriesByWindowID[windowID, default: [:]][leaseID] = Entry(
+                leaseID: leaseID,
                 connectionID: connectionID,
                 invocationID: invocationID,
                 state: .reserved
             )
-            return .detachEligible(Slot(
+            return .admitted(Slot(
                 registry: self,
                 windowID: windowID,
-                generation: generation,
+                leaseID: leaseID,
                 connectionID: connectionID,
                 invocationID: invocationID
             ))
@@ -114,12 +181,10 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
 
     func snapshot(windowID: Int) -> Snapshot {
         lock.withLock {
-            guard let entry = entriesByWindowID[windowID] else {
-                return Snapshot(activeCount: 0, detachedCount: 0)
-            }
+            let entries = entriesByWindowID[windowID, default: [:]]
             return Snapshot(
-                activeCount: 1,
-                detachedCount: entry.state == .detached ? 1 : 0
+                activeCount: entries.count,
+                detachedCount: entries.values.count { $0.state.isZombie }
             )
         }
     }
@@ -127,7 +192,7 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
     func awaitDrained(windowID: Int) async {
         await withCheckedContinuation { continuation in
             let shouldResume = lock.withLock {
-                guard entriesByWindowID[windowID] != nil else { return true }
+                guard entriesByWindowID[windowID]?.isEmpty == false else { return true }
                 drainWaitersByWindowID[windowID, default: []].append(continuation)
                 return false
             }
@@ -137,31 +202,252 @@ final class MCPCodeStructureSettlementRegistry: @unchecked Sendable {
         }
     }
 
-    private func markDetached(windowID: Int, generation: UInt64) -> Bool {
+    private func recordCompletion(
+        windowID: Int,
+        leaseID: UUID,
+        invocationID: UUID,
+        settlement: MCPToolExecutionSettlement
+    ) -> CompletionDirective {
+        transition(windowID: windowID, leaseID: leaseID, invocationID: invocationID) { entry in
+            switch entry.state {
+            case .reserved:
+                return (.remove, .deliver)
+            case .detaching:
+                entry.state = .detaching(settlement)
+                return (.retain(entry), .deferred)
+            case .detached:
+                return (.remove, .settleDetached)
+            case .abandoned:
+                return (.remove, .settleAbandoned)
+            case .forceDisconnecting:
+                return (.remove, .settleForceDisconnected)
+            }
+        } ?? .ignored
+    }
+
+    private func resolveGraceExpiry(
+        windowID: Int,
+        leaseID: UUID,
+        invocationID: UUID
+    ) -> GraceExpiryDirective {
         lock.withLock {
-            guard var entry = entriesByWindowID[windowID],
-                  entry.generation == generation
-            else { return false }
-            entry.state = .detached
-            entriesByWindowID[windowID] = entry
-            return true
+            guard var entries = entriesByWindowID[windowID],
+                  var entry = entries[leaseID],
+                  entry.invocationID == invocationID
+            else { return .settled }
+
+            switch entry.state {
+            case .reserved:
+                let otherUnsettled = entries.values.contains {
+                    $0.leaseID != leaseID && $0.state.blocksAdmission
+                }
+                if otherUnsettled {
+                    entry.state = .forceDisconnecting
+                    entries[leaseID] = entry
+                    entriesByWindowID[windowID] = entries
+                    return .forceDisconnect
+                }
+                entry.state = .detaching(nil)
+                entries[leaseID] = entry
+                entriesByWindowID[windowID] = entries
+                return .detach
+            case .detaching, .detached:
+                return .detach
+            case .abandoned:
+                return .settled
+            case .forceDisconnecting:
+                return .forceDisconnect
+            }
         }
     }
 
-    private func complete(
+    private func activateDetach(
         windowID: Int,
-        generation: UInt64
-    ) -> CompletionDisposition {
-        let result: (CompletionDisposition, [CheckedContinuation<Void, Never>]) = lock.withLock {
-            guard let entry = entriesByWindowID[windowID],
-                  entry.generation == generation
-            else { return (.ignored, []) }
+        leaseID: UUID,
+        invocationID: UUID
+    ) -> DetachActivationDirective {
+        let result: (DetachActivationDirective, [CheckedContinuation<Void, Never>]) = lock.withLock {
+            guard var entries = entriesByWindowID[windowID],
+                  var entry = entries[leaseID],
+                  entry.invocationID == invocationID
+            else { return (.notActivated, []) }
 
-            entriesByWindowID.removeValue(forKey: windowID)
-            let disposition: CompletionDisposition = entry.state == .detached ? .detached : .reserved
-            return (disposition, drainWaitersByWindowID.removeValue(forKey: windowID) ?? [])
+            guard case let .detaching(settlement) = entry.state else {
+                return (.notActivated, [])
+            }
+            if let settlement {
+                entries.removeValue(forKey: leaseID)
+                return (
+                    .settled(settlement),
+                    storeEntriesAndTakeWaiters(entries, windowID: windowID)
+                )
+            }
+            entry.state = .detached
+            entries[leaseID] = entry
+            entriesByWindowID[windowID] = entries
+            return (.activated, [])
         }
         result.1.forEach { $0.resume() }
         return result.0
+    }
+
+    private func cancel(
+        windowID: Int,
+        leaseID: UUID,
+        invocationID: UUID
+    ) -> CancellationDirective {
+        let result: (CancellationDirective, [CheckedContinuation<Void, Never>]) = lock.withLock {
+            guard var entries = entriesByWindowID[windowID],
+                  var entry = entries[leaseID],
+                  entry.invocationID == invocationID
+            else { return (.settled, []) }
+
+            switch entry.state {
+            case .reserved:
+                entry.state = .abandoned
+                entries[leaseID] = entry
+                entriesByWindowID[windowID] = entries
+                return (.abandoned(nil), [])
+
+            case let .detaching(settlement):
+                if let settlement {
+                    entries.removeValue(forKey: leaseID)
+                    let waiters = storeEntriesAndTakeWaiters(entries, windowID: windowID)
+                    return (.abandoned(settlement), waiters)
+                }
+                entry.state = .abandoned
+                entries[leaseID] = entry
+                entriesByWindowID[windowID] = entries
+                return (.abandoned(nil), [])
+
+            case .detached:
+                return (.alreadyDetached, [])
+
+            case .abandoned:
+                return (.abandoned(nil), [])
+
+            case .forceDisconnecting:
+                return (.forceDisconnect(nil), [])
+            }
+        }
+        result.1.forEach { $0.resume() }
+        return result.0
+    }
+
+    private func closeBeforeExecutionExit(
+        windowID: Int,
+        leaseID: UUID,
+        invocationID: UUID
+    ) -> EarlyExitDisposition {
+        let result: (EarlyExitDisposition, [CheckedContinuation<Void, Never>]) = lock.withLock {
+            guard var entries = entriesByWindowID[windowID],
+                  let entry = entries[leaseID],
+                  entry.invocationID == invocationID
+            else { return (.alreadySettled, []) }
+
+            guard case .reserved = entry.state else {
+                return (.retained, [])
+            }
+            entries.removeValue(forKey: leaseID)
+            return (
+                .released,
+                storeEntriesAndTakeWaiters(entries, windowID: windowID)
+            )
+        }
+        result.1.forEach { $0.resume() }
+        return result.0
+    }
+
+    private enum Mutation {
+        case retain(Entry)
+        case remove
+    }
+
+    private func transition<Result>(
+        windowID: Int,
+        leaseID: UUID,
+        invocationID: UUID,
+        mutation: (inout Entry) -> (Mutation, Result)
+    ) -> Result? {
+        let result: (Result?, [CheckedContinuation<Void, Never>]) = lock.withLock {
+            guard var entries = entriesByWindowID[windowID],
+                  var entry = entries[leaseID],
+                  entry.invocationID == invocationID
+            else { return (nil, []) }
+
+            let (entryMutation, value) = mutation(&entry)
+            switch entryMutation {
+            case let .retain(updated):
+                entries[leaseID] = updated
+            case .remove:
+                entries.removeValue(forKey: leaseID)
+            }
+            return (
+                value,
+                storeEntriesAndTakeWaiters(entries, windowID: windowID)
+            )
+        }
+        result.1.forEach { $0.resume() }
+        return result.0
+    }
+
+    private func storeEntriesAndTakeWaiters(
+        _ entries: [UUID: Entry],
+        windowID: Int
+    ) -> [CheckedContinuation<Void, Never>] {
+        if entries.isEmpty {
+            entriesByWindowID.removeValue(forKey: windowID)
+            return drainWaitersByWindowID.removeValue(forKey: windowID) ?? []
+        }
+        entriesByWindowID[windowID] = entries
+        return []
+    }
+
+    private static func busyReason(
+        for entries: Dictionary<UUID, Entry>.Values
+    ) -> BusyReason {
+        if entries.contains(where: {
+            if case .abandoned = $0.state { return true }
+            return false
+        }) {
+            return .abandoned
+        }
+        if entries.contains(where: \.state.isZombie) {
+            return .detached
+        }
+        return .settling
+    }
+
+    #if DEBUG
+        private func assertLeaseReleased(
+            windowID: Int,
+            leaseID: UUID,
+            invocationID: UUID
+        ) {
+            let leaked = lock.withLock {
+                entriesByWindowID[windowID]?[leaseID]?.invocationID == invocationID
+            }
+            assert(!leaked, "Leaked get_code_structure settlement lease \(invocationID)")
+        }
+    #endif
+}
+
+private extension MCPCodeStructureSettlementRegistry.State {
+    var isZombie: Bool {
+        switch self {
+        case .detaching, .detached, .abandoned:
+            true
+        case .reserved, .forceDisconnecting:
+            false
+        }
+    }
+
+    var blocksAdmission: Bool {
+        switch self {
+        case .reserved:
+            false
+        case .detaching, .detached, .abandoned, .forceDisconnecting:
+            true
+        }
     }
 }

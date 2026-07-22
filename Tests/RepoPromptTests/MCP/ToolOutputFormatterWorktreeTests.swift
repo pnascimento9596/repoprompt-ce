@@ -706,11 +706,21 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
     }
 
     func testHistoryFormatterTreatsNoMatchesAsSuccessfulEmptyResult() throws {
+        struct ScanDiagnostic: Encodable {
+            let kind = "turn_count"
+            let retryable = true
+            let limit = 250_000
+            let consumed = 250_000
+            let unit = "turns"
+        }
+
         struct HistoryList: Encodable {
             let total_sessions = 0
+            let totals_are_lower_bounds = true
             let truncated = false
             let sessions_scanned = 20
             let scan_truncated = true
+            let scan_diagnostics = [ScanDiagnostic()]
             let skipped_workspaces: [String] = []
             let sessions: [String] = []
         }
@@ -719,10 +729,91 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             args: ["op": .string("list_sessions"), "touched_file": .string("Sources/App.swift")],
             value: Self.value(HistoryList())
         ))
-        XCTAssertTrue(text.contains("## History Sessions ✅"))
+        XCTAssertTrue(text.contains("## History Sessions ⚠️"))
+        XCTAssertTrue(text.contains("**Total sessions**: 0 (lower bound)"))
         XCTAssertTrue(text.contains("No matching sessions found"))
         XCTAssertTrue(text.contains("touched_file"))
+        XCTAssertTrue(text.contains("Scan budget"))
+        XCTAssertTrue(text.contains("Retry with a narrower"))
         XCTAssertFalse(text.contains("## History Sessions ❌"))
+    }
+
+    func testHistoryFormatterPreservesRetryableErrorDiagnosticsAndAdvice() throws {
+        struct ScanDiagnostic: Encodable {
+            let kind = "elapsed_time"
+            let retryable = true
+            let limit = 20000
+            let consumed = 20000
+            let unit = "milliseconds"
+            let phase = "get_session_refresh"
+        }
+
+        struct HistoryError: Encodable {
+            let error = "History session lookup was incomplete before the request work budget expired."
+            let retryable = true
+            let scan_truncated = true
+            let scan_diagnostics = [ScanDiagnostic()]
+            let suggestion = "Retry the same get_session request; no authoritative not-found result was produced."
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("get_session")],
+            value: Self.value(HistoryError())
+        ))
+        XCTAssertTrue(text.contains("## History ⚠️"))
+        XCTAssertTrue(text.contains("**Retryable**: yes"))
+        XCTAssertTrue(text.contains("elapsed_time: 20000/20000 milliseconds during get_session_refresh; retryable"))
+        XCTAssertTrue(text.contains("no authoritative not-found result"))
+    }
+
+    func testHistoryFormatterCompactsRepeatedAndCappedScanDiagnostics() throws {
+        struct ScanDiagnostic: Encodable {
+            let kind: String
+            let retryable: Bool
+            let limit: Int
+            let consumed: Int
+            let unit: String
+            let phase: String
+            let count: Int
+        }
+
+        struct HistorySearch: Encodable {
+            let total_matches = 0
+            let truncated = false
+            let sessions_scanned = 0
+            let scan_truncated = true
+            let totals_are_lower_bounds = true
+            let scan_diagnostics = [
+                ScanDiagnostic(
+                    kind: "transcript_read_failure",
+                    retryable: true,
+                    limit: 1,
+                    consumed: 1,
+                    unit: "sessions",
+                    phase: "transcript_scan",
+                    count: 250
+                ),
+                ScanDiagnostic(
+                    kind: "diagnostic_count",
+                    retryable: true,
+                    limit: 16,
+                    consumed: 4,
+                    unit: "sessions",
+                    phase: "diagnostic_aggregation",
+                    count: 4
+                )
+            ]
+            let results: [String] = []
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("search")],
+            value: Self.value(HistorySearch())
+        ))
+
+        XCTAssertTrue(text.contains("transcript_read_failure: 1/1 sessions during transcript_scan; retryable ×250"))
+        XCTAssertTrue(text.contains("+4 additional diagnostic groups omitted"))
+        XCTAssertTrue(text.contains("Retry with a narrower"))
     }
 
     func testHistoryFormatterShowsFilesTouchedTruncation() throws {

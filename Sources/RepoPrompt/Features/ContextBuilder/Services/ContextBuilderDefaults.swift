@@ -35,21 +35,19 @@ enum ContextBuilderDefaults {
     /// Default timeout (in seconds) for user responses to clarifying questions
     static let questionTimeoutSeconds = MCPTimeoutPolicy.askUserDefaultTimeoutSeconds
 
-    /// A missing run-owned MCP connection remains a fast failure.
-    static let mcpNoConnectionTimeoutSeconds: TimeInterval = 10
+    /// Report-only watchdog for a live run that has not yet opened its owned MCP connection.
+    static let mcpRoutingWatchdogSeconds: TimeInterval = 30
 
-    /// Once the exact connection is observed, route materialization gets bounded handshake grace.
-    static let mcpObservedConnectionGraceSeconds: TimeInterval = 20
+    /// Maximum buffered text while routing is pending. Control events are always preserved.
+    static let mcpPreRouteBufferedTextCharacterLimit = 64000
 
-    static let mcpRoutingWaitPolicy = MCPRoutingWaitPolicy(
-        noConnectionTimeoutSeconds: mcpNoConnectionTimeoutSeconds,
-        observedConnectionGraceSeconds: mcpObservedConnectionGraceSeconds
-    )
+    /// Maximum early provider events retained while routing is pending. Redundant progress and
+    /// retry notifications are coalesced or dropped before ordered terminal/error/tool events.
+    static let mcpPreRouteBufferedEventLimit = 256
 
-    /// Leak bound for the pending policy, derived once from both phases plus a safety margin.
-    /// Observation/reconnect never refreshes it.
-    static let mcpBootstrapConnectionTTL =
-        mcpNoConnectionTimeoutSeconds + mcpObservedConnectionGraceSeconds + 5
+    /// Diagnostic age recorded on the policy. Context Builder policies are settlement-scoped and
+    /// are never revoked because this interval elapsed.
+    static let mcpBootstrapConnectionTTL: TimeInterval = 35
 
     /// Bounded handoff after response-drain failure while orderly peer-EOF teardown publishes final context ownership.
     static let peerEOFDetachmentHandoffTimeoutSeconds: TimeInterval = 10

@@ -859,6 +859,13 @@ class OracleViewModel: ObservableObject {
         (pinnedSessionRefCounts[sessionID] ?? 0) > 0
     }
 
+    #if DEBUG
+        @MainActor
+        func isSessionPinnedForTesting(_ sessionID: UUID) -> Bool {
+            isSessionPinned(sessionID)
+        }
+    #endif
+
     nonisolated static func shouldUseLivePromptStateForAutosave(
         sessionID: UUID,
         currentSessionID: UUID?,

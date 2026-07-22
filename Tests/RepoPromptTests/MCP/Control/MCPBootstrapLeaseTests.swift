@@ -101,6 +101,49 @@ final class MCPBootstrapLeaseTests: XCTestCase {
         #endif
     }
 
+    func testIndefiniteRoutedOutcomeRemainsObservableForLeaseLifetime() async {
+        let runID = UUID()
+        let policyRecorder = PolicyRecorder()
+        await HeadlessAgentConnectionGate.cancelAll()
+        await MCPRoutingWaiter.cleanup(runID: runID)
+
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: runID,
+                gateID: UUID(),
+                windowID: 1,
+                tabID: UUID(),
+                clientName: "bootstrap-indefinite-terminal-cache",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "indefinite routed terminal lifetime regression",
+                ttl: 10,
+                purpose: .discoverRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: false
+            ),
+            policyInstaller: { _ in await policyRecorder.recordInstall() },
+            policyClearer: { _ in await policyRecorder.recordClear() }
+        )
+        let acquired = await lease.acquire()
+        XCTAssertTrue(acquired)
+
+        await MCPRoutingWaiter.notifyRouted(runID: runID)
+        let releaseOutcome = await lease.releaseWhenRoutedIndefinitely()
+        let globalOutcomeAfterCleanup = await MCPRoutingWaiter.currentTerminalOutcome(runID: runID)
+        let firstLeaseOutcomeAfterCleanup = await lease.currentRoutingTerminalOutcome()
+        let secondLeaseOutcomeAfterCleanup = await lease.currentRoutingTerminalOutcome()
+        let clearCount = await policyRecorder.clearCount
+
+        XCTAssertEqual(releaseOutcome, .routed)
+        XCTAssertNil(globalOutcomeAfterCleanup)
+        XCTAssertEqual(firstLeaseOutcomeAfterCleanup, .routed)
+        XCTAssertEqual(secondLeaseOutcomeAfterCleanup, .routed)
+        XCTAssertEqual(clearCount, 0)
+    }
+
     func testPIDOwnedEarlyReleaseCleanupRemovesRetainedPolicyForEveryExit() async throws {
         #if DEBUG
             enum ExitMode: String, CaseIterable {
@@ -260,6 +303,113 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 XCTAssertEqual(waiterCount, 0)
                 await MCPRoutingWaiter.cleanup(runID: runID)
             }
+
+            let indefiniteRunID = UUID()
+            let indefinitePolicyRecorder = PolicyRecorder()
+            await MCPRoutingWaiter.cleanup(runID: indefiniteRunID)
+            let indefiniteLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: indefiniteRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: "bootstrap-progress-indefinite",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "indefinite routing cancellation regression",
+                    ttl: 0.001,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await indefinitePolicyRecorder.recordInstall() },
+                policyClearer: { _ in await indefinitePolicyRecorder.recordClear() }
+            )
+            let indefiniteAcquired = await indefiniteLease.acquire()
+            XCTAssertTrue(indefiniteAcquired)
+            let indefiniteWait = Task {
+                await indefiniteLease.releaseWhenRoutedIndefinitely()
+            }
+            await Task.yield()
+            indefiniteWait.cancel()
+            let indefiniteOutcome = await indefiniteWait.value
+            let indefiniteClearCount = await indefinitePolicyRecorder.clearCount
+            XCTAssertEqual(indefiniteOutcome, .cancelled)
+            XCTAssertEqual(indefiniteClearCount, 1)
+            await MCPRoutingWaiter.notifyRouted(runID: indefiniteRunID)
+            let lateRouteContinuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: indefiniteRunID)
+            XCTAssertEqual(lateRouteContinuationCount, 0)
+
+            let settlementRunID = UUID()
+            let settlementClientName = "bootstrap-settlement-policy-\(settlementRunID.uuidString)"
+            let settlementLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: settlementRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: settlementClientName,
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "settlement-scoped policy pruning regression",
+                    ttl: -1,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                )
+            )
+            let settlementAcquired = await settlementLease.acquire()
+            XCTAssertTrue(settlementAcquired)
+            _ = await ServerNetworkManager.shared.requireExpectedAgentPIDForPendingPolicy(
+                for: settlementClientName,
+                runID: settlementRunID,
+                windowID: 1
+            )
+            let pendingAfterAgePrune = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                for: settlementClientName
+            )
+            XCTAssertTrue(pendingAfterAgePrune.contains { $0.runID == settlementRunID })
+
+            await settlementLease.cancelAndCleanup()
+            let pendingAfterSettlement = await ServerNetworkManager.shared.debugPendingPolicySnapshot(
+                for: settlementClientName
+            )
+            XCTAssertFalse(pendingAfterSettlement.contains { $0.runID == settlementRunID })
+
+            let providerCompletionRunID = UUID()
+            await MCPRoutingWaiter.register(runID: providerCompletionRunID)
+            let committedAtProviderCompletionLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: providerCompletionRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: "bootstrap-provider-completion-race",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "provider completion route authority regression",
+                    ttl: 1,
+                    purpose: .discoverRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                routeAuthorityResolver: { _ in .committed }
+            )
+            let providerCompletionAuthority = await committedAtProviderCompletionLease
+                .resolveRouteAuthorityAtProviderCompletion()
+            XCTAssertEqual(providerCompletionAuthority, .committed)
+            let providerCompletionWaitOutcome = await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: providerCompletionRunID,
+                timeoutSeconds: 0
+            )
+            XCTAssertEqual(providerCompletionWaitOutcome, .routed)
+            await MCPRoutingWaiter.cleanup(runID: providerCompletionRunID)
         #else
             throw XCTSkip("Bootstrap routing progress diagnostics require DEBUG helpers.")
         #endif
@@ -358,7 +508,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             ),
             policyInstaller: { _ in await policyRecorder.recordInstall() },
             policyClearer: { _ in await policyRecorder.recordClear() },
-            committedRouteConfirmer: { _ in true }
+            routeAuthorityResolver: { _ in .committed }
         )
         let acquired = await lease.acquire()
         XCTAssertTrue(acquired)
@@ -409,7 +559,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             ),
             policyInstaller: { _ in await policyRecorder.recordInstall() },
             policyClearer: { _ in await policyRecorder.recordClear() },
-            committedRouteConfirmer: { _ in false }
+            routeAuthorityResolver: { _ in .revocationFenced }
         )
         let acquired = await lease.acquire()
         XCTAssertTrue(acquired)

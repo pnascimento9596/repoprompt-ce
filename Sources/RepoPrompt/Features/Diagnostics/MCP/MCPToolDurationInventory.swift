@@ -148,6 +148,8 @@ import RepoPromptShared
                 MCPTimeoutPolicy.applyEditsApprovalTimeoutSeconds
             case MCPWindowToolName.manageWorktree:
                 MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds
+            case MCPWindowToolName.getCodeStructure:
+                Double(workspaceCodemapProductionDemandWaitMilliseconds) / 1000
             default:
                 nil
             }
@@ -190,7 +192,7 @@ import RepoPromptShared
                     expectedActiveDuration: "Ordinary dispatch must complete within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
                     evidence: "ServerNetworkManager applies MCPToolExecutionWatchdog at the resolved provider boundary.",
                     qualification: cleanupDisposition == .detachAndSettle
-                        ? "At most one read-only provider per window may remain detached after grace. Its ordinary permit and publication ownership are released, creating a bounded +1 provider-capacity exception until eventual settlement; later structure calls return retryable busy only after detachment."
+                        ? "A per-window settlement fence rejects later structure calls while any detached, abandoned, or force-disconnecting lease remains. The number that may remain fenced after ordinary permits and publication ownership are released is bounded by the already-admitted same-window calls: only one grace-expiring call may detach, request-cancelled calls become abandoned, and competing grace expiry resolves atomically to force-disconnect. Exact late settlement clears only its invocation lease. The provider's fixed 10-second readiness ceiling remains the liveness guarantee without a second registry TTL."
                         : "Cancellation must release provider, limiter, ownership, and run-registration state; an uncooperative handler force-disconnects its connection after grace.",
                     semanticWaitMaximumSeconds: semanticWaitMaximumSeconds,
                     conditionalExecutionOverrides: conditionalExecutionOverrides

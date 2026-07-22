@@ -1425,7 +1425,6 @@ final class AgentModeViewModel: ObservableObject {
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
             let options = CodexNativeSessionController.Options.agentModeDefault(
-                forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
@@ -15721,7 +15720,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Delete a session completely (clear chat and close tab)
-    func deleteSession(tabID: UUID) async {
+    func deleteSession(tabID: UUID, workspace: WorkspaceModel) async throws {
         #if DEBUG
             let deleteSessionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
@@ -15751,11 +15750,14 @@ final class AgentModeViewModel: ObservableObject {
             liveSession: liveSession,
             reason: "session_delete"
         )
-        let workspaceID = workspaceManager?.activeWorkspace?.id
-        if let workspace = workspaceManager?.activeWorkspace,
-           let sessionID
-        {
-            try? await dataService.deleteAgentSession(id: sessionID, for: workspace)
+        let workspaceID = workspace.id
+        var persistedDeletionError: Error?
+        if let sessionID {
+            do {
+                try await dataService.deleteAgentSession(id: sessionID, for: workspace)
+            } catch {
+                persistedDeletionError = error
+            }
             removeSessionIndex(sessionID: sessionID)
         } else {
             removeSessionIndex(forTabID: tabID)
@@ -15788,6 +15790,9 @@ final class AgentModeViewModel: ObservableObject {
                 ]
             )
         #endif
+        if let persistedDeletionError {
+            throw persistedDeletionError
+        }
     }
 
     /// Last activity timestamp for sorting tabs in the UI

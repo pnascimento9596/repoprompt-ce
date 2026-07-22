@@ -167,7 +167,7 @@ actor MCPBootstrapLease {
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
-    private let committedRouteConfirmer: (MCPBootstrapLeaseSpec) async -> Bool
+    private let routeAuthorityResolver: (MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision
 
     private var hasAcquired = false
     private var hasReleased = false
@@ -177,6 +177,10 @@ actor MCPBootstrapLease {
     private var policyInstalled = false
     private var didSignalRoutingFailure = false
     private var didReleaseGate = false
+    /// Lease-local terminal memory survives teardown of the process-global waiter state. Because a
+    /// lease is permanently scoped to one immutable run and releaseRouting is one-shot, this cache
+    /// cannot confer routing authority on a successor run.
+    private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
     private var policyClearOperation: Task<Void, Never>?
     private var routingCleanupOperation: Task<Void, Never>?
@@ -203,14 +207,14 @@ actor MCPBootstrapLease {
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
-        committedRouteConfirmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
+        routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil
     ) {
         self.spec = spec
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
-        self.committedRouteConfirmer = committedRouteConfirmer ?? Self.defaultCommittedRouteConfirmer
+        self.routeAuthorityResolver = routeAuthorityResolver ?? Self.defaultRouteAuthorityResolver
     }
 
     // MARK: - Core Lifecycle
@@ -359,6 +363,7 @@ actor MCPBootstrapLease {
     private enum RoutingWaitSelection {
         case absolute(timeoutMs: Int)
         case adaptive(MCPRoutingWaitPolicy)
+        case indefinite
     }
 
     /// Legacy compatibility API. The Boolean wrapper retains one absolute deadline and
@@ -375,7 +380,7 @@ actor MCPBootstrapLease {
         return outcome.routed
     }
 
-    /// Typed adaptive API used by Context Builder.
+    /// Typed adaptive API retained for callers that require bounded readiness.
     func releaseWhenRouted(
         waitPolicy: MCPRoutingWaitPolicy,
         progressReporter: MCPBootstrapRoutingProgressReporter? = nil
@@ -384,6 +389,34 @@ actor MCPBootstrapLease {
             selection: .adaptive(waitPolicy),
             progressReporter: progressReporter
         )
+    }
+
+    /// Waits until routing commits, ownership is lost, or the caller cancels. Elapsed time is not terminal.
+    func releaseWhenRoutedIndefinitely(
+        progressReporter: MCPBootstrapRoutingProgressReporter? = nil
+    ) async -> MCPRoutingWaitOutcome {
+        await releaseRouting(
+            selection: .indefinite,
+            progressReporter: progressReporter
+        )
+    }
+
+    /// Returns a routing terminal signal that may have arrived before the waiter task enrolled.
+    func currentRoutingTerminalOutcome() async -> MCPRoutingWaitOutcome? {
+        if let routingTerminalOutcome {
+            return routingTerminalOutcome
+        }
+        return await MCPRoutingWaiter.currentTerminalOutcome(runID: spec.runID)
+    }
+
+    /// Resolves a provider-boundary race through the same route authority used by bounded waits.
+    /// Re-signaling a confirmed route prevents notification lag from parking the indefinite waiter.
+    func resolveRouteAuthorityAtProviderCompletion() async -> MCPRunRouteAuthorityDecision {
+        let decision = await routeAuthorityResolver(spec)
+        if decision == .committed {
+            await MCPRoutingWaiter.notifyRouted(runID: spec.runID)
+        }
+        return decision
     }
 
     private func releaseRouting(
@@ -405,8 +438,16 @@ actor MCPBootstrapLease {
         case let .adaptive(policy):
             timeoutMs = 0
             waitPolicy = policy
+        case .indefinite:
+            timeoutMs = 0
+            waitPolicy = nil
         }
 
+        if case .indefinite = selection {
+            // PID-owned policies already released the gate during acquire. This also prevents
+            // legacy ownership from parking the process-global gate for an unbounded wait.
+            await releaseOwnedGate(reason: "indefinite_route_wait")
+        }
         let ownedGateBeforeWait = ownsGate
         let progressLifecycle = progressReporter.map {
             MCPBootstrapRoutingProgressLifecycle(reporter: $0)
@@ -437,15 +478,23 @@ actor MCPBootstrapLease {
         var outcome = releaseResult.routingOutcome
 
         // A committed route can cross the waiter deadline before its notification is delivered.
-        // Recheck authoritative maps before any revocation/cleanup, but never accept staged tokens.
+        // Resolve that race through the route owner's conditional revocation fence. A fenced
+        // timeout is revoked below through clearPolicyOnce so concurrent cancellation still
+        // joins the lease's sole idempotent cleanup operation.
+        var routeAuthorityDecision: MCPRunRouteAuthorityDecision?
         switch outcome {
         case .timedOutBeforeConnection, .timedOutAfterConnection:
-            if await committedRouteConfirmer(spec) {
+            routeAuthorityDecision = await routeAuthorityResolver(spec)
+            if routeAuthorityDecision == .committed {
                 outcome = .routed
             }
         case .routed, .failed, .cancelled:
             break
         }
+
+        // Publish the finalized result to this run's lease before any awaited diagnostics or
+        // cleanup can erase MCPRoutingWaiter's process-global terminal state.
+        routingTerminalOutcome = outcome
 
         if ownedGateBeforeWait || releaseResult.gateRelease.released {
             let gateReleaseReason = switch outcome {
@@ -463,7 +512,9 @@ actor MCPBootstrapLease {
             await recordGateRelease(releaseResult.gateRelease, reason: gateReleaseReason)
         }
 
-        if !outcome.routed, policyInstalled {
+        if !outcome.routed, policyInstalled,
+           routeAuthorityDecision == nil || routeAuthorityDecision == .revocationFenced
+        {
             await clearPolicyOnce()
         }
         if routingRegistered {
@@ -807,7 +858,8 @@ actor MCPBootstrapLease {
             purpose: spec.purpose,
             taskLabelKind: spec.taskLabelKind,
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
-            requiresExpectedAgentPID: spec.requiresExpectedAgentPID
+            requiresExpectedAgentPID: spec.requiresExpectedAgentPID,
+            prunesOnlyAfterSettlement: spec.purpose == .discoverRun
         )
     }
 
@@ -820,8 +872,8 @@ actor MCPBootstrapLease {
         )
     }
 
-    private static let defaultCommittedRouteConfirmer: (MCPBootstrapLeaseSpec) async -> Bool = { spec in
-        await ServerNetworkManager.shared.isRunRouteAuthoritativelyCommitted(
+    private static let defaultRouteAuthorityResolver: (MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision = { spec in
+        await ServerNetworkManager.shared.confirmCommittedRunRouteOrFenceRevocation(
             runID: spec.runID,
             windowID: spec.windowID,
             tabID: spec.tabID

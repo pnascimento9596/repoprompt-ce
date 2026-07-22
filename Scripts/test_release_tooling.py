@@ -3008,10 +3008,12 @@ label_generated_tip_appcast""",
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("does not verify", rejected.stderr)
 
-    def test_github_tokens_are_scrubbed_before_swiftpm_commands(self) -> None:
+    def test_secret_free_swiftpm_commands_scrub_tokens(self) -> None:
         helper = SCRIPT_DIR / "run_without_github_tokens.sh"
         result = subprocess.run(
             [
+                str(helper),
+                # Re-enter the wrapper to verify nesting remains harmless.
                 str(helper),
                 "bash",
                 "-c",
@@ -3029,8 +3031,33 @@ label_generated_tip_appcast""",
 
         self.assertEqual(result.returncode, 0, result.stderr)
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        universal_builder = (SCRIPT_DIR / "build_swiftpm_release_products.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
-        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
+        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
+        release_workflow = (workflows_dir / "release.yml").read_text(encoding="utf-8")
+        tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
+
+        release_stage_job = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
+        tip_stage_job = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        release_stage_function = release_script.split("stage_publish_release() {", 1)[1].split("\n}", 1)[0]
+        tip_stage_function = tip_script.split("stage_tip() {", 1)[1].split("\n}", 1)[0]
+        release_resolver = release_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
+        tip_resolver = tip_script.split("resolve_without_lockfile_drift() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn("run: ./trusted-control-plane/Scripts/release.sh stage-publish", release_stage_job)
+        self.assertIn("run: ./trusted-control-plane/Scripts/main_tip_release.sh stage", tip_stage_job)
+        self.assertIn("resolve_without_lockfile_drift", release_stage_function)
+        self.assertIn("resolve_without_lockfile_drift", tip_stage_function)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_resolver)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', tip_resolver)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY', release_stage_function)
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY', tip_stage_function)
+        self.assertIn(
+            'REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS="$RUN_WITHOUT_GITHUB_TOKENS"',
+            package_script,
+        )
+        self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift build', universal_builder)
         self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 4)
         self.assertIn(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',

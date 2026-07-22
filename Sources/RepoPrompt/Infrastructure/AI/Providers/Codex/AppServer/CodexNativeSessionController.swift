@@ -489,7 +489,6 @@ final class CodexNativeSessionController {
         }
 
         static func agentModeDefault(
-            forceExperimentalSteering: Bool,
             approvalPolicyProvider: @escaping () -> CodexAgentToolPreferences.ApprovalPolicy = { CodexAgentToolPreferences.approvalPolicy() },
             sandboxModeProvider: @escaping () -> CodexAgentToolPreferences.SandboxMode = { CodexAgentToolPreferences.sandboxMode() },
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
@@ -510,10 +509,6 @@ final class CodexNativeSessionController {
                         )
                     }
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
-                        forceExperimentalSteering: forceExperimentalSteering,
-                        approvalPolicy: approvalPolicyProvider(),
-                        sandboxMode: sandboxModeProvider(),
-                        approvalReviewer: approvalReviewerProvider(),
                         shellToolEnabled: shellToolEnabled,
                         suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
@@ -745,7 +740,6 @@ final class CodexNativeSessionController {
         tabID: UUID,
         windowID: Int,
         workspacePaths: CodexRuntimeWorkspacePaths,
-        forceExperimentalSteering: Bool = false,
         options: Options? = nil,
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
@@ -756,7 +750,7 @@ final class CodexNativeSessionController {
         self.tabID = tabID
         self.windowID = windowID
         self.workspacePaths = workspacePaths
-        self.options = options ?? Self.Options.agentModeDefault(forceExperimentalSteering: forceExperimentalSteering)
+        self.options = options ?? Self.Options.agentModeDefault()
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
@@ -7989,27 +7983,18 @@ final class CodexNativeSessionController {
     static func defaultAppServerToolPolicy(
         shellToolEnabled: Bool,
         webSearchRequestEnabled: Bool,
-        forceExperimentalSteering: Bool,
         modelReasoningSummary: CodexOverrides.ReasoningSummary? = .auto
     ) -> CodexOverrides.ToolPolicy {
         CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: shellToolEnabled,
             webSearchRequestEnabled: webSearchRequestEnabled,
-            viewImageToolEnabled: true,
-            // Best-effort only; native FileChange events are still the authoritative patch signal.
-            includeApplyPatchTool: false,
             multiAgentEnabled: false,
-            experimentalSteeringEnabled: forceExperimentalSteering ? true : nil,
             modelReasoningSummary: modelReasoningSummary
         )
     }
 
     static func defaultAppServerConfigOverrides(
-        forceExperimentalSteering: Bool,
-        approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy? = nil,
-        sandboxMode: CodexAgentToolPreferences.SandboxMode? = nil,
-        approvalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
@@ -8024,7 +8009,6 @@ final class CodexNativeSessionController {
         let toolPolicy = defaultAppServerToolPolicy(
             shellToolEnabled: shellToolEnabled ?? preferences.bashToolEnabled,
             webSearchRequestEnabled: preferences.searchToolEnabled,
-            forceExperimentalSteering: forceExperimentalSteering,
             modelReasoningSummary: modelReasoningSummary
         )
         var overrides = CodexOverrides.appServerConfigMap(
@@ -8040,12 +8024,7 @@ final class CodexNativeSessionController {
         for (key, value) in mcpOverrides {
             overrides[key] = value
         }
-        let effectiveApprovalPolicy = approvalPolicy ?? preferences.approvalPolicy
-        let effectiveSandboxMode = sandboxMode ?? preferences.sandboxMode
-        let effectiveApprovalReviewer = approvalReviewer ?? preferences.approvalReviewer
-        overrides["approval_policy"] = effectiveApprovalPolicy.appServerConfigOverrideValue
-        overrides["sandbox_mode"] = effectiveSandboxMode.appServerConfigOverrideValue
-        overrides["approvals_reviewer"] = effectiveApprovalReviewer.appServerConfigOverrideValue
+        overrides["features.code_mode.direct_only_tool_namespaces"] = ["mcp__RepoPromptCE"]
         return overrides
     }
 

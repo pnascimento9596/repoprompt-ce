@@ -1141,6 +1141,12 @@ final class MCPServerViewModel: ObservableObject {
                 display: display,
                 codeMapUsageOverride: codeMapUsageOverride,
                 lookupContextOverride: lookupContextOverride,
+                // Context Builder owns the selection authority before rendering: a completed run has
+                // already validated the exact committed snapshot revision, while a cancelled or failed
+                // pre-commit run deliberately reports its immutable captured initial snapshot as
+                // informational context. Joining later filesystem ingress cannot improve either
+                // snapshot's authority. Codemap/token freshness remains explicit in the reply metadata.
+                ingressPolicy: .alreadyAwaited,
                 reviewGitContextOverride: reviewGitContextOverride
             )
             #if DEBUG
