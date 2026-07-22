@@ -559,7 +559,8 @@
     },
     {
       "union": "ClientNotification.json",
-      "method": "initialized"
+      "method": "initialized",
+      "alwaysSent": []
     },
     {
       "union": "ServerNotification.json",

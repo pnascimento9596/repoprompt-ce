@@ -488,6 +488,8 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
     checks = contract["methodChecks"]
     if not isinstance(checks, list):
         raise GateError("contract methodChecks must be an array")
+    if not checks:
+        raise GateError("contract methodChecks must not be empty")
 
     identities: set[tuple[str, str]] = set()
     for index, check in enumerate(checks):
@@ -734,7 +736,7 @@ def validate_method_check(
                 label=f"{label} params",
             )
         )
-        if always_sent or may_send:
+        if "alwaysSent" in check or "maySend" in check:
             missing_required = missing_required_sent_paths(
                 document,
                 params,

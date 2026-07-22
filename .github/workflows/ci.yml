@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   style:
     name: Style
@@ -13,6 +16,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Run repository guardrails
         run: make guardrails
@@ -53,6 +58,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Restore SwiftPM build cache
         uses: actions/cache@v6
@@ -100,6 +107,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Restore SwiftPM build cache
         uses: actions/cache@v6
@@ -127,6 +136,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Restore SwiftPM build cache
         uses: actions/cache@v6
@@ -149,6 +160,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install gitleaks

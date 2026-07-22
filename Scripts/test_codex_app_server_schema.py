@@ -79,6 +79,55 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateError, "could not parse"):
             gate.parse_version("Codex unknown", label="test")
 
+    def test_committed_contract_has_reviewed_method_identity_baseline(self) -> None:
+        committed = gate.load_json(gate.DEFAULT_CONTRACT)
+        gate.validate_contract(committed)
+        checks = committed["methodChecks"]
+        expected = {
+            ("ClientRequest.json", "initialize"),
+            ("ClientRequest.json", "model/list"),
+            ("ClientRequest.json", "thread/start"),
+            ("ClientRequest.json", "thread/resume"),
+            ("ClientRequest.json", "thread/memoryMode/set"),
+            ("ClientRequest.json", "thread/read"),
+            ("ClientRequest.json", "thread/name/set"),
+            ("ClientRequest.json", "thread/goal/get"),
+            ("ClientRequest.json", "thread/goal/set"),
+            ("ClientRequest.json", "thread/goal/clear"),
+            ("ClientRequest.json", "turn/start"),
+            ("ClientRequest.json", "turn/steer"),
+            ("ClientRequest.json", "turn/interrupt"),
+            ("ClientRequest.json", "thread/compact/start"),
+            ("ClientNotification.json", "initialized"),
+            ("ServerNotification.json", "turn/started"),
+            ("ServerNotification.json", "turn/completed"),
+            ("ServerNotification.json", "thread/compacted"),
+            ("ServerNotification.json", "item/started"),
+            ("ServerNotification.json", "item/completed"),
+            ("ServerNotification.json", "item/agentMessage/delta"),
+            ("ServerNotification.json", "item/reasoning/summaryTextDelta"),
+            ("ServerNotification.json", "item/reasoning/textDelta"),
+            ("ServerNotification.json", "thread/tokenUsage/updated"),
+            ("ServerNotification.json", "item/commandExecution/outputDelta"),
+            ("ServerNotification.json", "item/commandExecution/terminalInteraction"),
+            ("ServerNotification.json", "item/fileChange/outputDelta"),
+            ("ServerNotification.json", "item/mcpToolCall/progress"),
+            ("ServerNotification.json", "thread/status/changed"),
+            ("ServerNotification.json", "turn/plan/updated"),
+            ("ServerNotification.json", "turn/diff/updated"),
+            ("ServerNotification.json", "item/plan/delta"),
+            ("ServerRequest.json", "item/tool/requestUserInput"),
+            ("ServerRequest.json", "account/chatgptAuthTokens/refresh"),
+            ("ServerRequest.json", "mcpServer/elicitation/request"),
+            ("ServerRequest.json", "item/permissions/requestApproval"),
+            ("ServerRequest.json", "item/tool/call"),
+            ("ServerRequest.json", "item/commandExecution/requestApproval"),
+            ("ServerRequest.json", "item/fileChange/requestApproval"),
+        }
+
+        self.assertEqual(len(checks), 39)
+        self.assertEqual({(check["union"], check["method"]) for check in checks}, expected)
+
     def test_bundle_validation_accepts_declared_fields_nested_paths_and_enum(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -474,6 +523,40 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
             errors, _ = gate.validate_bundle(root, fixture)
             self.assertTrue(any("incoming enum 'goal.status' changed" in error for error in errors))
 
+    def test_zero_sent_param_method_detects_new_required_param(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            schema_path = root / "ClientNotification.json"
+            schema_path.write_text(
+                json.dumps(method_union("initialized")), encoding="utf-8"
+            )
+            fixture = contract([
+                {
+                    "union": "ClientNotification.json",
+                    "method": "initialized",
+                    "alwaysSent": [],
+                }
+            ])
+            self.assertEqual(gate.validate_bundle(root, fixture)[0], [])
+
+            schema_path.write_text(
+                json.dumps(
+                    method_union(
+                        "initialized",
+                        object_schema(
+                            required=["newRequired"],
+                            properties={"newRequired": {"type": "string"}},
+                        ),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            errors, _ = gate.validate_bundle(root, fixture)
+
+            self.assertTrue(
+                any("schema now requires param 'newRequired'" in error for error in errors)
+            )
+
     def test_bundle_validation_reports_removed_method_and_new_required_param(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -516,6 +599,7 @@ class CodexAppServerSchemaGateTests(unittest.TestCase):
 
         mutations = [
             ("schemaVersion", {**base, "schemaVersion": 2}),
+            ("empty methodChecks", {**base, "methodChecks": []}),
             ("invalid version", {**base, "minimumCodexVersion": "latest"}),
             ("unknown top-level", {**base, "minimumCodexVerison": "0.1.0"}),
             (
