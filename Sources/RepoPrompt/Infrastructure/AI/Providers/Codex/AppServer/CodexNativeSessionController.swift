@@ -575,7 +575,9 @@ final class CodexNativeSessionController {
     private let runID: UUID
     private let tabID: UUID
     private let windowID: Int
-    private let workspacePath: String?
+    /// Launch/execution directory pair; kept whole so the two roles cannot
+    /// drift apart through partial initialization or copying.
+    private let workspacePaths: CodexRuntimeWorkspacePaths
     private let options: Options
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
@@ -742,7 +744,7 @@ final class CodexNativeSessionController {
         runID: UUID,
         tabID: UUID,
         windowID: Int,
-        workspacePath: String?,
+        workspacePaths: CodexRuntimeWorkspacePaths,
         options: Options? = nil,
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
@@ -752,7 +754,7 @@ final class CodexNativeSessionController {
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
-        self.workspacePath = workspacePath
+        self.workspacePaths = workspacePaths
         self.options = options ?? Self.Options.agentModeDefault()
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
@@ -902,7 +904,7 @@ final class CodexNativeSessionController {
     }
 
     private static func makeRawEventLogFileURL(
-        workspacePath: String?,
+        executionDirectory: String?,
         threadID: String
     ) -> URL? {
         let defaults = UserDefaults.standard
@@ -913,10 +915,10 @@ final class CodexNativeSessionController {
                 let expanded = NSString(string: overridePath).expandingTildeInPath
                 return URL(fileURLWithPath: expanded, isDirectory: true)
             }
-            if let workspacePath = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !workspacePath.isEmpty
+            if let executionDirectory = executionDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !executionDirectory.isEmpty
             {
-                return URL(fileURLWithPath: workspacePath, isDirectory: true)
+                return URL(fileURLWithPath: executionDirectory, isDirectory: true)
                     .appendingPathComponent(".codexlogs", isDirectory: true)
             }
             return MCPFilesystemConstants.identity.temporaryRootURL()
@@ -943,7 +945,7 @@ final class CodexNativeSessionController {
             return
         }
         guard let fileURL = Self.makeRawEventLogFileURL(
-            workspacePath: workspacePath,
+            executionDirectory: workspacePaths.executionDirectory,
             threadID: threadIdentifier
         ) else {
             return
@@ -997,7 +999,7 @@ final class CodexNativeSessionController {
                 "runID": runID.uuidString,
                 "tabID": tabID.uuidString,
                 "threadID": threadID ?? "",
-                "workspacePath": workspacePath ?? ""
+                "workspacePath": workspacePaths.executionDirectory ?? ""
             ])
         }
         var record: [String: Any] = [
@@ -1079,7 +1081,7 @@ final class CodexNativeSessionController {
                     .init(clientName: expectedMCPClientName, runID: runID)
                 )
             }
-            await client.updateWorkingDirectory(workspacePath)
+            await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
             await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
@@ -1095,8 +1097,8 @@ final class CodexNativeSessionController {
                     params["model"] = model
                 }
                 Self.addServiceTier(serviceTier, to: &params)
-                if let workspacePath {
-                    params["cwd"] = workspacePath
+                if let executionDirectory = workspacePaths.executionDirectory {
+                    params["cwd"] = executionDirectory
                 }
                 if !configOverrides.isEmpty {
                     params["config"] = configOverrides
@@ -1121,8 +1123,8 @@ final class CodexNativeSessionController {
                     params["model"] = model
                 }
                 Self.addServiceTier(serviceTier, to: &params)
-                if let workspacePath {
-                    params["cwd"] = workspacePath
+                if let executionDirectory = workspacePaths.executionDirectory {
+                    params["cwd"] = executionDirectory
                 }
                 if !configOverrides.isEmpty {
                     params["config"] = configOverrides
@@ -1376,8 +1378,8 @@ final class CodexNativeSessionController {
             params["effort"] = reasoningEffort
         }
         Self.addServiceTier(serviceTier, to: &params)
-        if let workspacePath {
-            params["cwd"] = workspacePath
+        if let executionDirectory = workspacePaths.executionDirectory {
+            params["cwd"] = executionDirectory
         }
         #if DEBUG
             print("[CodexNativeSessionController] turn/start request model=\(String(describing: params["model"] ?? "default")) effort=\(String(describing: params["effort"] ?? "default")) serviceTier=\(String(describing: params["serviceTier"] ?? "missing")) threadID=\(threadID)")
@@ -1393,7 +1395,7 @@ final class CodexNativeSessionController {
             requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
             requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
                 mode: sandboxMode,
-                workspacePath: workspacePath
+                executionDirectory: workspacePaths.executionDirectory
             )
             // app-server v2 turn/start does not accept a config override bag.
             // Thread-level config changes take effect on thread/start or thread/resume.
@@ -3437,7 +3439,7 @@ final class CodexNativeSessionController {
                 runID: UUID(),
                 tabID: UUID(),
                 windowID: 1,
-                workspacePath: nil
+                workspacePaths: .uniform(nil)
             )
             return controller.parseExecCommandEndEvent(params: params)?.resultJSON
         }
@@ -7953,7 +7955,7 @@ final class CodexNativeSessionController {
 
     static func appServerTurnSandboxPolicyPayload(
         mode: CodexAgentToolPreferences.SandboxMode,
-        workspacePath: String?
+        executionDirectory: String?
     ) -> [String: Any] {
         switch mode {
         case .readOnly:
@@ -7965,10 +7967,10 @@ final class CodexNativeSessionController {
                 "type": "workspaceWrite",
                 "networkAccess": true
             ]
-            if let workspacePath = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !workspacePath.isEmpty
+            if let executionDirectory = executionDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !executionDirectory.isEmpty
             {
-                payload["writableRoots"] = [workspacePath]
+                payload["writableRoots"] = [executionDirectory]
             }
             return payload
         }
