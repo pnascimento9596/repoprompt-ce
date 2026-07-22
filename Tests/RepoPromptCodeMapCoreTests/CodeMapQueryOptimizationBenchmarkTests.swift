@@ -333,6 +333,41 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         }
     #endif
 
+    func testTypeScriptAndTSXCorpusCorrectnessReference() throws {
+        #if RPCE_BENCHMARK_TESTS
+            guard TypeScriptCodeMapPipelineBenchmarkSupport.isRuntimeEnabled else {
+                throw XCTSkip("Set RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE=1 to run the TS/TSX corpus reference test")
+            }
+
+            let files = TypeScriptCodeMapPipelineBenchmarkSupport.makeCorpus(
+                tsSource: Self.typeScriptSource(declarationCount: 200),
+                tsxSource: Self.typeScriptXSource(declarationCount: 200)
+            )
+            let artifacts = try files.map(TypeScriptCodeMapPipelineBenchmarkSupport.buildArtifact)
+            let repeated = try files.map(TypeScriptCodeMapPipelineBenchmarkSupport.buildArtifact)
+            XCTAssertEqual(artifacts, repeated)
+
+            let evidences = try zip(files, artifacts).map {
+                try TypeScriptCodeMapPipelineBenchmarkSupport.makeEvidence(file: $0, artifact: $1)
+            }
+            XCTAssertEqual(evidences.count, 2)
+            TypeScriptCodeMapPipelineBenchmarkSupport.printDigestRecord(
+                evidences[0].reference,
+                language: .ts
+            )
+            TypeScriptCodeMapPipelineBenchmarkSupport.printDigestRecord(
+                evidences[1].reference,
+                language: .tsx
+            )
+            try TypeScriptCodeMapPipelineBenchmarkSupport.applyReferenceMode(
+                tsReference: evidences[0].reference,
+                tsxReference: evidences[1].reference
+            )
+        #else
+            throw XCTSkip("Compile with RPCE_ENABLE_BENCHMARK_TESTS=1 to run the TS/TSX corpus reference test")
+        #endif
+    }
+
     func testSwiftSignatureWhitespaceNormalizerMatchesLegacyBehavior() {
         let cases: [(name: String, input: String)] = [
             ("space run", "func  value()"),
@@ -987,6 +1022,7 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         let cases: [(name: String, language: LanguageType, source: String)] = [
             ("swift", .swift, Self.swiftSource(declarationCount: 200)),
             ("typescript", .ts, Self.typeScriptSource(declarationCount: 200)),
+            ("tsx", .tsx, Self.typeScriptXSource(declarationCount: 200)),
         ]
 
         for benchmark in cases {
@@ -1038,21 +1074,19 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             let repeatArtifactEquality = attributedArtifact == expectedArtifact
             XCTAssertTrue(repeatArtifactEquality)
 
-            print(
-                [
-                    "CODEMAP_PREMATERIALIZED_GENERATOR_BENCHMARK",
-                    "language=\(benchmark.name)",
-                    "declarations=200",
-                    "raw_samples_ms=\(Self.formattedSamples(samplesMS))",
-                    "median_ms=\(Self.formattedMilliseconds(Self.median(samplesMS)))",
-                    "p95_ms=\(Self.formattedMilliseconds(Self.percentile95(samplesMS)))",
-                    "max_ms=\(Self.formattedMilliseconds(samplesMS.max() ?? 0))",
-                    "capture_index_ms=\(Self.milliseconds(collector.captureIndexDuration))",
-                    "capture_loop_ms=\(Self.milliseconds(collector.captureLoopDuration))",
-                    "captures=\(captures.count)",
-                    "repeat_artifact_equality=\(repeatArtifactEquality)",
-                ].joined(separator: " ")
-            )
+            var record = [
+                "CODEMAP_PREMATERIALIZED_GENERATOR_BENCHMARK",
+                "language=\(benchmark.name)",
+                "declarations=200",
+                "raw_samples_ms=\(Self.formattedSamples(samplesMS))",
+                "median_ms=\(Self.formattedMilliseconds(Self.median(samplesMS)))",
+                "p95_ms=\(Self.formattedMilliseconds(Self.percentile95(samplesMS)))",
+                "max_ms=\(Self.formattedMilliseconds(samplesMS.max() ?? 0))",
+                "captures=\(captures.count)",
+                "repeat_artifact_equality=\(repeatArtifactEquality)",
+            ]
+            record.append(contentsOf: Self.codeMapAttributionFields(collector))
+            print(record.joined(separator: " "))
         }
     }
 
@@ -1060,54 +1094,56 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         let cases: [(name: String, language: LanguageType, source: String)] = [
             ("swift", .swift, Self.swiftSource(declarationCount: 200)),
             ("typescript", .ts, Self.typeScriptSource(declarationCount: 200)),
+            ("tsx", .tsx, Self.typeScriptXSource(declarationCount: 200)),
         ]
 
         for benchmark in cases {
+            let expectedArtifact = try build(source: benchmark.source, language: benchmark.language)
             for _ in 0 ..< 2 {
-                _ = try build(source: benchmark.source, language: benchmark.language)
+                XCTAssertEqual(
+                    try build(source: benchmark.source, language: benchmark.language),
+                    expectedArtifact
+                )
             }
 
             var samplesMS: [Double] = []
+            samplesMS.reserveCapacity(5)
             for _ in 0 ..< 5 {
                 let start = ProcessInfo.processInfo.systemUptime
-                _ = try build(source: benchmark.source, language: benchmark.language)
+                let artifact = try build(source: benchmark.source, language: benchmark.language)
                 samplesMS.append((ProcessInfo.processInfo.systemUptime - start) * 1_000)
+                XCTAssertEqual(artifact, expectedArtifact)
             }
-            samplesMS.sort()
+
             let collector = CodeMapPerformanceCollector(collectsCaptureNames: true)
-            _ = try build(
+            let attributedArtifact = try build(
                 source: benchmark.source,
                 language: benchmark.language,
                 options: .countersOnly,
                 collector: collector
             )
+            let repeatArtifactEquality = attributedArtifact == expectedArtifact
+            XCTAssertTrue(repeatArtifactEquality)
             XCTAssertEqual(collector.syntaxQueryExecutes, 1)
             XCTAssertGreaterThan(collector.syntaxCaptures, 0)
 
-            print(
-                [
-                    "CODEMAP_QUERY_BENCHMARK",
-                    "language=\(benchmark.name)",
-                    "declarations=200",
-                    "median_ms=\(String(format: "%.3f", samplesMS[samplesMS.count / 2]))",
-                    "max_ms=\(String(format: "%.3f", samplesMS.last ?? 0))",
-                    "parse_ms=\(Self.milliseconds(collector.syntaxParseDuration))",
-                    "query_ms=\(Self.milliseconds(collector.syntaxQueryExecuteDuration))",
-                    "materialize_ms=\(Self.milliseconds(collector.syntaxCaptureMaterializationDuration))",
-                    "capture_name_count_ms=\(Self.milliseconds(collector.syntaxCaptureNameCountingDuration))",
-                    "index_ms=\(Self.milliseconds(collector.captureIndexDuration))",
-                    "capture_loop_ms=\(Self.milliseconds(collector.captureLoopDuration))",
-                    "captures=\(collector.syntaxCaptures)",
-                    "lte_function_calls=\(collector.lteMatchAnyFunctionCalls)",
-                    "lte_variable_calls=\(collector.lteMatchAnyVariableCalls)",
-                    "jsts_calls=\(collector.jstsSignatureCallsFunctionLike + collector.jstsSignatureCallsStatementLike)",
-                    "ts_duplicate_suppressions=\(collector.tsDuplicateFunctionVariableSuppressions)",
-                    "swift_bodies=\(collector.syntaxCaptureCountsByName["swift.function.body", default: 0])",
-                    "swift_returns=\(collector.syntaxCaptureCountsByName["swift.function.return_type", default: 0])",
-                    "swift_property_types=\(collector.syntaxCaptureCountsByName["swift.property.type", default: 0])",
-                    "ts_variables=\(collector.syntaxCaptureCountsByName["variable.global", default: 0])",
-                ].joined(separator: " ")
-            )
+            var record = [
+                "CODEMAP_QUERY_BENCHMARK",
+                "language=\(benchmark.name)",
+                "declarations=200",
+                "raw_samples_ms=\(Self.formattedSamples(samplesMS))",
+                "median_ms=\(Self.formattedMilliseconds(Self.median(samplesMS)))",
+                "p95_ms=\(Self.formattedMilliseconds(Self.percentile95(samplesMS)))",
+                "max_ms=\(Self.formattedMilliseconds(samplesMS.max() ?? 0))",
+                "captures=\(collector.syntaxCaptures)",
+                "repeat_artifact_equality=\(repeatArtifactEquality)",
+                "swift_bodies=\(collector.syntaxCaptureCountsByName["swift.function.body", default: 0])",
+                "swift_returns=\(collector.syntaxCaptureCountsByName["swift.function.return_type", default: 0])",
+                "swift_property_types=\(collector.syntaxCaptureCountsByName["swift.property.type", default: 0])",
+                "ts_variables=\(collector.syntaxCaptureCountsByName["variable.global", default: 0])",
+            ]
+            record.append(contentsOf: Self.codeMapAttributionFields(collector))
+            print(record.joined(separator: " "))
         }
     }
 
@@ -1337,6 +1373,63 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         String(format: "%.3f", milliseconds)
     }
 
+    private static func codeMapAttributionFields(_ collector: CodeMapPerformanceCollector) -> [String] {
+        [
+            "builder_total_ms=\(milliseconds(collector.builderTotalDuration))",
+            "builder_generator_ms=\(milliseconds(collector.builderGeneratorDuration))",
+            "syntax_total_ms=\(milliseconds(collector.syntaxTotalDuration))",
+            "parse_ms=\(milliseconds(collector.syntaxParseDuration))",
+            "query_ms=\(milliseconds(collector.syntaxQueryExecuteDuration))",
+            "materialize_ms=\(milliseconds(collector.syntaxCaptureMaterializationDuration))",
+            "capture_name_count_ms=\(milliseconds(collector.syntaxCaptureNameCountingDuration))",
+            "capture_index_ms=\(milliseconds(collector.captureIndexDuration))",
+            "ts_context_ms=\(milliseconds(collector.tsContextDuration))",
+            "capture_loop_ms=\(milliseconds(collector.captureLoopDuration))",
+            "ts_loop_ms=\(milliseconds(collector.captureLoopTSStrategyDuration))",
+            "jsts_ms=\(milliseconds(collector.jstsSignatureDuration))",
+            "lte_function_ms=\(milliseconds(collector.languageTypeExtractorFunctionDuration))",
+            "lte_variable_ms=\(milliseconds(collector.languageTypeExtractorVariableDuration))",
+            "type_cleaner_ms=\(milliseconds(collector.typeCleanerDuration))",
+            "type_cleaner_ts_ms=\(milliseconds(collector.typeCleanerTSDuration))",
+            "type_cleaner_tsx_ms=\(milliseconds(collector.typeCleanerTSXDuration))",
+            "referenced_finalize_ms=\(milliseconds(collector.referencedTypesFinalizeDuration))",
+            "artifact_finalize_ms=\(milliseconds(collector.artifactFinalizationDuration))",
+            "captures_processed=\(collector.capturesProcessed)",
+            "ts_strategy_handled=\(collector.tsStrategyHandled)",
+            "jsts_function_calls=\(collector.jstsSignatureCallsFunctionLike)",
+            "jsts_statement_calls=\(collector.jstsSignatureCallsStatementLike)",
+            "lte_function_calls=\(collector.lteMatchAnyFunctionCalls)",
+            "lte_variable_calls=\(collector.lteMatchAnyVariableCalls)",
+            "ts_duplicate_suppressions=\(collector.tsDuplicateFunctionVariableSuppressions)",
+            "ts_return_fast_path_hits=\(collector.tsReturnTypeFastPathHits)",
+            "ts_type_annotation_fast_path_hits=\(collector.tsTypeAnnotationFastPathHits)",
+            "ts_alias_rhs_fast_path_hits=\(collector.tsTypeAliasRhsFastPathHits)",
+            "type_cleaner_calls=\(collector.typeCleanerExtractCalls)",
+            "type_cleaner_cache_hits=\(collector.typeCleanerCacheHits)",
+            "type_cleaner_cache_misses=\(collector.typeCleanerCacheMisses)",
+            "type_cleaner_ts_calls=\(collector.typeCleanerTSCalls)",
+            "type_cleaner_tsx_calls=\(collector.typeCleanerTSXCalls)",
+            "referenced_raw_insertions=\(collector.referencedTypesRawInsertions)",
+            "referenced_prefilter_skips=\(collector.referencedTypesPrefilterSkips)",
+            "referenced_output_types=\(collector.referencedTypesOutputTypeCount)",
+            "referenced_unique_types=\(collector.referencedTypesUniqueCount)",
+            "memo_jsts_hits=\(collector.extractionMemoJSTSHits)",
+            "memo_jsts_misses=\(collector.extractionMemoJSTSMisses)",
+            "memo_function_hits=\(collector.extractionMemoFunctionHits)",
+            "memo_function_misses=\(collector.extractionMemoFunctionMisses)",
+            "memo_function_parsed_hits=\(collector.extractionMemoFunctionParsedHits)",
+            "memo_function_parsed_misses=\(collector.extractionMemoFunctionParsedMisses)",
+            "memo_variable_hits=\(collector.extractionMemoVariableHits)",
+            "memo_variable_misses=\(collector.extractionMemoVariableMisses)",
+            "memo_ts_fast_path_hits=\(collector.extractionMemoTSFastPathHits)",
+            "memo_ts_fast_path_misses=\(collector.extractionMemoTSFastPathMisses)",
+            "artifact_classes=\(collector.artifactFinalClassCount)",
+            "artifact_interfaces=\(collector.artifactFinalInterfaceCount)",
+            "artifact_functions=\(collector.artifactFinalFunctionCount)",
+            "artifact_globals=\(collector.artifactFinalGlobalVariableCount)",
+        ]
+    }
+
     private static func formattedSamples(_ samples: [Double]) -> String {
         "[\(samples.map(formattedMilliseconds).joined(separator: ","))]"
     }
@@ -1383,6 +1476,27 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
                 return { value: input };
             };
             export const payload\(index): Record<string, number> = { value: \(index) };
+            """
+        }.joined(separator: "\n")
+    }
+
+    private static func typeScriptXSource(declarationCount: Int) -> String {
+        (0 ..< declarationCount).map { index in
+            """
+            export interface ViewProps\(index)<T extends { label: string }> {
+                value\(index): Promise<Record<string, T>>;
+                onSelect\(index)?: (value: T | { fallback: string }) => Promise<{ value: T }>;
+            }
+            export function View\(index)<T extends { label: string }>(props: ViewProps\(index)<T>): JSX.Element {
+                return <section data-index={\(index)}><span>{props.value\(index).toString()}</span></section>;
+            }
+            export const Card\(index) = (props: { title: string; payload: Record<string, number>; render?: (value: number) => JSX.Element }) => (
+                <article>{props.render?.(\(index)) ?? <strong>{props.title}</strong>}</article>
+            );
+            export const payload\(index): { primary: Record<string, number>; state: "ready" | "idle" } = {
+                primary: { value: \(index) },
+                state: "ready"
+            };
             """
         }.joined(separator: "\n")
     }

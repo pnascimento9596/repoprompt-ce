@@ -1731,6 +1731,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     "RPCE_RUN_CODEMAP_E2E": "1",
                     "RPCE_RUN_SCALE_TESTS": "1",
                     "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK": "1",
+                    "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE": "1",
+                    "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE": "compare",
+                    "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH": "/tmp/typescript-reference.json",
+                    "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH": "/tmp/tsx-reference.json",
                     "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES": "type.class",
                     "RP_SWIFT_CODEMAP_REFERENCE_MODE": "compare",
                     "RP_SWIFT_CODEMAP_REFERENCE_PATH": "/tmp/reference.json",
@@ -1744,6 +1748,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
             self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
             self.assertEqual(snapshot["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+            self.assertEqual(snapshot["RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"], "1")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"], "compare")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"], "/tmp/typescript-reference.json")
+            self.assertEqual(snapshot["RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"], "/tmp/tsx-reference.json")
             self.assertEqual(snapshot["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
             self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
             self.assertEqual(snapshot["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")
@@ -1761,6 +1769,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
         self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
         self.assertEqual(env["RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"], "1")
+        self.assertEqual(env["RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"], "1")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"], "compare")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"], "/tmp/typescript-reference.json")
+        self.assertEqual(env["RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"], "/tmp/tsx-reference.json")
         self.assertEqual(env["RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"], "type.class")
         self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_MODE"], "compare")
         self.assertEqual(env["RP_SWIFT_CODEMAP_REFERENCE_PATH"], "/tmp/reference.json")

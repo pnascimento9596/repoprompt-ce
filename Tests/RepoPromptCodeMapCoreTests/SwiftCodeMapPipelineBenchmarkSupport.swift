@@ -4,28 +4,12 @@
     import Foundation
     @testable import RepoPromptCodeMapCore
 
-    /// Opt-in, serial source-to-CodeMap benchmark support. This file is excluded
-    /// unless the package is built with RPCE_ENABLE_BENCHMARK_TESTS=1.
-    enum SwiftCodeMapPipelineBenchmarkSupport {
-        static let runtimeGateKey = "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"
-        static let referenceModeKey = "RP_SWIFT_CODEMAP_REFERENCE_MODE"
-        static let referencePathKey = "RP_SWIFT_CODEMAP_REFERENCE_PATH"
-        static let allowedRemovedCaptureNamesKey = "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"
-        static let defaultReferencePath = "/tmp/rpce-swift-codemap-bdc8ba10c.json"
-        static let referenceSemanticBase = "bdc8ba10c"
-
-        // Filled from the deterministic corpus and intentionally fixed after setup.
-        static let expectedContentDigest = "972bc2e36fd6e177096800089c782576972d56675b10f6c934407face1f2af7e"
-        static let expectedArtifactDigest = "5befe73ca42db203c0825b133a4eeeed018b5cd65f41597644b93f1b35858664"
-        static let expectedCaptureDigestsByQuerySHA = [
-            "c99914bc4c89f0c588a0717dfca902b2f25be24e3cca8720d0b026c250791448":
-                "9e82ba5a2ae5fec1b494f424a2fdcf24bfe5061167b93c5fc3f7b0dc8bf7254c"
-        ]
-
-        struct CorpusFile {
+    /// Shared deterministic reference mechanics for opt-in CodeMap benchmarks.
+    /// Language-specific corpus construction and reporting remain in thin façades below.
+    enum CodeMapPipelineReferenceSupport {
+        struct SourceFile {
             let logicalPath: String
             let source: String
-            let snapshot: CodeMapCoreSourceSnapshot
         }
 
         struct ArtifactRecord: Codable, Equatable {
@@ -94,23 +78,15 @@
             }
         }
 
-        static var isRuntimeEnabled: Bool {
-            ProcessInfo.processInfo.environment[runtimeGateKey] == "1"
-        }
-
-        static var referencePath: String {
-            ProcessInfo.processInfo.environment[referencePathKey] ?? defaultReferencePath
-        }
-
-        static var referenceMode: String {
-            ProcessInfo.processInfo.environment[referenceModeKey] ?? "compare"
-        }
-
-        static func configuredReferenceComparisonMode() throws -> ReferenceComparisonMode {
+        static func configuredReferenceComparisonMode(
+            referenceMode: String,
+            allowedRemovedCaptureNamesKey: String,
+            allowsCaptureRemovals: Bool
+        ) throws -> ReferenceComparisonMode {
             switch referenceMode {
             case "write", "compare":
                 return .exact
-            case "compare-capture-removals":
+            case "compare-capture-removals" where allowsCaptureRemovals:
                 let names = Set(
                     (ProcessInfo.processInfo.environment[allowedRemovedCaptureNamesKey] ?? "")
                         .split(separator: ",")
@@ -124,6 +100,500 @@
             default:
                 throw SupportError.unsupportedReferenceMode(referenceMode)
             }
+        }
+
+        static func makeEvidence(
+            files: [SourceFile],
+            artifacts: [CodeMapSyntaxArtifact],
+            language: LanguageType,
+            semanticBase: String
+        ) throws -> Evidence {
+            precondition(files.count == artifacts.count)
+            let identity = try CodeMapSyntaxEngine.shared.pipelineIdentity(
+                for: language,
+                decoderPolicy: .workspaceAutomaticV1
+            )
+            let querySHA = identity.codeMapQuerySHA256.lowercaseHex
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+
+            var artifactRecords: [ArtifactRecord] = []
+            artifactRecords.reserveCapacity(files.count)
+            var captureRecords: [CaptureRecord] = []
+            for (file, artifact) in zip(files, artifacts) {
+                try artifactRecords.append(ArtifactRecord(
+                    logicalPath: file.logicalPath,
+                    canonicalJSON: encoder.encode(artifact)
+                ))
+                let outcome = try CodeMapSyntaxEngine.shared.codeMap(
+                    content: file.source,
+                    language: language
+                )
+                guard case let .captures(captures) = outcome else {
+                    throw SupportError.queryNotReady(file.logicalPath, outcome)
+                }
+                captureRecords.append(contentsOf: captures.map {
+                    CaptureRecord(
+                        logicalPath: file.logicalPath,
+                        name: $0.name,
+                        location: $0.range.location,
+                        length: $0.range.length
+                    )
+                })
+            }
+            captureRecords.sort(by: captureLessThan)
+
+            let reference = ReferenceRecord(
+                schemaVersion: 1,
+                semanticBase: semanticBase,
+                fileCount: files.count,
+                querySHA256: querySHA,
+                contentDigest: contentDigest(files),
+                captureDigest: captureDigest(
+                    queryDigestBytes: identity.codeMapQuerySHA256.bytes,
+                    captures: captureRecords
+                ),
+                artifactDigest: artifactDigest(artifactRecords),
+                artifacts: artifactRecords,
+                captures: captureRecords
+            )
+            return Evidence(reference: reference, artifacts: artifacts)
+        }
+
+        static func applyReferenceMode(
+            to reference: ReferenceRecord,
+            referenceMode: String,
+            referencePath: String,
+            allowedRemovedCaptureNamesKey: String,
+            allowsCaptureRemovals: Bool
+        ) throws {
+            switch referenceMode {
+            case "write":
+                try writeReferenceExclusively(reference, path: referencePath)
+            case "compare", "compare-capture-removals":
+                let expected = try readReference(path: referencePath)
+                try compareReference(
+                    expected: expected,
+                    actual: reference,
+                    comparisonMode: configuredReferenceComparisonMode(
+                        referenceMode: referenceMode,
+                        allowedRemovedCaptureNamesKey: allowedRemovedCaptureNamesKey,
+                        allowsCaptureRemovals: allowsCaptureRemovals
+                    ),
+                    allowedRemovedCaptureNamesKey: allowedRemovedCaptureNamesKey
+                )
+            default:
+                throw SupportError.unsupportedReferenceMode(referenceMode)
+            }
+        }
+
+        static func compareReference(
+            expected: ReferenceRecord,
+            actual: ReferenceRecord,
+            comparisonMode: ReferenceComparisonMode = .exact,
+            allowedRemovedCaptureNamesKey: String
+        ) throws {
+            switch comparisonMode {
+            case .exact:
+                guard expected == actual else {
+                    throw SupportError.referenceMismatch(referenceDifference(expected: expected, actual: actual))
+                }
+            case let .allowingCaptureRemovals(allowedNames):
+                guard !allowedNames.isEmpty else {
+                    throw SupportError.invalidCaptureRemovalAllowlist(allowedRemovedCaptureNamesKey)
+                }
+                try compareReferenceAuthority(expected: expected, actual: actual)
+                guard expected.querySHA256 != actual.querySHA256 else {
+                    throw SupportError.referenceMismatch("candidate query SHA did not change")
+                }
+                guard expected.captureDigest != actual.captureDigest else {
+                    throw SupportError.referenceMismatch("candidate capture digest did not change")
+                }
+
+                var actualIndex = 0
+                var removedCount = 0
+                for expectedCapture in expected.captures {
+                    if actualIndex < actual.captures.count,
+                       actual.captures[actualIndex] == expectedCapture
+                    {
+                        actualIndex += 1
+                        continue
+                    }
+                    guard allowedNames.contains(expectedCapture.name) else {
+                        throw SupportError.referenceMismatch(
+                            "removed or modified non-allowlisted capture tuple \(captureDescription(expectedCapture))"
+                        )
+                    }
+                    removedCount += 1
+                }
+                guard actualIndex == actual.captures.count else {
+                    throw SupportError.referenceMismatch(
+                        "added or modified capture tuple \(captureDescription(actual.captures[actualIndex]))"
+                    )
+                }
+                guard removedCount > 0 else {
+                    throw SupportError.referenceMismatch("candidate removed no allowlisted capture tuples")
+                }
+            }
+        }
+
+        static func printDigestRecord(
+            _ reference: ReferenceRecord,
+            prefix: String,
+            referenceMode: String,
+            referencePath: String
+        ) {
+            print([
+                prefix,
+                "files=\(reference.fileCount)",
+                "semantic_base=\(reference.semanticBase)",
+                "query_sha256=\(reference.querySHA256)",
+                "content_sha256=\(reference.contentDigest)",
+                "capture_sha256=\(reference.captureDigest)",
+                "artifact_sha256=\(reference.artifactDigest)",
+                "captures=\(reference.captures.count)",
+                "reference_mode=\(referenceMode)",
+                "reference_path=\(referencePath)"
+            ].joined(separator: " "))
+        }
+
+        static func writeReferencesExclusively(_ entries: [(ReferenceRecord, String)]) throws {
+            for (_, path) in entries where FileManager.default.fileExists(atPath: path) {
+                throw SupportError.referenceAlreadyExists(path)
+            }
+
+            var createdPaths: [String] = []
+            do {
+                for (reference, path) in entries {
+                    try writeReferenceExclusively(reference, path: path)
+                    createdPaths.append(path)
+                }
+            } catch {
+                for path in createdPaths {
+                    removeIncompleteReference(path: path)
+                }
+                throw error
+            }
+        }
+
+        private static func contentDigest(_ files: [SourceFile]) -> String {
+            var framed = Data()
+            for file in files {
+                appendFrame(Data(file.logicalPath.utf8), to: &framed)
+                appendFrame(Data(file.source.utf8), to: &framed)
+            }
+            return sha256Hex(framed)
+        }
+
+        private static func captureDigest(
+            queryDigestBytes: Data,
+            captures: [CaptureRecord]
+        ) -> String {
+            var framed = Data(queryDigestBytes)
+            for capture in captures {
+                appendFrame(Data(capture.logicalPath.utf8), to: &framed)
+                appendFrame(Data(capture.name.utf8), to: &framed)
+                appendUInt64(UInt64(capture.location), to: &framed)
+                appendUInt64(UInt64(capture.length), to: &framed)
+            }
+            return sha256Hex(framed)
+        }
+
+        private static func artifactDigest(_ records: [ArtifactRecord]) -> String {
+            var framed = Data()
+            for record in records {
+                appendFrame(Data(record.logicalPath.utf8), to: &framed)
+                appendFrame(record.canonicalJSON, to: &framed)
+            }
+            return sha256Hex(framed)
+        }
+
+        private static func appendFrame(_ bytes: Data, to data: inout Data) {
+            appendUInt64(UInt64(bytes.count), to: &data)
+            data.append(bytes)
+        }
+
+        private static func appendUInt64(_ value: UInt64, to data: inout Data) {
+            for shift in stride(from: 56, through: 0, by: -8) {
+                data.append(UInt8((value >> UInt64(shift)) & 0xFF))
+            }
+        }
+
+        private static func sha256Hex(_ data: Data) -> String {
+            Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
+        }
+
+        private static func captureLessThan(_ lhs: CaptureRecord, _ rhs: CaptureRecord) -> Bool {
+            if lhs.logicalPath != rhs.logicalPath { return lhs.logicalPath < rhs.logicalPath }
+            if lhs.name != rhs.name { return lhs.name < rhs.name }
+            if lhs.location != rhs.location { return lhs.location < rhs.location }
+            return lhs.length < rhs.length
+        }
+
+        private static func writeReferenceExclusively(
+            _ reference: ReferenceRecord,
+            path: String
+        ) throws {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(reference)
+
+            let descriptor: Int32
+            while true {
+                let result = open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
+                if result >= 0 {
+                    descriptor = result
+                    break
+                }
+                if errno == EINTR { continue }
+                if errno == EEXIST { throw SupportError.referenceAlreadyExists(path) }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+
+            var completed = false
+            defer {
+                _ = close(descriptor)
+                if !completed {
+                    removeIncompleteReference(path: path)
+                }
+            }
+            try data.withUnsafeBytes { buffer in
+                guard let base = buffer.baseAddress else {
+                    throw SupportError.shortWrite(path)
+                }
+                var total = 0
+                while total < buffer.count {
+                    let result = Darwin.write(descriptor, base.advanced(by: total), buffer.count - total)
+                    if result < 0 {
+                        if errno == EINTR { continue }
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                    guard result > 0 else { throw SupportError.shortWrite(path) }
+                    total += result
+                }
+            }
+            completed = true
+        }
+
+        private static func removeIncompleteReference(path: String) {
+            while unlink(path) < 0, errno == EINTR {}
+        }
+
+        private static func readReference(path: String) throws -> ReferenceRecord {
+            try JSONDecoder().decode(ReferenceRecord.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        }
+
+        private static func compareReferenceAuthority(
+            expected: ReferenceRecord,
+            actual: ReferenceRecord
+        ) throws {
+            if expected.schemaVersion != actual.schemaVersion {
+                throw SupportError.referenceMismatch("schema version")
+            }
+            if expected.semanticBase != actual.semanticBase {
+                throw SupportError.referenceMismatch("semantic base")
+            }
+            if expected.fileCount != actual.fileCount {
+                throw SupportError.referenceMismatch("file count")
+            }
+            if expected.contentDigest != actual.contentDigest {
+                throw SupportError.referenceMismatch("content digest")
+            }
+            if expected.artifactDigest != actual.artifactDigest {
+                throw SupportError.referenceMismatch("artifact digest")
+            }
+            if expected.artifacts != actual.artifacts {
+                throw SupportError.referenceMismatch("canonical artifact bytes")
+            }
+        }
+
+        private static func captureDescription(_ capture: CaptureRecord) -> String {
+            "\(capture.logicalPath):\(capture.name)@\(capture.location)+\(capture.length)"
+        }
+
+        private static func referenceDifference(
+            expected: ReferenceRecord,
+            actual: ReferenceRecord
+        ) -> String {
+            if expected.schemaVersion != actual.schemaVersion { return "schema version" }
+            if expected.semanticBase != actual.semanticBase { return "semantic base" }
+            if expected.fileCount != actual.fileCount { return "file count" }
+            if expected.querySHA256 != actual.querySHA256 { return "query SHA" }
+            if expected.contentDigest != actual.contentDigest { return "content digest" }
+            if expected.captureDigest != actual.captureDigest { return "capture digest" }
+            if expected.artifactDigest != actual.artifactDigest { return "artifact digest" }
+            if expected.artifacts != actual.artifacts { return "canonical artifact bytes" }
+            if expected.captures != actual.captures { return "canonical capture tuples" }
+            return "unknown"
+        }
+    }
+
+    enum TypeScriptCodeMapPipelineBenchmarkSupport {
+        static let runtimeGateKey = "RP_RUN_TYPESCRIPT_CODEMAP_REFERENCE"
+        static let referenceModeKey = "RP_TYPESCRIPT_CODEMAP_REFERENCE_MODE"
+        static let tsReferencePathKey = "RP_TYPESCRIPT_CODEMAP_TS_REFERENCE_PATH"
+        static let tsxReferencePathKey = "RP_TYPESCRIPT_CODEMAP_TSX_REFERENCE_PATH"
+        static let defaultTSReferencePath = "/tmp/rpce-typescript-codemap-ts-v1.json"
+        static let defaultTSXReferencePath = "/tmp/rpce-typescript-codemap-tsx-v1.json"
+        private static let unsupportedCaptureRemovalKey = "TS/TSX references are exact-only"
+
+        typealias Evidence = CodeMapPipelineReferenceSupport.Evidence
+        typealias ReferenceRecord = CodeMapPipelineReferenceSupport.ReferenceRecord
+        typealias SupportError = CodeMapPipelineReferenceSupport.SupportError
+
+        struct CorpusFile {
+            let logicalPath: String
+            let source: String
+            let language: LanguageType
+            let snapshot: CodeMapCoreSourceSnapshot
+        }
+
+        static var isRuntimeEnabled: Bool {
+            ProcessInfo.processInfo.environment[runtimeGateKey] == "1"
+        }
+
+        static var referenceMode: String {
+            ProcessInfo.processInfo.environment[referenceModeKey] ?? "compare"
+        }
+
+        static var tsReferencePath: String {
+            ProcessInfo.processInfo.environment[tsReferencePathKey] ?? defaultTSReferencePath
+        }
+
+        static var tsxReferencePath: String {
+            ProcessInfo.processInfo.environment[tsxReferencePathKey] ?? defaultTSXReferencePath
+        }
+
+        static func makeCorpus(tsSource: String, tsxSource: String) -> [CorpusFile] {
+            [
+                CorpusFile(
+                    logicalPath: "Synthetic/TypeScriptBench.ts",
+                    source: tsSource,
+                    language: .ts,
+                    snapshot: CodeMapFixtureRunner.makeSourceSnapshot(content: tsSource)
+                ),
+                CorpusFile(
+                    logicalPath: "Synthetic/TypeScriptBench.tsx",
+                    source: tsxSource,
+                    language: .tsx,
+                    snapshot: CodeMapFixtureRunner.makeSourceSnapshot(content: tsxSource)
+                )
+            ]
+        }
+
+        static func buildArtifact(file: CorpusFile) throws -> CodeMapSyntaxArtifact {
+            let outcome = try CodeMapSyntaxArtifactBuilder.build(
+                source: file.snapshot,
+                language: file.language
+            )
+            guard case let .ready(artifact) = outcome else {
+                throw SupportError.artifactNotReady(file.logicalPath, outcome)
+            }
+            return artifact
+        }
+
+        static func makeEvidence(
+            file: CorpusFile,
+            artifact: CodeMapSyntaxArtifact
+        ) throws -> Evidence {
+            try CodeMapPipelineReferenceSupport.makeEvidence(
+                files: [.init(logicalPath: file.logicalPath, source: file.source)],
+                artifacts: [artifact],
+                language: file.language,
+                semanticBase: file.language == .ts ? "typescript-codemap-synthetic-v1" : "tsx-codemap-synthetic-v1"
+            )
+        }
+
+        static func applyReferenceMode(
+            tsReference: ReferenceRecord,
+            tsxReference: ReferenceRecord
+        ) throws {
+            switch referenceMode {
+            case "write":
+                try CodeMapPipelineReferenceSupport.writeReferencesExclusively([
+                    (tsReference, tsReferencePath),
+                    (tsxReference, tsxReferencePath)
+                ])
+            case "compare":
+                try CodeMapPipelineReferenceSupport.applyReferenceMode(
+                    to: tsReference,
+                    referenceMode: referenceMode,
+                    referencePath: tsReferencePath,
+                    allowedRemovedCaptureNamesKey: unsupportedCaptureRemovalKey,
+                    allowsCaptureRemovals: false
+                )
+                try CodeMapPipelineReferenceSupport.applyReferenceMode(
+                    to: tsxReference,
+                    referenceMode: referenceMode,
+                    referencePath: tsxReferencePath,
+                    allowedRemovedCaptureNamesKey: unsupportedCaptureRemovalKey,
+                    allowsCaptureRemovals: false
+                )
+            default:
+                throw SupportError.unsupportedReferenceMode(referenceMode)
+            }
+        }
+
+        static func printDigestRecord(_ reference: ReferenceRecord, language: LanguageType) {
+            let isTypeScript = language == .ts
+            CodeMapPipelineReferenceSupport.printDigestRecord(
+                reference,
+                prefix: isTypeScript ? "TYPESCRIPT_CODEMAP_PIPELINE_DIGESTS" : "TSX_CODEMAP_PIPELINE_DIGESTS",
+                referenceMode: referenceMode,
+                referencePath: isTypeScript ? tsReferencePath : tsxReferencePath
+            )
+        }
+    }
+
+    /// Opt-in, serial source-to-CodeMap benchmark support. This file is excluded
+    /// unless the package is built with RPCE_ENABLE_BENCHMARK_TESTS=1.
+    enum SwiftCodeMapPipelineBenchmarkSupport {
+        static let runtimeGateKey = "RP_RUN_SWIFT_CODEMAP_PIPELINE_BENCHMARK"
+        static let referenceModeKey = "RP_SWIFT_CODEMAP_REFERENCE_MODE"
+        static let referencePathKey = "RP_SWIFT_CODEMAP_REFERENCE_PATH"
+        static let allowedRemovedCaptureNamesKey = "RP_SWIFT_CODEMAP_ALLOWED_REMOVED_CAPTURES"
+        static let defaultReferencePath = "/tmp/rpce-swift-codemap-bdc8ba10c.json"
+        static let referenceSemanticBase = "bdc8ba10c"
+
+        // Filled from the deterministic corpus and intentionally fixed after setup.
+        static let expectedContentDigest = "972bc2e36fd6e177096800089c782576972d56675b10f6c934407face1f2af7e"
+        static let expectedArtifactDigest = "5befe73ca42db203c0825b133a4eeeed018b5cd65f41597644b93f1b35858664"
+        static let expectedCaptureDigestsByQuerySHA = [
+            "c99914bc4c89f0c588a0717dfca902b2f25be24e3cca8720d0b026c250791448":
+                "9e82ba5a2ae5fec1b494f424a2fdcf24bfe5061167b93c5fc3f7b0dc8bf7254c"
+        ]
+
+        struct CorpusFile {
+            let logicalPath: String
+            let source: String
+            let snapshot: CodeMapCoreSourceSnapshot
+        }
+
+        typealias ArtifactRecord = CodeMapPipelineReferenceSupport.ArtifactRecord
+        typealias CaptureRecord = CodeMapPipelineReferenceSupport.CaptureRecord
+        typealias ReferenceRecord = CodeMapPipelineReferenceSupport.ReferenceRecord
+        typealias Evidence = CodeMapPipelineReferenceSupport.Evidence
+        typealias ReferenceComparisonMode = CodeMapPipelineReferenceSupport.ReferenceComparisonMode
+        typealias SupportError = CodeMapPipelineReferenceSupport.SupportError
+
+        static var isRuntimeEnabled: Bool {
+            ProcessInfo.processInfo.environment[runtimeGateKey] == "1"
+        }
+
+        static var referencePath: String {
+            ProcessInfo.processInfo.environment[referencePathKey] ?? defaultReferencePath
+        }
+
+        static var referenceMode: String {
+            ProcessInfo.processInfo.environment[referenceModeKey] ?? "compare"
+        }
+
+        static func configuredReferenceComparisonMode() throws -> ReferenceComparisonMode {
+            try CodeMapPipelineReferenceSupport.configuredReferenceComparisonMode(
+                referenceMode: referenceMode,
+                allowedRemovedCaptureNamesKey: allowedRemovedCaptureNamesKey,
+                allowsCaptureRemovals: true
+            )
         }
 
         static func makeCorpus() -> [CorpusFile] {
@@ -185,59 +655,12 @@
             files: [CorpusFile],
             artifacts: [CodeMapSyntaxArtifact]
         ) throws -> Evidence {
-            precondition(files.count == artifacts.count)
-            let identity = try CodeMapSyntaxEngine.shared.pipelineIdentity(
-                for: .swift,
-                decoderPolicy: .workspaceAutomaticV1
+            try CodeMapPipelineReferenceSupport.makeEvidence(
+                files: files.map { .init(logicalPath: $0.logicalPath, source: $0.source) },
+                artifacts: artifacts,
+                language: .swift,
+                semanticBase: referenceSemanticBase
             )
-            let querySHA = identity.codeMapQuerySHA256.lowercaseHex
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-
-            var artifactRecords: [ArtifactRecord] = []
-            artifactRecords.reserveCapacity(files.count)
-            var captureRecords: [CaptureRecord] = []
-            for (file, artifact) in zip(files, artifacts) {
-                try artifactRecords.append(ArtifactRecord(
-                    logicalPath: file.logicalPath,
-                    canonicalJSON: encoder.encode(artifact)
-                ))
-                let outcome = try CodeMapSyntaxEngine.shared.codeMap(
-                    content: file.source,
-                    language: .swift
-                )
-                guard case let .captures(captures) = outcome else {
-                    throw SupportError.queryNotReady(file.logicalPath, outcome)
-                }
-                captureRecords.append(contentsOf: captures.map {
-                    CaptureRecord(
-                        logicalPath: file.logicalPath,
-                        name: $0.name,
-                        location: $0.range.location,
-                        length: $0.range.length
-                    )
-                })
-            }
-            captureRecords.sort(by: captureLessThan)
-
-            let contentDigest = contentDigest(files)
-            let captureDigest = captureDigest(
-                queryDigestBytes: identity.codeMapQuerySHA256.bytes,
-                captures: captureRecords
-            )
-            let artifactDigest = artifactDigest(artifactRecords)
-            let reference = ReferenceRecord(
-                schemaVersion: 1,
-                semanticBase: referenceSemanticBase,
-                fileCount: files.count,
-                querySHA256: querySHA,
-                contentDigest: contentDigest,
-                captureDigest: captureDigest,
-                artifactDigest: artifactDigest,
-                artifacts: artifactRecords,
-                captures: captureRecords
-            )
-            return Evidence(reference: reference, artifacts: artifacts)
         }
 
         static func validateFixedDigests(
@@ -282,19 +705,13 @@
         }
 
         static func applyReferenceMode(to reference: ReferenceRecord) throws {
-            switch referenceMode {
-            case "write":
-                try writeReferenceExclusively(reference, path: referencePath)
-            case "compare", "compare-capture-removals":
-                let expected = try readReference(path: referencePath)
-                try compareReference(
-                    expected: expected,
-                    actual: reference,
-                    comparisonMode: configuredReferenceComparisonMode()
-                )
-            default:
-                throw SupportError.unsupportedReferenceMode(referenceMode)
-            }
+            try CodeMapPipelineReferenceSupport.applyReferenceMode(
+                to: reference,
+                referenceMode: referenceMode,
+                referencePath: referencePath,
+                allowedRemovedCaptureNamesKey: allowedRemovedCaptureNamesKey,
+                allowsCaptureRemovals: true
+            )
         }
 
         static func compareReference(
@@ -302,63 +719,21 @@
             actual: ReferenceRecord,
             comparisonMode: ReferenceComparisonMode = .exact
         ) throws {
-            switch comparisonMode {
-            case .exact:
-                guard expected == actual else {
-                    throw SupportError.referenceMismatch(referenceDifference(expected: expected, actual: actual))
-                }
-            case let .allowingCaptureRemovals(allowedNames):
-                guard !allowedNames.isEmpty else {
-                    throw SupportError.invalidCaptureRemovalAllowlist(allowedRemovedCaptureNamesKey)
-                }
-                try compareReferenceAuthority(expected: expected, actual: actual)
-                guard expected.querySHA256 != actual.querySHA256 else {
-                    throw SupportError.referenceMismatch("candidate query SHA did not change")
-                }
-                guard expected.captureDigest != actual.captureDigest else {
-                    throw SupportError.referenceMismatch("candidate capture digest did not change")
-                }
-
-                var actualIndex = 0
-                var removedCount = 0
-                for expectedCapture in expected.captures {
-                    if actualIndex < actual.captures.count,
-                       actual.captures[actualIndex] == expectedCapture
-                    {
-                        actualIndex += 1
-                        continue
-                    }
-                    guard allowedNames.contains(expectedCapture.name) else {
-                        throw SupportError.referenceMismatch(
-                            "removed or modified non-allowlisted capture tuple \(captureDescription(expectedCapture))"
-                        )
-                    }
-                    removedCount += 1
-                }
-                guard actualIndex == actual.captures.count else {
-                    throw SupportError.referenceMismatch(
-                        "added or modified capture tuple \(captureDescription(actual.captures[actualIndex]))"
-                    )
-                }
-                guard removedCount > 0 else {
-                    throw SupportError.referenceMismatch("candidate removed no allowlisted capture tuples")
-                }
-            }
+            try CodeMapPipelineReferenceSupport.compareReference(
+                expected: expected,
+                actual: actual,
+                comparisonMode: comparisonMode,
+                allowedRemovedCaptureNamesKey: allowedRemovedCaptureNamesKey
+            )
         }
 
         static func printDigestRecord(_ reference: ReferenceRecord) {
-            print([
-                "SWIFT_CODEMAP_PIPELINE_DIGESTS",
-                "files=\(reference.fileCount)",
-                "semantic_base=\(reference.semanticBase)",
-                "query_sha256=\(reference.querySHA256)",
-                "content_sha256=\(reference.contentDigest)",
-                "capture_sha256=\(reference.captureDigest)",
-                "artifact_sha256=\(reference.artifactDigest)",
-                "captures=\(reference.captures.count)",
-                "reference_mode=\(referenceMode)",
-                "reference_path=\(referencePath)"
-            ].joined(separator: " "))
+            CodeMapPipelineReferenceSupport.printDigestRecord(
+                reference,
+                prefix: "SWIFT_CODEMAP_PIPELINE_DIGESTS",
+                referenceMode: referenceMode,
+                referencePath: referencePath
+            )
         }
 
         static func attributionRecord(
@@ -581,157 +956,6 @@
 
         private static func ratio(_ numerator: Int, _ denominator: Int) -> String {
             String(format: "%.3f", Double(numerator) / Double(denominator))
-        }
-
-        private static func contentDigest(_ files: [CorpusFile]) -> String {
-            var framed = Data()
-            for file in files {
-                appendFrame(Data(file.logicalPath.utf8), to: &framed)
-                appendFrame(Data(file.source.utf8), to: &framed)
-            }
-            return sha256Hex(framed)
-        }
-
-        private static func captureDigest(
-            queryDigestBytes: Data,
-            captures: [CaptureRecord]
-        ) -> String {
-            var framed = Data(queryDigestBytes)
-            for capture in captures {
-                appendFrame(Data(capture.logicalPath.utf8), to: &framed)
-                appendFrame(Data(capture.name.utf8), to: &framed)
-                appendUInt64(UInt64(capture.location), to: &framed)
-                appendUInt64(UInt64(capture.length), to: &framed)
-            }
-            return sha256Hex(framed)
-        }
-
-        private static func artifactDigest(_ records: [ArtifactRecord]) -> String {
-            var framed = Data()
-            for record in records {
-                appendFrame(Data(record.logicalPath.utf8), to: &framed)
-                appendFrame(record.canonicalJSON, to: &framed)
-            }
-            return sha256Hex(framed)
-        }
-
-        private static func appendFrame(_ bytes: Data, to data: inout Data) {
-            appendUInt64(UInt64(bytes.count), to: &data)
-            data.append(bytes)
-        }
-
-        private static func appendUInt64(_ value: UInt64, to data: inout Data) {
-            for shift in stride(from: 56, through: 0, by: -8) {
-                data.append(UInt8((value >> UInt64(shift)) & 0xFF))
-            }
-        }
-
-        private static func sha256Hex(_ data: Data) -> String {
-            Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
-        }
-
-        private static func captureLessThan(_ lhs: CaptureRecord, _ rhs: CaptureRecord) -> Bool {
-            if lhs.logicalPath != rhs.logicalPath { return lhs.logicalPath < rhs.logicalPath }
-            if lhs.name != rhs.name { return lhs.name < rhs.name }
-            if lhs.location != rhs.location { return lhs.location < rhs.location }
-            return lhs.length < rhs.length
-        }
-
-        private static func writeReferenceExclusively(
-            _ reference: ReferenceRecord,
-            path: String
-        ) throws {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(reference)
-
-            let descriptor: Int32
-            while true {
-                let result = open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
-                if result >= 0 {
-                    descriptor = result
-                    break
-                }
-                if errno == EINTR { continue }
-                if errno == EEXIST { throw SupportError.referenceAlreadyExists(path) }
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-
-            var completed = false
-            defer {
-                _ = close(descriptor)
-                if !completed {
-                    removeIncompleteReference(path: path)
-                }
-            }
-            try data.withUnsafeBytes { buffer in
-                guard let base = buffer.baseAddress else {
-                    throw SupportError.shortWrite(path)
-                }
-                var total = 0
-                while total < buffer.count {
-                    let result = Darwin.write(descriptor, base.advanced(by: total), buffer.count - total)
-                    if result < 0 {
-                        if errno == EINTR { continue }
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                    guard result > 0 else { throw SupportError.shortWrite(path) }
-                    total += result
-                }
-            }
-            completed = true
-        }
-
-        private static func removeIncompleteReference(path: String) {
-            while unlink(path) < 0, errno == EINTR {}
-        }
-
-        private static func readReference(path: String) throws -> ReferenceRecord {
-            try JSONDecoder().decode(ReferenceRecord.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-        }
-
-        private static func compareReferenceAuthority(
-            expected: ReferenceRecord,
-            actual: ReferenceRecord
-        ) throws {
-            if expected.schemaVersion != actual.schemaVersion {
-                throw SupportError.referenceMismatch("schema version")
-            }
-            if expected.semanticBase != actual.semanticBase {
-                throw SupportError.referenceMismatch("semantic base")
-            }
-            if expected.fileCount != actual.fileCount {
-                throw SupportError.referenceMismatch("file count")
-            }
-            if expected.contentDigest != actual.contentDigest {
-                throw SupportError.referenceMismatch("content digest")
-            }
-            if expected.artifactDigest != actual.artifactDigest {
-                throw SupportError.referenceMismatch("artifact digest")
-            }
-            if expected.artifacts != actual.artifacts {
-                throw SupportError.referenceMismatch("canonical artifact bytes")
-            }
-        }
-
-        private static func captureDescription(_ capture: CaptureRecord) -> String {
-            "\(capture.logicalPath):\(capture.name)@\(capture.location)+\(capture.length)"
-        }
-
-        private static func referenceDifference(
-            expected: ReferenceRecord,
-            actual: ReferenceRecord
-        ) -> String {
-            if expected.schemaVersion != actual.schemaVersion { return "schema version" }
-            if expected.semanticBase != actual.semanticBase { return "semantic base" }
-            if expected.fileCount != actual.fileCount { return "file count" }
-            if expected.querySHA256 != actual.querySHA256 { return "query SHA" }
-            if expected.contentDigest != actual.contentDigest { return "content digest" }
-            if expected.captureDigest != actual.captureDigest { return "capture digest" }
-            if expected.artifactDigest != actual.artifactDigest { return "artifact digest" }
-            if expected.artifacts != actual.artifacts { return "canonical artifact bytes" }
-            if expected.captures != actual.captures { return "canonical capture tuples" }
-            return "unknown"
         }
 
         private static func smallSource(index: Int) -> String {
