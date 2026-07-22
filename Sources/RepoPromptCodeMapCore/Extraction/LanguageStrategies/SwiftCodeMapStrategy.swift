@@ -264,6 +264,71 @@ enum SwiftCodeMapStrategy {
         let signatureEnd: Int
     }
 
+    static func normalizeSwiftSignatureWhitespace(
+        _ trimmed: String,
+        performanceCollector: CodeMapPerformanceCollector?
+    ) -> String {
+        var needsRewrite = false
+        var previousWasWhitespace = false
+        var asciiByteCount = 0
+
+        for byte in trimmed.utf8 {
+            if byte >= 0x80 {
+                let normalized = trimmed.replacing(#/\s+/#, with: " ")
+                if let performanceCollector {
+                    performanceCollector.swiftSignatureNormalizationUnicodeFallbackCount += 1
+                    performanceCollector.swiftSignatureNormalizationInputUTF8ByteCount += trimmed.utf8.count
+                    performanceCollector.swiftSignatureNormalizationOutputUTF8ByteCount += normalized.utf8.count
+                }
+                return normalized
+            }
+
+            asciiByteCount += 1
+            let isWhitespace = byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)
+            if isWhitespace {
+                if byte != 0x20 || previousWasWhitespace {
+                    needsRewrite = true
+                }
+                previousWasWhitespace = true
+            } else {
+                previousWasWhitespace = false
+            }
+        }
+
+        guard needsRewrite else {
+            if let performanceCollector {
+                performanceCollector.swiftSignatureNormalizationASCIINoOpCount += 1
+                performanceCollector.swiftSignatureNormalizationInputUTF8ByteCount += asciiByteCount
+                performanceCollector.swiftSignatureNormalizationOutputUTF8ByteCount += asciiByteCount
+            }
+            return trimmed
+        }
+
+        var normalizedUTF8: [UInt8] = []
+        normalizedUTF8.reserveCapacity(asciiByteCount)
+        var isCollapsingWhitespace = false
+        for byte in trimmed.utf8 {
+            let isWhitespace = byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)
+            if isWhitespace {
+                if !isCollapsingWhitespace {
+                    normalizedUTF8.append(0x20)
+                    isCollapsingWhitespace = true
+                }
+            } else {
+                normalizedUTF8.append(byte)
+                isCollapsingWhitespace = false
+            }
+        }
+
+        let normalized = String(decoding: normalizedUTF8, as: UTF8.self)
+        if let performanceCollector {
+            performanceCollector.swiftSignatureNormalizationASCIIRewriteCount += 1
+            performanceCollector.swiftSignatureNormalizationInputUTF8ByteCount += asciiByteCount
+            performanceCollector.swiftSignatureNormalizationOutputUTF8ByteCount += normalizedUTF8.count
+        }
+        return normalized
+    }
+
     /// Extracts only the function signature (up to but not including `{`) from a Swift function capture range.
     /// Uses `signatureEndLocation` to correctly handle strings, comments, and nesting.
     private static func extractSwiftFunctionSignature(
@@ -287,11 +352,14 @@ enum SwiftCodeMapStrategy {
 
         // Get the signature text
         let normalizationStart = performanceCollector.map { _ in CFAbsoluteTimeGetCurrent() }
-        var signature = nsContent.substring(with: signatureRange)
+        let trimmedSignature = nsContent.substring(with: signatureRange)
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Normalize whitespace (collapse multiple whitespace to single space)
-        signature = signature.replacing(#/\s+/#, with: " ")
+        let signature = normalizeSwiftSignatureWhitespace(
+            trimmedSignature,
+            performanceCollector: performanceCollector
+        )
         if let normalizationStart {
             performanceCollector?.swiftSignatureNormalizationDuration +=
                 CFAbsoluteTimeGetCurrent() - normalizationStart

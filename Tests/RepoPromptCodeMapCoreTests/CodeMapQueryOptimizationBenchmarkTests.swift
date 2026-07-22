@@ -58,6 +58,18 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             XCTAssertEqual(collector.syntaxCalls, files.count)
             XCTAssertEqual(collector.syntaxQueryExecutes, files.count)
             XCTAssertGreaterThan(collector.syntaxCaptures, 0)
+            XCTAssertEqual(
+                collector.swiftSignatureNormalizationASCIINoOpCount +
+                    collector.swiftSignatureNormalizationASCIIRewriteCount +
+                    collector.swiftSignatureNormalizationUnicodeFallbackCount,
+                collector.swiftStrategyFunctionSignatureCount
+            )
+            XCTAssertGreaterThan(collector.swiftSignatureNormalizationInputUTF8ByteCount, 0)
+            XCTAssertGreaterThan(collector.swiftSignatureNormalizationOutputUTF8ByteCount, 0)
+            XCTAssertLessThanOrEqual(
+                collector.swiftSignatureNormalizationOutputUTF8ByteCount,
+                collector.swiftSignatureNormalizationInputUTF8ByteCount
+            )
 
             let evidence = try SwiftCodeMapPipelineBenchmarkSupport.makeEvidence(
                 files: files,
@@ -238,6 +250,80 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             )
         }
     #endif
+
+    func testSwiftSignatureWhitespaceNormalizerMatchesLegacyBehavior() {
+        let cases: [(name: String, input: String)] = [
+            ("space run", "func  value()"),
+            ("tab", "func\tvalue()"),
+            ("newline", "func\nvalue()"),
+            ("vertical tab", "func\u{000B}value()"),
+            ("form feed", "func\u{000C}value()"),
+            ("carriage return", "func\rvalue()"),
+            ("mixed whitespace run", "func \t\n\u{000B}\u{000C}\r value()"),
+            ("already normalized", "func value(_ input: Int) -> String"),
+            ("no whitespace", "funcValue()"),
+            ("empty", ""),
+            ("trimmed away", " \t\n\r "),
+            ("string literal", #"func value(_ text: String = "a  b") -> String"#),
+            ("line comment", "func value() -> Int //  comment"),
+            ("block comment", "func value(/*  comment  */ _ input: Int)"),
+            ("closure default", "func value(_ transform: (Int) -> Int = { value  in value })"),
+            ("braces colons arrows", #"func value(_ text: String = "{  key:  -> }")"#),
+            ("non-ASCII identifier", "func café(_ value: Int)"),
+            ("nonbreaking space", "func\u{00A0}value()"),
+            ("em space", "func\u{2003}value()"),
+        ]
+
+        for testCase in cases {
+            let trimmed = testCase.input.trimmingCharacters(in: .whitespacesAndNewlines)
+            XCTAssertEqual(
+                SwiftCodeMapStrategy.normalizeSwiftSignatureWhitespace(
+                    trimmed,
+                    performanceCollector: nil
+                ),
+                Self.legacySwiftSignatureWhitespaceNormalization(testCase.input),
+                testCase.name
+            )
+        }
+    }
+
+    func testSwiftSignatureWhitespaceNormalizerCounters() {
+        let inputs = [
+            "func value() -> Int",
+            "func\tvalue(\n_ item: Int)",
+            "func café(\u{2003}_ value: Int)",
+        ]
+        let collector = CodeMapPerformanceCollector()
+        let outputs = inputs.map {
+            SwiftCodeMapStrategy.normalizeSwiftSignatureWhitespace(
+                $0,
+                performanceCollector: collector
+            )
+        }
+
+        XCTAssertEqual(outputs, inputs.map(Self.legacySwiftSignatureWhitespaceNormalization))
+        XCTAssertEqual(collector.swiftSignatureNormalizationASCIINoOpCount, 1)
+        XCTAssertEqual(collector.swiftSignatureNormalizationASCIIRewriteCount, 1)
+        XCTAssertEqual(collector.swiftSignatureNormalizationUnicodeFallbackCount, 1)
+        XCTAssertEqual(
+            collector.swiftSignatureNormalizationASCIINoOpCount +
+                collector.swiftSignatureNormalizationASCIIRewriteCount +
+                collector.swiftSignatureNormalizationUnicodeFallbackCount,
+            inputs.count
+        )
+        XCTAssertEqual(
+            collector.swiftSignatureNormalizationInputUTF8ByteCount,
+            inputs.reduce(0) { $0 + $1.utf8.count }
+        )
+        XCTAssertEqual(
+            collector.swiftSignatureNormalizationOutputUTF8ByteCount,
+            outputs.reduce(0) { $0 + $1.utf8.count }
+        )
+        XCTAssertLessThanOrEqual(
+            collector.swiftSignatureNormalizationOutputUTF8ByteCount,
+            collector.swiftSignatureNormalizationInputUTF8ByteCount
+        )
+    }
 
     func testCaptureIndexCountsMissingNamedBuckets() {
         let collector = CodeMapPerformanceCollector()
@@ -532,6 +618,11 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             XCTAssertTrue(globalVariables.isEmpty)
             XCTAssertTrue(referencedTypes.types.isEmpty)
         }
+    }
+
+    private static func legacySwiftSignatureWhitespaceNormalization(_ input: String) -> String {
+        input.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacing(#/\s+/#, with: " ")
     }
 
     private enum BenchmarkError: Error {

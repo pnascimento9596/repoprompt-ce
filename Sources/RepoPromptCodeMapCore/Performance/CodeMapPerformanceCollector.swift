@@ -89,6 +89,11 @@ package final class CodeMapPerformanceCollector {
     package var captureLoopSkippedCount = 0
     package var captureLoopUnclassifiedCount = 0
     package var swiftStrategyFunctionSignatureCount = 0
+    package var swiftSignatureNormalizationASCIINoOpCount = 0
+    package var swiftSignatureNormalizationASCIIRewriteCount = 0
+    package var swiftSignatureNormalizationUnicodeFallbackCount = 0
+    package var swiftSignatureNormalizationInputUTF8ByteCount = 0
+    package var swiftSignatureNormalizationOutputUTF8ByteCount = 0
     package var swiftStrategyFunctionNameLookupCount = 0
     package var swiftStrategyParameterExtractionCount = 0
     package var swiftStrategyReturnTypeExtractionCount = 0
