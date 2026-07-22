@@ -126,6 +126,32 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
                 collector.swiftPropertyTypeLegacyFallbackCount,
                 collector.swiftPropertyTypeResolutionCount
             )
+            XCTAssertGreaterThan(collector.referencedTypesSwiftDedupEligibleCount, 0)
+            XCTAssertGreaterThan(collector.referencedTypesSwiftFirstSeenCount, 0)
+            XCTAssertGreaterThan(collector.referencedTypesSwiftDuplicateSkipCount, 0)
+            XCTAssertEqual(
+                collector.referencedTypesSwiftFirstSeenCount +
+                    collector.referencedTypesSwiftDuplicateSkipCount,
+                collector.referencedTypesSwiftDedupEligibleCount
+            )
+            XCTAssertGreaterThan(collector.referencedTypesSwiftDuplicateSkippedUTF8ByteCount, 0)
+            XCTAssertGreaterThanOrEqual(collector.referencedTypesSwiftRawTypeDedupDuration, 0)
+            XCTAssertLessThanOrEqual(
+                collector.referencedTypesSwiftRawTypeDedupDuration,
+                collector.builderGeneratorDuration
+            )
+            XCTAssertLessThanOrEqual(
+                collector.referencedTypesSwiftRawTypeDedupDuration,
+                collector.builderTotalDuration
+            )
+            XCTAssertEqual(
+                collector.typeCleanerExtractCalls,
+                collector.typeCleanerCacheHits + collector.typeCleanerCacheMisses
+            )
+            XCTAssertLessThan(collector.typeCleanerExtractCalls, 1_497)
+            XCTAssertLessThan(collector.typeCleanerCacheHits, 759)
+            XCTAssertEqual(collector.typeCleanerCacheMisses, 738)
+            XCTAssertEqual(collector.typeCleanerSwiftCalls, 738)
 
             let evidence = try SwiftCodeMapPipelineBenchmarkSupport.makeEvidence(
                 files: files,
@@ -747,6 +773,199 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
         XCTAssertGreaterThan(collector.swiftPropertyTypeInputUTF8ByteCount, 0)
     }
 
+    func testSwiftReferencedTypesDedupMatchesFreshInsertionAuthority() {
+        let sequences: [(name: String, rawTypes: [String?])] = [
+            ("exact duplicate", ["Result<Payload, Failure>", "Result<Payload, Failure>"]),
+            ("trimmed duplicate", ["  Result<Payload, Failure>\n", "Result<Payload, Failure>"]),
+            ("case-sensitive", ["Widget", "widget", "Widget"]),
+            ("complex generics", [
+                "Outer<Inner<Payload>, Result<Value, Failure>>",
+                "Outer<Inner<Payload>, Result<Value, Failure>>",
+            ]),
+            ("functions", [
+                "(Input, @escaping (Nested) -> Output) async throws -> Result<Value, Failure>",
+                "(Input, @escaping (Nested) -> Output) async throws -> Result<Value, Failure>",
+            ]),
+            ("tuples arrays dictionaries", [
+                "(Left, Right)",
+                "[Element]",
+                "[Key: Value]",
+                "(Left, Right)",
+            ]),
+            ("compositions opaque existential", [
+                "FirstProtocol & SecondProtocol",
+                "some Shape",
+                "any Shape",
+                "FirstProtocol & SecondProtocol",
+            ]),
+            ("unicode", [
+                "Résultat<Élément, Ошибка>",
+                "Résultat<Élément, Ошибка>",
+                "résultat<Élément, Ошибка>",
+            ]),
+            ("prefilter and empty", [nil, "", " \n\t", "Int", "Void", "Array", "Payload", "Payload"]),
+        ]
+
+        for sequence in sequences {
+            assertSwiftReferencedTypesSequenceMatchesFreshAuthority(
+                sequence.rawTypes,
+                name: sequence.name
+            )
+        }
+
+        let ordered: [String?] = [
+            "Result<Payload, Failure>",
+            "(Input) -> Output",
+            "[Key: Value]",
+            "FirstProtocol & SecondProtocol",
+            "some Shape",
+            "any Shape",
+            "Résultat<Élément>",
+            "Result<Payload, Failure>",
+        ]
+        assertSwiftReferencedTypesSequenceMatchesFreshAuthority(ordered, name: "forward order")
+        assertSwiftReferencedTypesSequenceMatchesFreshAuthority(Array(ordered.reversed()), name: "reverse order")
+
+        let manyRawTypes = ordered.compactMap { $0 }
+        var individual = ReferencedTypesAccumulator(language: .swift)
+        for rawType in manyRawTypes {
+            individual.insert(rawType: rawType)
+        }
+        var many = ReferencedTypesAccumulator(language: .swift)
+        many.insertMany(rawTypes: manyRawTypes)
+        XCTAssertEqual(many.types, individual.types)
+        XCTAssertEqual(many.finalizeSorted(), individual.finalizeSorted())
+    }
+
+    func testSwiftReferencedTypesDedupPreservesFirstSeenBehavior() {
+        let raw = "Result<Payload, Failure>"
+        let expected = Set(TypeCleaner.extractBaseTypes(from: raw, language: .swift)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })
+        let collector = CodeMapPerformanceCollector()
+        var accumulator = ReferencedTypesAccumulator(
+            language: .swift,
+            stats: collector,
+            perfOptions: .countersOnly
+        )
+
+        accumulator.insert(rawType: raw)
+
+        XCTAssertEqual(accumulator.types, expected)
+        XCTAssertEqual(accumulator.finalizeSorted(), expected.sorted())
+        XCTAssertEqual(collector.referencedTypesRawInsertions, 1)
+        XCTAssertEqual(collector.referencedTypesSwiftDedupEligibleCount, 1)
+        XCTAssertEqual(collector.referencedTypesSwiftFirstSeenCount, 1)
+        XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkipCount, 0)
+        XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkippedUTF8ByteCount, 0)
+        XCTAssertGreaterThan(collector.typeCleanerExtractCalls, 0)
+        XCTAssertEqual(
+            collector.typeCleanerExtractCalls,
+            collector.typeCleanerCacheHits + collector.typeCleanerCacheMisses
+        )
+        XCTAssertEqual(collector.referencedTypesEmptyResults, expected.isEmpty ? 1 : 0)
+        XCTAssertEqual(collector.referencedTypesOutputTypeCount, expected.count)
+        XCTAssertGreaterThanOrEqual(collector.referencedTypesSwiftRawTypeDedupDuration, 0)
+    }
+
+    func testSwiftReferencedTypesDedupSkipsExactTrimmedDuplicates() {
+        let raw = "Result<Payload, Failure>"
+        let collector = CodeMapPerformanceCollector()
+        var accumulator = ReferencedTypesAccumulator(
+            language: .swift,
+            stats: collector,
+            perfOptions: .countersOnly
+        )
+        accumulator.insert(rawType: raw)
+        let firstTypes = accumulator.types
+        let firstCleanerCalls = collector.typeCleanerExtractCalls
+        let firstCacheHits = collector.typeCleanerCacheHits
+        let firstCacheMisses = collector.typeCleanerCacheMisses
+        let firstSwiftCalls = collector.typeCleanerSwiftCalls
+        let firstEmptyResults = collector.referencedTypesEmptyResults
+        let firstOutputTypes = collector.referencedTypesOutputTypeCount
+        let firstDedupDuration = collector.referencedTypesSwiftRawTypeDedupDuration
+
+        accumulator.insert(rawType: "  \(raw)\n")
+
+        XCTAssertEqual(accumulator.types, firstTypes)
+        XCTAssertEqual(accumulator.finalizeSorted(), firstTypes.sorted())
+        XCTAssertEqual(collector.referencedTypesRawInsertions, 2)
+        XCTAssertEqual(collector.referencedTypesSwiftDedupEligibleCount, 2)
+        XCTAssertEqual(collector.referencedTypesSwiftFirstSeenCount, 1)
+        XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkipCount, 1)
+        XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkippedUTF8ByteCount, raw.utf8.count)
+        XCTAssertEqual(collector.typeCleanerExtractCalls, firstCleanerCalls)
+        XCTAssertEqual(collector.typeCleanerCacheHits, firstCacheHits)
+        XCTAssertEqual(collector.typeCleanerCacheMisses, firstCacheMisses)
+        XCTAssertEqual(collector.typeCleanerSwiftCalls, firstSwiftCalls)
+        XCTAssertEqual(collector.referencedTypesEmptyResults, firstEmptyResults)
+        XCTAssertEqual(collector.referencedTypesOutputTypeCount, firstOutputTypes)
+        XCTAssertGreaterThanOrEqual(
+            collector.referencedTypesSwiftRawTypeDedupDuration,
+            firstDedupDuration
+        )
+    }
+
+    func testSwiftReferencedTypesPrefilterRunsBeforeDedup() {
+        let collector = CodeMapPerformanceCollector()
+        var accumulator = ReferencedTypesAccumulator(
+            language: .swift,
+            stats: collector,
+            perfOptions: .countersOnly
+        )
+
+        let rawTypes: [String?] = ["Int", "Int", "Void", "Array", nil, "", " \n\t"]
+        for rawType in rawTypes {
+            accumulator.insert(rawType: rawType)
+        }
+
+        XCTAssertEqual(accumulator.rawInsertions, 4)
+        XCTAssertEqual(collector.referencedTypesRawInsertions, 4)
+        XCTAssertEqual(collector.referencedTypesPrefilterSkips, 4)
+        XCTAssertEqual(collector.referencedTypesEmptyResults, 4)
+        XCTAssertEqual(collector.referencedTypesSwiftDedupEligibleCount, 0)
+        XCTAssertEqual(collector.referencedTypesSwiftFirstSeenCount, 0)
+        XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkipCount, 0)
+        XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkippedUTF8ByteCount, 0)
+        XCTAssertEqual(collector.referencedTypesSwiftRawTypeDedupDuration, 0)
+        XCTAssertEqual(collector.typeCleanerExtractCalls, 0)
+        XCTAssertTrue(accumulator.types.isEmpty)
+    }
+
+    func testNonSwiftReferencedTypeDuplicatesStillUseTypeCleanerCache() {
+        for language: LanguageType in [.ts, .tsx] {
+            let raw = "Promise<Payload>"
+            let collector = CodeMapPerformanceCollector()
+            var accumulator = ReferencedTypesAccumulator(
+                language: language,
+                stats: collector,
+                perfOptions: .countersOnly
+            )
+            accumulator.insert(rawType: raw)
+            let firstTypes = accumulator.types
+            let firstCleanerCalls = collector.typeCleanerExtractCalls
+            let firstCacheHits = collector.typeCleanerCacheHits
+            let firstCacheMisses = collector.typeCleanerCacheMisses
+            let firstOutputTypes = collector.referencedTypesOutputTypeCount
+            let firstEmptyResults = collector.referencedTypesEmptyResults
+
+            accumulator.insert(rawType: raw)
+
+            XCTAssertEqual(accumulator.types, firstTypes, "language=\(language)")
+            XCTAssertEqual(collector.typeCleanerExtractCalls, firstCleanerCalls + 1, "language=\(language)")
+            XCTAssertEqual(collector.typeCleanerCacheHits, firstCacheHits + 1, "language=\(language)")
+            XCTAssertEqual(collector.typeCleanerCacheMisses, firstCacheMisses, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesOutputTypeCount, firstOutputTypes * 2, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesEmptyResults, firstEmptyResults, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesSwiftDedupEligibleCount, 0, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesSwiftFirstSeenCount, 0, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkipCount, 0, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesSwiftDuplicateSkippedUTF8ByteCount, 0, "language=\(language)")
+            XCTAssertEqual(collector.referencedTypesSwiftRawTypeDedupDuration, 0, "language=\(language)")
+        }
+    }
+
     func testCaptureIndexCountsMissingNamedBuckets() {
         let collector = CodeMapPerformanceCollector()
         let index = CodeMapCaptureIndex([], performanceCollector: collector)
@@ -1057,6 +1276,28 @@ final class CodeMapQueryOptimizationBenchmarkTests: XCTestCase {
             XCTAssertTrue(globalVariables.isEmpty)
             XCTAssertTrue(referencedTypes.types.isEmpty)
         }
+    }
+
+    private func assertSwiftReferencedTypesSequenceMatchesFreshAuthority(
+        _ rawTypes: [String?],
+        name: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        var expected: Set<String> = []
+        for rawType in rawTypes {
+            var fresh = ReferencedTypesAccumulator(language: .swift)
+            fresh.insert(rawType: rawType)
+            expected.formUnion(fresh.types)
+        }
+
+        var accumulated = ReferencedTypesAccumulator(language: .swift)
+        for rawType in rawTypes {
+            accumulated.insert(rawType: rawType)
+        }
+
+        XCTAssertEqual(accumulated.types, expected, name, file: file, line: line)
+        XCTAssertEqual(accumulated.finalizeSorted(), expected.sorted(), name, file: file, line: line)
     }
 
     private static func legacySwiftSignatureWhitespaceNormalization(_ input: String) -> String {

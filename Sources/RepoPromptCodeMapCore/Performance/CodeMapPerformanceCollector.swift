@@ -184,6 +184,10 @@ package final class CodeMapPerformanceCollector {
     package var typeCleanerDedupCount = 0
     package var referencedTypesRawInsertions = 0
     package var referencedTypesPrefilterSkips = 0
+    package var referencedTypesSwiftDedupEligibleCount = 0
+    package var referencedTypesSwiftFirstSeenCount = 0
+    package var referencedTypesSwiftDuplicateSkipCount = 0
+    package var referencedTypesSwiftDuplicateSkippedUTF8ByteCount = 0
     package var referencedTypesEmptyResults = 0
     package var referencedTypesOutputTypeCount = 0
     package var referencedTypesUniqueCount = 0
@@ -260,6 +264,7 @@ package final class CodeMapPerformanceCollector {
     package var typeCleanerTSObjectLiteralDuration: TimeInterval = 0
     package var typeCleanerFilterDuration: TimeInterval = 0
     package var typeCleanerDedupDuration: TimeInterval = 0
+    package var referencedTypesSwiftRawTypeDedupDuration: TimeInterval = 0
     package var referencedTypesFinalizeDuration: TimeInterval = 0
     package var artifactFinalizationDuration: TimeInterval = 0
     package var artifactMeaningfulContentCheckDuration: TimeInterval = 0

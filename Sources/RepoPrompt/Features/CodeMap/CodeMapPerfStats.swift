@@ -98,6 +98,7 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var generatorTypeCleanerTSObjectLiteralDuration: TimeInterval = 0
     var generatorTypeCleanerFilterDuration: TimeInterval = 0
     var generatorTypeCleanerDedupDuration: TimeInterval = 0
+    var generatorReferencedTypesSwiftRawTypeDedupDuration: TimeInterval = 0
     var generatorReferencedTypesFinalizeDuration: TimeInterval = 0
     var generatorFileAPIInitDuration: TimeInterval = 0
 
@@ -179,6 +180,10 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var typeCleanerDedupCount = 0
     var referencedTypesRawInsertions = 0
     var referencedTypesPrefilterSkips = 0
+    var referencedTypesSwiftDedupEligibleCount = 0
+    var referencedTypesSwiftFirstSeenCount = 0
+    var referencedTypesSwiftDuplicateSkipCount = 0
+    var referencedTypesSwiftDuplicateSkippedUTF8ByteCount = 0
     var referencedTypesEmptyResults = 0
     var referencedTypesOutputTypeCount = 0
     var extractionMemoJSTSHits = 0
@@ -322,6 +327,7 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.generatorTypeCleanerTSObjectLiteralDuration += stats.typeCleanerTSObjectLiteralDuration
             storage.generatorTypeCleanerFilterDuration += stats.typeCleanerFilterDuration
             storage.generatorTypeCleanerDedupDuration += stats.typeCleanerDedupDuration
+            storage.generatorReferencedTypesSwiftRawTypeDedupDuration += stats.referencedTypesSwiftRawTypeDedupDuration
             storage.generatorReferencedTypesFinalizeDuration += stats.referencedTypesFinalizeDuration
             storage.generatorFileAPIInitDuration += stats.fileAPIInitDuration
 
@@ -386,6 +392,10 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
             storage.typeCleanerDedupCount += stats.typeCleanerDedupCount
             storage.referencedTypesRawInsertions += stats.referencedTypesRawInsertions
             storage.referencedTypesPrefilterSkips += stats.referencedTypesPrefilterSkips
+            storage.referencedTypesSwiftDedupEligibleCount += stats.referencedTypesSwiftDedupEligibleCount
+            storage.referencedTypesSwiftFirstSeenCount += stats.referencedTypesSwiftFirstSeenCount
+            storage.referencedTypesSwiftDuplicateSkipCount += stats.referencedTypesSwiftDuplicateSkipCount
+            storage.referencedTypesSwiftDuplicateSkippedUTF8ByteCount += stats.referencedTypesSwiftDuplicateSkippedUTF8ByteCount
             storage.referencedTypesEmptyResults += stats.referencedTypesEmptyResults
             storage.referencedTypesOutputTypeCount += stats.referencedTypesOutputTypeCount
             storage.extractionMemoJSTSHits += stats.extractionMemoJSTSHits
