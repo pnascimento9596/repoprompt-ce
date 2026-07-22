@@ -157,6 +157,15 @@ if [[ "$1" == "--remove-signature" ]]; then
     exit
 fi
 if [[ "$1" == "--verify" ]]; then
+    if [[ -n "${FAKE_VERIFY_COUNTER:-}" ]]; then
+        verify_count=0
+        if [[ -f "$FAKE_VERIFY_COUNTER" ]]; then verify_count="$(cat "$FAKE_VERIFY_COUNTER")"; fi
+        verify_count=$((verify_count + 1))
+        printf '%s\n' "$verify_count" > "$FAKE_VERIFY_COUNTER"
+        if [[ -n "${FAKE_VERIFY_FAILURE_AFTER:-}" ]] && (( verify_count > FAKE_VERIFY_FAILURE_AFTER )); then
+            exit 1
+        fi
+    fi
     [[ "${FAKE_SIGNATURE_FAILURE:-0}" != "1" ]]
     exit
 fi
@@ -673,6 +682,30 @@ fi
                     entries[relative]["normalizedSha256"],
                     digest(self.cache / "0.144.6" / target / relative),
                 )
+
+    def test_failed_normalized_digest_candidate_leaves_manifest_unchanged(self) -> None:
+        self.acquire_all()
+        original = self.manifest_path.read_bytes()
+        counter = self.temp / "codesign-verify-count"
+
+        result = self.run_tool(
+            "refresh-normalized-digests",
+            "--arch",
+            "all",
+            "--cache-root",
+            str(self.cache),
+            env={
+                "FAKE_VERIFY_COUNTER": str(counter),
+                "FAKE_VERIFY_FAILURE_AFTER": "4",
+            },
+            expected=1,
+        )
+
+        self.assertIn("signature check", result.stderr)
+        self.assertEqual(self.manifest_path.read_bytes(), original)
+        self.assertFalse(
+            self.manifest_path.with_name(f".{self.manifest_path.name}.tmp").exists()
+        )
 
     def test_manifest_version_drives_packaging_cache_path(self) -> None:
         result = self.run_tool("manifest-version")

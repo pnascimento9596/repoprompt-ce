@@ -716,17 +716,20 @@ def refresh_normalized_digests(
             )
 
     temporary = manifest_path.with_name(f".{manifest_path.name}.tmp")
-    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, manifest_path)
-    refreshed = load_manifest(manifest_path)
-    for target in targets:
-        verify_package(
-            cache_root / refreshed["version"] / target,
-            target,
-            refreshed,
-            args.lipo,
-            args.codesign,
-        )
+    try:
+        temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        refreshed = load_manifest(temporary)
+        for target in targets:
+            verify_package(
+                cache_root / refreshed["version"] / target,
+                target,
+                refreshed,
+                args.lipo,
+                args.codesign,
+            )
+        os.replace(temporary, manifest_path)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"OK: refreshed normalized Codex Mach-O digests in {manifest_path}")
 
 
