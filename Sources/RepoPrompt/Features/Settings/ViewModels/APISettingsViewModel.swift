@@ -3087,7 +3087,7 @@ public class APISettingsViewModel: ObservableObject {
             return "Permission denied. Ensure the 'codex' executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") {
-            return "Codex CLI is not authenticated. Run 'codex login' in your terminal."
+            return CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage
         }
         return message
     }

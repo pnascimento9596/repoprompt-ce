@@ -181,6 +181,42 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
         XCTAssertEqual(runtime.source, .externalOverride)
     }
 
+    func testCodexPreflightUsesCapturedLoginShellOverrideInsteadOfInheritedAppEnvironment() async throws {
+        let inheritedOverride = temporaryDirectory.appendingPathComponent("inherited/codex")
+        let loginShellOverride = temporaryDirectory.appendingPathComponent("login-shell/codex")
+        try makeExecutable(at: inheritedOverride, content: "#!/bin/sh\necho 'codex 0.142.0'\n")
+        try makeExecutable(at: loginShellOverride, content: "#!/bin/sh\necho 'codex 0.144.6'\n")
+
+        let temporaryPath = temporaryDirectory.path
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+            inheritedEnvironment: [
+                "HOME": temporaryPath,
+                CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: inheritedOverride.path
+            ],
+            shellEnvironmentProvider: { _, _ in
+                CLIEnvironmentSnapshot(
+                    environment: [
+                        "HOME": temporaryPath,
+                        CodexRuntimeAuthority.externalExecutableOverrideEnvironmentKey: loginShellOverride.path
+                    ],
+                    source: .capturedLoginShell
+                )
+            }
+        )
+
+        XCTAssertEqual(resolution.status, .available)
+        XCTAssertEqual(resolution.resolvedCommand, loginShellOverride.path)
+        XCTAssertEqual(resolution.runtime?.source, .externalOverride)
+        XCTAssertEqual(resolution.runtime?.version, .init(major: 0, minor: 144, patch: 6))
+    }
+
+    func testManagedAuthGuidanceUsesRepoPromptOwnedLoginFlow() {
+        let guidance = CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage
+
+        XCTAssertTrue(guidance.contains("Login with ChatGPT"))
+        XCTAssertFalse(guidance.localizedCaseInsensitiveContains("codex login"))
+    }
+
     private func failure(
         from result: Result<CodexRuntimeAuthority.Runtime, CodexRuntimeAuthority.Failure>
     ) -> CodexRuntimeAuthority.Failure? {

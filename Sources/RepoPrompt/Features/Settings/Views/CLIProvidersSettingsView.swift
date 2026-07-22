@@ -1609,7 +1609,7 @@ struct CLIProvidersSettingsView: View {
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
-                        Text("Run `codex login` in your terminal, or use Login with ChatGPT.")
+                        Text(CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

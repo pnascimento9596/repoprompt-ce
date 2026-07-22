@@ -9,7 +9,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     private static let codexMCPClientID = AgentProviderKind.codexMCPClientID
 
-    private let runner: CLIProcessRunner
+    private var runner: CLIProcessRunner?
     private let config: CodexExecAgentConfig
     private let configService = MCPConfigExportService.shared
     private let toolTracking = AgentToolTrackingController()
@@ -20,8 +20,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         config.enableDebugLogging
     }
 
-    init(runner: CLIProcessRunner, config: CodexExecAgentConfig) {
-        self.runner = runner
+    init(config: CodexExecAgentConfig) {
         self.config = config
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Initialized provider with model: \(config.modelString ?? "default")")
@@ -89,12 +88,19 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         let actualRunID = runID ?? UUID()
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Preparing context for run \(actualRunID)")
-            print("[DEBUG] CodexExec: \(config.runtimeResolution.debugMessage)")
         }
-        guard config.runtimeResolution.status == .available,
-              let runtime = config.runtimeResolution.runtime
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+            commandName: config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: enableDebugLogging
+        )
+        if enableDebugLogging {
+            print("[DEBUG] CodexExec: \(resolution.debugMessage)")
+        }
+        guard resolution.status == .available,
+              let runtime = resolution.runtime
         else {
-            throw AIProviderError.invalidConfiguration(detail: config.runtimeResolution.userMessage)
+            throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
         do {
             try runtime.prepareState()
@@ -103,6 +109,17 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                 detail: "RepoPrompt could not start Codex: unable to prepare its isolated state directories (\(error.localizedDescription))."
             )
         }
+
+        var processConfig = CLIProcessConfiguration(
+            command: resolution.resolvedCommand,
+            environment: resolution.environmentOverrides,
+            enableDebugLogging: enableDebugLogging,
+            captureStdoutTailBytes: 128 * 1024,
+            captureStderrTailBytes: 256 * 1024,
+            logStdinSampleBytes: 0
+        )
+        processConfig.ensureAdditionalPaths(config.additionalPathHints)
+        runner = CLIProcessRunner(config: processConfig)
 
         // Verify MCP server is running
         if enableDebugLogging {
@@ -171,6 +188,9 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                             }
 
                             let context = try await self.prepare(runID: runID)
+                            guard let runner = self.runner else {
+                                throw AIProviderError.invalidConfiguration(detail: "RepoPrompt could not initialize the Codex runtime.")
+                            }
                             try await AsyncScope.withCleanup({}, cleanup: {
                                 await self.cleanup(context: context)
                             }) {
@@ -216,7 +236,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
                                 // Register tool observer with cleanup
                                 try await AsyncScope.withCleanup({}, cleanup: {
-                                    await self.runner.cancelAll()
+                                    await runner.cancelAll()
                                     await self.toolTracking.stopTracking()
                                 }) {
                                     if self.enableDebugLogging {
@@ -234,7 +254,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     }
 
                                     let expectedPIDRunID = context.runID
-                                    let stream = try await self.runner.runStreaming(
+                                    let stream = try await runner.runStreaming(
                                         args: args,
                                         stdin: combinedPrompt,
                                         outputMode: .none,
@@ -331,7 +351,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                         if self.enableDebugLogging {
                                             print("[DEBUG] CodexExec: Completion seen; cancelling runner to close pipes.")
                                         }
-                                        await self.runner.cancelAll()
+                                        await runner.cancelAll()
                                     }
 
                                     // Process any trailing data without newline
@@ -475,7 +495,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                     }
                     Task { [weak self] in
                         // Kill the child aggressively, then ensure our outer stream ends.
-                        await self?.runner.cancelAll()
+                        await self?.runner?.cancelAll()
                         continuation.finish()
                     }
                 })
@@ -492,7 +512,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             print("[DEBUG] CodexExec: Disposing provider, cancelling stream task & runners")
         }
         streamTask?.cancel()
-        await runner.cancelAll()
+        await runner?.cancelAll()
     }
 
     func extractUserMessage(from aiMessage: AIMessage) -> String {
@@ -940,7 +960,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             )
         }
         if lower.contains("not authenticated") || lower.contains("unauthorized") {
-            return AIProviderError.invalidConfiguration(detail: "Codex CLI not authenticated. Run `codex login` in a terminal and try again.")
+            return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
         if lower.contains("rate limit") || lower.contains("too many requests") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI rate limited. Please wait and try again.")

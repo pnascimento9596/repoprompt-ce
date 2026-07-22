@@ -115,14 +115,23 @@ enum CodexProviderHelpers {
         commandName: String = CLILaunchProfiles.codex.commandName,
         additionalPathHints: [String] = CLILaunchProfiles.codex.supplementalSearchPaths,
         enableDebugLogging: Bool = false,
-        logCollector: CLIProcessLogCollector? = nil
+        logCollector: CLIProcessLogCollector? = nil,
+        inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+        shellEnvironmentProvider: ProcessEnvironmentBuilder.ShellEnvironmentProvider? = nil
     ) async -> CodexExecutableResolution {
-        let environmentResult = await ProcessEnvironmentBuilder.build(
-            ProcessEnvironmentRequest(
-                purpose: .codexPreflight,
-                enableDebugLogging: enableDebugLogging
-            )
+        let request = ProcessEnvironmentRequest(
+            purpose: .codexPreflight,
+            inheritedEnvironment: inheritedEnvironment,
+            enableDebugLogging: enableDebugLogging
         )
+        let environmentResult: ProcessEnvironmentResult = if let shellEnvironmentProvider {
+            await ProcessEnvironmentBuilder.build(
+                request,
+                shellEnvironmentProvider: shellEnvironmentProvider
+            )
+        } else {
+            await ProcessEnvironmentBuilder.build(request)
+        }
         let logger: ((String) -> Void)? = { message in
             logCollector?.append(message)
             if enableDebugLogging {
