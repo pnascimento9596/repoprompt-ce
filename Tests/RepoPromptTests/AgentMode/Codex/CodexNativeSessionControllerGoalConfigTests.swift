@@ -460,7 +460,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "  existing-thread  ",
-            rolloutPath: "/tmp/existing-thread.jsonl",
+            rolloutPath: nil,
             model: nil,
             reasoningEffort: "high"
         )

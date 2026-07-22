@@ -1086,10 +1086,14 @@ final class CodexNativeSessionController {
             await ensureInboundStreamsStarted()
 
             let configOverrides = await options.configOverridesProvider()
+            let pathValue = existing?.rolloutPath
             let result: [String: Any]
 
             if let resumeThreadID {
                 var params: [String: Any] = ["threadId": resumeThreadID]
+                if let pathValue {
+                    params["path"] = pathValue
+                }
                 if let model {
                     params["model"] = model
                 }
