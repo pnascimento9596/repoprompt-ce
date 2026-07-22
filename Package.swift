@@ -58,7 +58,6 @@ var repoPromptAppDependencies: [Target.Dependency] = [
     .product(name: "MarkdownUI", package: "swift-markdown-ui"),
     .product(name: "Markdown", package: "swift-markdown"),
     .product(name: "MCP", package: "swift-sdk"),
-    .product(name: "SwiftTreeSitter", package: "swift-tree-sitter"),
     .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
     .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
     .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),

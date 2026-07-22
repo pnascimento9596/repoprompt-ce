@@ -11,7 +11,7 @@ struct FilePreviewPopover: View {
     @State private var loadingTask: Task<Void, Never>? = nil // Task handle
     @State private var showSlicesOnly: Bool = true // Default to showing slices if available
     @State private var viewRefreshID = UUID() // Force view refresh
-    @State private var previewMode: FilePreviewMode = .syntaxHighlighted
+    @State private var previewMode: FilePreviewMode = .plainText
     @State private var statusMessage: String? = nil
     @State private var codemapLogicalPath: String? = nil
 
@@ -81,8 +81,8 @@ struct FilePreviewPopover: View {
         case .disabled:
             // Show disabled state with message
             disabledPreviewView
-        case .plainText, .syntaxHighlighted:
-            // Show content (plain or highlighted based on available ranges)
+        case .plainText:
+            // Show plain-text content
             if previewContent != "Loading..." {
                 textPreviewView
             } else {
@@ -146,7 +146,7 @@ struct FilePreviewPopover: View {
                         previewContent = "Codemap preview was revoked because the workspace or selection changed."
                         statusMessage = "Preview revoked"
                     }
-                    previewMode = .syntaxHighlighted
+                    previewMode = .plainText
                     viewRefreshID = UUID()
                 }
                 return
@@ -162,7 +162,7 @@ struct FilePreviewPopover: View {
             if shouldShowSlices, let slices = fileSlices {
                 // Get SVG safety info from previewSnapshot first
                 let snapshot = await MainActor.run { file.previewSnapshot }
-                let svgMode = snapshot?.mode ?? .syntaxHighlighted
+                let svgMode = snapshot?.mode ?? .plainText
 
                 // For disabled SVGs, don't render slices at all - use snapshot message
                 if svgMode == .disabled {
@@ -211,7 +211,7 @@ struct FilePreviewPopover: View {
 
                     if !Task.isCancelled {
                         await MainActor.run {
-                            previewMode = .syntaxHighlighted
+                            previewMode = .plainText
                             previewContent = loadedPreviewContent
                             statusMessage = nil
                             viewRefreshID = UUID()

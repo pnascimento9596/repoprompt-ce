@@ -9,29 +9,6 @@
 import Foundation
 import RepoPromptCodeMapCore
 
-struct CodeMapSyntaxStartupPerfStats {
-    var primeDuration: TimeInterval = 0
-    var warmCacheDuration: TimeInterval = 0
-    var warmCodeMapQueriesDuration: TimeInterval = 0
-    var languageConfigCreateDuration: TimeInterval = 0
-    var languagePointerDuration: TimeInterval = 0
-    var highlightQueryDataDuration: TimeInterval = 0
-    var highlightQueryCompileDuration: TimeInterval = 0
-    var codeMapQueryDataDuration: TimeInterval = 0
-    var codeMapQueryCompileDuration: TimeInterval = 0
-
-    var warmCacheLanguageCount = 0
-    var languageConfigCreateCount = 0
-    var languageConfigSuccessCount = 0
-    var languageConfigFailureCount = 0
-    var highlightQueryCompileSuccessCount = 0
-    var highlightQueryCompileFailureCount = 0
-    var warmCodeMapQueryLanguageCount = 0
-    var codeMapQueryPrecomputeSuccessCount = 0
-    var codeMapQueryPrecomputeFailureCount = 0
-    var codeMapQueryPrecomputeSkippedCount = 0
-}
-
 struct CodeMapSyntaxPerfStats {
     var languageLookupDuration: TimeInterval = 0
     var oversizeGuardDuration: TimeInterval = 0
@@ -64,15 +41,6 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var parseAndQueryDuration: TimeInterval = 0
     var generatorDuration: TimeInterval = 0
     var batchApplyDuration: TimeInterval = 0
-    var syntaxManagerPrimeDuration: TimeInterval = 0
-    var syntaxWarmCacheDuration: TimeInterval = 0
-    var syntaxWarmCodeMapQueriesDuration: TimeInterval = 0
-    var syntaxLanguageConfigCreateDuration: TimeInterval = 0
-    var syntaxLanguagePointerDuration: TimeInterval = 0
-    var syntaxHighlightQueryDataDuration: TimeInterval = 0
-    var syntaxHighlightQueryCompileDuration: TimeInterval = 0
-    var syntaxCodeMapQueryDataDuration: TimeInterval = 0
-    var syntaxCodeMapQueryCompileDuration: TimeInterval = 0
     var syntaxLanguageLookupDuration: TimeInterval = 0
     var syntaxOversizeGuardDuration: TimeInterval = 0
     var syntaxParserCreateDuration: TimeInterval = 0
@@ -142,16 +110,6 @@ struct CodeMapPipelinePerfSnapshot: Equatable {
     var generatedAPIs = 0
     var nilAPIs = 0
     var codeMapQuerySuccessfulLookups = 0
-    var syntaxWarmCacheLanguageCount = 0
-    var syntaxLanguageConfigCreateCount = 0
-    var syntaxLanguageConfigSuccessCount = 0
-    var syntaxLanguageConfigFailureCount = 0
-    var syntaxHighlightQueryCompileSuccessCount = 0
-    var syntaxHighlightQueryCompileFailureCount = 0
-    var syntaxWarmCodeMapQueryLanguageCount = 0
-    var syntaxCodeMapQueryPrecomputeSuccessCount = 0
-    var syntaxCodeMapQueryPrecomputeFailureCount = 0
-    var syntaxCodeMapQueryPrecomputeSkippedCount = 0
     var syntaxCodeMapCalls = 0
     var syntaxUnsupportedExtensionCount = 0
     var syntaxOversizedSkipCount = 0
@@ -263,31 +221,6 @@ final class CodeMapPipelinePerfStats: @unchecked Sendable {
         lock.withLock {
             storage.resultBatchCount += 1
             storage.maxResultBatchSize = max(storage.maxResultBatchSize, size)
-        }
-    }
-
-    func mergeSyntaxManagerStartupStats(_ stats: CodeMapSyntaxStartupPerfStats) {
-        lock.withLock {
-            storage.syntaxManagerPrimeDuration += stats.primeDuration
-            storage.syntaxWarmCacheDuration += stats.warmCacheDuration
-            storage.syntaxWarmCodeMapQueriesDuration += stats.warmCodeMapQueriesDuration
-            storage.syntaxLanguageConfigCreateDuration += stats.languageConfigCreateDuration
-            storage.syntaxLanguagePointerDuration += stats.languagePointerDuration
-            storage.syntaxHighlightQueryDataDuration += stats.highlightQueryDataDuration
-            storage.syntaxHighlightQueryCompileDuration += stats.highlightQueryCompileDuration
-            storage.syntaxCodeMapQueryDataDuration += stats.codeMapQueryDataDuration
-            storage.syntaxCodeMapQueryCompileDuration += stats.codeMapQueryCompileDuration
-
-            storage.syntaxWarmCacheLanguageCount += stats.warmCacheLanguageCount
-            storage.syntaxLanguageConfigCreateCount += stats.languageConfigCreateCount
-            storage.syntaxLanguageConfigSuccessCount += stats.languageConfigSuccessCount
-            storage.syntaxLanguageConfigFailureCount += stats.languageConfigFailureCount
-            storage.syntaxHighlightQueryCompileSuccessCount += stats.highlightQueryCompileSuccessCount
-            storage.syntaxHighlightQueryCompileFailureCount += stats.highlightQueryCompileFailureCount
-            storage.syntaxWarmCodeMapQueryLanguageCount += stats.warmCodeMapQueryLanguageCount
-            storage.syntaxCodeMapQueryPrecomputeSuccessCount += stats.codeMapQueryPrecomputeSuccessCount
-            storage.syntaxCodeMapQueryPrecomputeFailureCount += stats.codeMapQueryPrecomputeFailureCount
-            storage.syntaxCodeMapQueryPrecomputeSkippedCount += stats.codeMapQueryPrecomputeSkippedCount
         }
     }
 

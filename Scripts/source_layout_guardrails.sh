@@ -216,8 +216,8 @@ if wrapper_manifest_pattern.search(manifest_text) is None:
     errors.append("Package.swift must use the unnamed URL/revision declaration for the approved RepoPrompt SwiftTreeSitter fork")
 if wrapper.get("location") != wrapper_url or wrapper.get("state", {}) != {"revision": wrapper_revision}:
     errors.append("SwiftTreeSitter fork location/revision drifted")
-if ("SwiftTreeSitter", "swift-tree-sitter") not in repo_prompt_app_products:
-    errors.append("RepoPromptApp missing direct SwiftTreeSitter product dependency for syntax parsing")
+if ("SwiftTreeSitter", "swift-tree-sitter") in repo_prompt_app_products:
+    errors.append("RepoPromptApp must not directly depend on SwiftTreeSitter")
 if ("SwiftTreeSitter", "swift-tree-sitter") not in repo_prompt_code_map_core_products:
     errors.append("RepoPromptCodeMapCore missing direct SwiftTreeSitter product dependency")
 if "https://github.com/ChimeHQ/SwiftTreeSitter" in manifest_text or "swifttreesitter" in resolved_pins:
@@ -260,10 +260,7 @@ if code_map_core_tests.get("path") != "Tests/RepoPromptCodeMapCoreTests":
 if core_test_dependencies != ["RepoPromptCodeMapCore"]:
     errors.append("RepoPromptCodeMapCoreTests must depend only on RepoPromptCodeMapCore")
 
-syntax_source = Path("Sources/RepoPrompt/Infrastructure/SyntaxParsing/SyntaxManager.swift").read_text()
 core_syntax_source = Path("Sources/RepoPromptCodeMapCore/CodeMapSyntaxEngine.swift").read_text()
-if "import SwiftTreeSitter\n" not in syntax_source:
-    errors.append("SyntaxManager must retain direct SwiftTreeSitter import for highlighting")
 required_core_imports = {
     "SwiftTreeSitter", "TreeSitterC", "TreeSitterCPP", "TreeSitterCSharp",
     "TreeSitterGo", "TreeSitterJava", "TreeSitterJavaScript", "TreeSitterPHP", "TreeSitterPython",
