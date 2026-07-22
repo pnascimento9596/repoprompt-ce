@@ -395,6 +395,86 @@ final class CodexAppServerClientProcessExitTests: XCTestCase {
         await client.stop()
     }
 
+    func testStopDuringPrepublicationObserverSettlementPreventsReplacementSpawn() async throws {
+        let directory = try makeTemporaryDirectory()
+        let recordURL = directory.appendingPathComponent("requests.jsonl")
+        let spawnCountURL = directory.appendingPathComponent("spawn-count")
+        let executable = try makePersistentServer(
+            in: directory,
+            recordURL: recordURL,
+            spawnCountURL: spawnCountURL
+        )
+        let outcomePublicationGate = ChildExitOutcomePublicationGate()
+        let client = try await makeClient(
+            executable: executable,
+            launchDirectory: directory,
+            timeout: 5,
+            processExitObserverFactory: { pid in
+                ChildProcessExitObserver(
+                    pid: pid,
+                    beforePublishingOutcome: { outcomePublicationGate.hold($0) }
+                )
+            }
+        )
+        let replacementStartCleanup = ThrowingTaskCleanup()
+        addTeardownBlock {
+            outcomePublicationGate.release()
+            await client.stop()
+            await replacementStartCleanup.finish()
+        }
+        try await client.startIfNeeded()
+        try await waitUntil("initial spawn count", timeout: 2) {
+            (try? String(contentsOf: spawnCountURL, encoding: .utf8)) == "1"
+        }
+
+        let initialPIDValue = await client.debugProcessID()
+        let initialPID = try XCTUnwrap(initialPIDValue)
+        XCTAssertEqual(Darwin.kill(initialPID, SIGKILL), 0)
+        let deadline = CodexProcessExitTestDeadline(timeout: 5)
+        guard await outcomePublicationGate.waitUntilHolding(timeout: deadline.remaining) else {
+            throw WaitUntilError.timedOut("child exit outcome publication gate")
+        }
+        try await waitUntil("stdout EOF observer settlement join", timeout: deadline.remaining) {
+            await client.debugTerminalObserverJoinCount() >= 1
+        }
+        let joinCountBeforeReplacementStart = await client.debugTerminalObserverJoinCount()
+
+        let replacementStart = Task {
+            try await client.startIfNeeded()
+        }
+        await replacementStartCleanup.track(replacementStart)
+        try await waitUntil("replacement-start observer settlement join", timeout: deadline.remaining) {
+            await client.debugTerminalObserverJoinCount() > joinCountBeforeReplacementStart
+        }
+
+        let stopCompletion = CompletionFlag()
+        let stop = Task {
+            await client.stop()
+            await stopCompletion.markComplete()
+        }
+        try await waitUntil("explicit stop transport claim", timeout: deadline.remaining) {
+            await client.debugLastTransportTerminationReason() == .explicitStop
+        }
+        let stopCompletedBeforeSettlementRelease = await stopCompletion.isComplete
+        XCTAssertFalse(stopCompletedBeforeSettlementRelease)
+        outcomePublicationGate.release()
+        await stop.value
+
+        do {
+            try await replacementStart.value
+            XCTFail("The pre-publication start must not spawn after stop")
+        } catch is CancellationError {
+            // Expected: stop revoked this invocation while it was joining settlement.
+        } catch {
+            XCTFail("Expected replacement-start cancellation, got \(error)")
+        }
+        XCTAssertEqual(try String(contentsOf: spawnCountURL, encoding: .utf8), "1")
+        let isRunning = await client.debugIsProcessRunning()
+        let processObserver = await client.debugProcessExitObserver()
+        XCTAssertFalse(isRunning)
+        XCTAssertNil(processObserver)
+    }
+
     func testStopDuringRestartPreparationPreventsSpawnAfterReturn() async throws {
         let directory = try makeTemporaryDirectory()
         let recordURL = directory.appendingPathComponent("requests.jsonl")

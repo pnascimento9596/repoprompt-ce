@@ -351,7 +351,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let resumeParams = try recordedParams(for: "thread/resume", at: recordURL)
         XCTAssertEqual(resumeParams["cwd"] as? String, worktreeRoot.path)
         XCTAssertEqual(resumeParams["threadId"] as? String, "existing-thread")
-        XCTAssertEqual(resumeParams["path"] as? String, "/tmp/existing-thread.jsonl")
+        XCTAssertNil(resumeParams["path"])
 
         let turnParams = try recordedRequests(for: "turn/start", at: recordURL)
             .map { try XCTUnwrap($0["params"] as? [String: Any]) }
@@ -460,7 +460,7 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         let (resumeController, resumeRecordURL) = try await makeController(options: makeOptions())
         let existing = CodexNativeSessionController.SessionRef(
             conversationID: "  existing-thread  ",
-            rolloutPath: nil,
+            rolloutPath: "/tmp/existing-thread.jsonl",
             model: nil,
             reasoningEffort: "high"
         )

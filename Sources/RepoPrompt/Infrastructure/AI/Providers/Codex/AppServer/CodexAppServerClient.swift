@@ -380,6 +380,9 @@ actor CodexAppServerClient {
     /// to the correct transport instance — prevents a stale task from killing a
     /// newly started process.
     private var transportGeneration: UInt64 = 0
+    /// Actor-confined authority for startup work. Explicit or emergency shutdown
+    /// revokes every invocation that began before the shutdown request.
+    private var startupAuthorityEpoch: UInt64 = 0
     private var startupTask: (id: UUID, task: Task<Void, Error>)?
     private var expectedAgentPIDRegistration: ExpectedAgentPIDRegistration?
     private var registeredExpectedAgentPID: RegisteredExpectedAgentPID?
@@ -529,10 +532,12 @@ actor CodexAppServerClient {
     }
 
     func startIfNeeded() async throws {
+        let authority = startupAuthorityEpoch
         if let termination = transportTerminationTask,
            termination.generation == transportGeneration
         {
             await termination.task.value
+            try ensureStartupAuthority(authority)
         }
         if let existingStartupTask = startupTask?.task {
             return try await existingStartupTask.value
@@ -548,11 +553,13 @@ actor CodexAppServerClient {
                     flushStdout: false,
                     fallbackReason: .livenessCheckFailed(method: nil)
                 )
+                try ensureStartupAuthority(authority)
             }
         }
+        try ensureStartupAuthority(authority)
         let startupID = UUID()
         let task = Task<Void, Error> {
-            try await self.performStartupIfNeeded()
+            try await self.performStartupIfNeeded(startupAuthority: authority)
         }
         startupTask = (id: startupID, task: task)
         do {
@@ -569,6 +576,7 @@ actor CodexAppServerClient {
     }
 
     func stop() async {
+        startupAuthorityEpoch &+= 1
         startupTask?.task.cancel()
         startupTask = nil
         if let termination = transportTerminationTask,
@@ -920,6 +928,7 @@ actor CodexAppServerClient {
     }
 
     private func emergencyTerminateTransportForDeinit() {
+        startupAuthorityEpoch &+= 1
         startupTask?.task.cancel()
         startupTask = nil
         stdoutChunkChannel?.finish()
@@ -1240,11 +1249,19 @@ actor CodexAppServerClient {
         isInitialized = true
     }
 
-    private func performStartupIfNeeded() async throws {
+    private func ensureStartupAuthority(_ authority: UInt64) throws {
+        guard authority == startupAuthorityEpoch else {
+            throw CancellationError()
+        }
+    }
+
+    private func performStartupIfNeeded(startupAuthority: UInt64) async throws {
         do {
+            try ensureStartupAuthority(startupAuthority)
             if activeTransport == nil {
-                try await startProcess()
+                try await startProcess(startupAuthority: startupAuthority)
             }
+            try ensureStartupAuthority(startupAuthority)
             try await initializeIfNeeded()
         } catch is CancellationError {
             if let termination = transportTerminationTask,
@@ -1257,7 +1274,7 @@ actor CodexAppServerClient {
         }
     }
 
-    private func startProcess() async throws {
+    private func startProcess(startupAuthority: UInt64) async throws {
         let environmentResult = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
                 purpose: .codexAppServer,
@@ -1287,6 +1304,7 @@ actor CodexAppServerClient {
         )
         try await processSpawnPreparation()
         try Task.checkCancellation()
+        try ensureStartupAuthority(startupAuthority)
         let spawned = try ProcessLauncher.spawn(
             command: resolution.resolvedCommand,
             arguments: args,
