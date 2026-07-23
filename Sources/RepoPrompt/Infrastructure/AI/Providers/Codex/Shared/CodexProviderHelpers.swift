@@ -150,34 +150,6 @@ enum CodexProviderHelpers {
             .hasPrefix("RepoPrompt could not start Codex:")
     }
 
-    /// Recognizes post-resolution runtime launch failures in raw process/app-server
-    /// failure details and returns the classified `RepoPrompt could not start Codex:`
-    /// message for them, or nil when the detail is not a launch failure.
-    ///
-    /// Covers the two spawn-time families that can occur after executable resolution
-    /// succeeded: the runtime going missing (spawn errno 2 / not-found text) and the
-    /// runtime being non-executable for this user (spawn errno 13 / permission text).
-    /// Producing the sentinel prefix here keeps `isCodexExecutableUnavailableMessage`
-    /// the single classifier for executable-unavailable phases instead of widening
-    /// its string matching.
-    static func runtimeLaunchFailureMessage(fromFailureDetail detail: String) -> String? {
-        let lower = detail.lowercased()
-        if lower.contains("command not found")
-            || lower.contains("no such file")
-            || lower.contains("spawnfailed(errno: 2)")
-            || lower.contains("errno: 2")
-        {
-            return "RepoPrompt could not start Codex: the selected runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
-        }
-        if lower.contains("permission denied")
-            || lower.contains("spawnfailed(errno: 13)")
-            || lower.contains("errno: 13")
-        {
-            return "RepoPrompt could not start Codex: permission was denied when starting the selected runtime. Reinstall RepoPrompt CE or configure a valid explicit override."
-        }
-        return nil
-    }
-
     /// Extracts the name of a broken MCP server from Codex CLI stderr output.
     /// Parses error messages like:
     /// - "Error: invalid transport\nin `mcp_servers.ServerName`"

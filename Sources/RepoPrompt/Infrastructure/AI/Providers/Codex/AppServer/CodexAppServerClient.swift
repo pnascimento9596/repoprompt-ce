@@ -1331,6 +1331,25 @@ actor CodexAppServerClient {
         }
     }
 
+    private static func executableUnavailableSpawnError(
+        _ error: ProcessLauncherError
+    ) -> ClientError? {
+        let failure = error.processLaunchFailure
+        guard failure.domain == NSPOSIXErrorDomain else { return nil }
+        return switch failure.code {
+        case Int(ENOENT):
+            .executableUnavailable(
+                "RepoPrompt could not start Codex: the selected runtime could not be started. Reinstall RepoPrompt CE or configure a valid explicit override."
+            )
+        case Int(EACCES):
+            .executableUnavailable(
+                "RepoPrompt could not start Codex: permission was denied when starting the selected runtime. Reinstall RepoPrompt CE or configure a valid explicit override."
+            )
+        default:
+            nil
+        }
+    }
+
     private func startProcess(startupAuthority: UInt64) async throws {
         let runtime = try await prepareRuntimeForLaunch()
         guard let launchContext = preparedRuntimeLaunchContext else {
@@ -1357,15 +1376,23 @@ actor CodexAppServerClient {
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
         )
-        try await processSpawnPreparation()
-        try Task.checkCancellation()
-        try ensureStartupAuthority(startupAuthority)
-        let spawned = try ProcessLauncher.spawn(
-            command: resolution.resolvedCommand,
-            arguments: args,
-            environment: environment,
-            workingDirectory: launchDirectory
-        )
+        let spawned: SpawnedProcess
+        do {
+            try await processSpawnPreparation()
+            try Task.checkCancellation()
+            try ensureStartupAuthority(startupAuthority)
+            spawned = try ProcessLauncher.spawn(
+                command: resolution.resolvedCommand,
+                arguments: args,
+                environment: environment,
+                workingDirectory: launchDirectory
+            )
+        } catch let error as ProcessLauncherError {
+            guard let mappedError = Self.executableUnavailableSpawnError(error) else {
+                throw error
+            }
+            throw mappedError
+        }
 
         // The observer is installed before reader setup or PID registration so
         // every successful spawn immediately has one cancellation-independent reaper.

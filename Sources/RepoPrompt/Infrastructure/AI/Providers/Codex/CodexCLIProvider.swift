@@ -939,9 +939,6 @@ final class CodexCLIProvider: AIProvider {
         if isTimeoutDetail(detail) {
             return timeoutError(for: timeoutValue)
         }
-        if let launchFailureMessage = CodexProviderHelpers.runtimeLaunchFailureMessage(fromFailureDetail: detail) {
-            return AIProviderError.invalidConfiguration(detail: launchFailureMessage)
-        }
         if lower.contains("unauthorized") || lower.contains("not authenticated") {
             return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
