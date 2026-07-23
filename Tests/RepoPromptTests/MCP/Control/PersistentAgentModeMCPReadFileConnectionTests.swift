@@ -3241,9 +3241,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let attachedPublisherIngress = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(
                 rootID: rootID
             )
-            XCTAssertTrue(attachedPublisherIngress)
+            guard attachedPublisherIngress else {
+                throw ClientFixtureError.syntheticWatcherPublisherIngressUnavailable(rootID)
+            }
             let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
-            XCTAssertFalse(watcherIsActive)
+            guard !watcherIsActive else {
+                throw ClientFixtureError.syntheticWatcherStillActive(rootID)
+            }
             if qualifyCachedSearchContent {
                 try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: rootID, true)
             }
@@ -3901,6 +3905,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case syntheticWatcherPublisherIngressUnavailable(UUID)
+        case syntheticWatcherStillActive(UUID)
     }
 
     private struct RetainedConnectionSnapshot: Equatable {
